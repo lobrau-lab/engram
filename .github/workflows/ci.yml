@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: Compile and smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo check
+        run: cargo check --workspace --all-targets
+
+      - name: cargo build --release
+        run: cargo build --workspace --release
+
+      - name: Smoke test (init, index, search, export)
+        run: |
+          set -euxo pipefail
+          BIN=./target/release/engram
+          rm -rf /tmp/brain /tmp/sync
+          $BIN --vault /tmp/brain init
+          $BIN --vault /tmp/brain index
+          $BIN --vault /tmp/brain search "welcome"
+          $BIN --vault /tmp/brain search "who is who"
+          $BIN --vault /tmp/brain export /tmp/sync
+          test -f /tmp/sync/.engram-manifest.json
+          test -f /tmp/brain/.engram/state.json
+
+      - name: cargo clippy (advisory, non-blocking on first run)
+        run: cargo clippy --workspace --all-targets
+        continue-on-error: true
+
+      - name: cargo test
+        run: cargo test --workspace --verbose

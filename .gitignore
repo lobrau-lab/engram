@@ -1,0 +1,5 @@
+/target
+**/*.rs.bk
+# Engram runtime artifacts
+.engram/
+*.conflict-*.md
