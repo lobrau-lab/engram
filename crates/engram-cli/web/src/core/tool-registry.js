@@ -4,6 +4,10 @@ const registeredTools = [
     description: 'Open a view in the chat application.',
     effect: 'ui_navigation',
     scope: 'threadline:views:read',
+    capability: 'Navigate between Threadline views',
+    risk: 'low',
+    destination: 'local',
+    dataClasses: [],
     approval: 'none',
     parameters: {
       type: 'object',
@@ -17,6 +21,10 @@ const registeredTools = [
     description: 'Change supported chat, memory, or context settings at the user’s request.',
     effect: 'local_settings_write',
     scope: 'threadline:settings:write',
+    capability: 'Change Threadline settings',
+    risk: 'medium',
+    destination: 'local',
+    dataClasses: ['Threadline settings'],
     approval: 'confirm',
     confirmation: 'Apply the requested changes to Threadline settings?',
     parameters: {
@@ -39,6 +47,10 @@ const registeredTools = [
     description: 'Read the current conversation’s derived memory variables and unresolved conflicts.',
     effect: 'conversation_read',
     scope: 'threadline:memory:read',
+    capability: 'Read derived memory for the active conversation',
+    risk: 'low',
+    destination: 'local',
+    dataClasses: ['Conversation memory and assertion provenance'],
     approval: 'none',
     parameters: { type: 'object', properties: {}, additionalProperties: false }
   },
@@ -47,6 +59,10 @@ const registeredTools = [
     description: 'Create and switch to a new empty local conversation.',
     effect: 'local_state_write',
     scope: 'threadline:conversations:write',
+    capability: 'Create and switch to an empty conversation',
+    risk: 'low',
+    destination: 'local',
+    dataClasses: ['Conversation index'],
     approval: 'none',
     parameters: { type: 'object', properties: {}, additionalProperties: false }
   },
@@ -55,11 +71,15 @@ const registeredTools = [
     description: 'Delete all locally stored conversations, memory, and settings. This is destructive and requires explicit user confirmation.',
     effect: 'destructive_local_delete',
     scope: 'threadline:workspace:delete',
+    capability: 'Delete Threadline conversations, memory, and settings',
+    risk: 'high',
+    destination: 'local',
+    dataClasses: ['All Threadline conversations, memory, and settings'],
     approval: 'confirm',
     confirmation: 'Clear all locally stored conversations, memory, and settings? This cannot be undone.',
     parameters: { type: 'object', properties: {}, additionalProperties: false }
   }
-].map(tool => Object.freeze(tool));
+].map(tool => Object.freeze({ ...tool, dataClasses: Object.freeze([...tool.dataClasses]) }));
 
 const registry = new Map(registeredTools.map(tool => [tool.name, tool]));
 
@@ -74,8 +94,8 @@ export function getRegisteredTool(name) {
 }
 
 export function listRegisteredTools() {
-  return registeredTools.map(({ name, description, effect, scope, approval }) => ({
-    name, description, effect, scope, approval
+  return registeredTools.map(({ name, description, effect, scope, capability, risk, destination, dataClasses, approval }) => ({
+    name, description, effect, scope, capability, risk, destination, dataClasses: [...dataClasses], approval
   }));
 }
 

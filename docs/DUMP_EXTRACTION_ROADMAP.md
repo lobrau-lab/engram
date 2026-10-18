@@ -4,11 +4,20 @@
 
 Engram Dump accepts pasted text and explicitly selected `.md`, `.markdown`,
 and `.txt` files. It stores immutable local intake records before analysis.
-The organizer model receives only successfully extracted text after the user
-explicitly selects **Analyze**.
+The core now validates and stores versioned, source-hash-linked structured
+suggestions after an explicit local **Analyze** call. Review and apply UI/API
+work remains separate from this core storage step.
 
-Each item reports its own extraction and analysis state. Pending data remains
-under `.engram/dump/` and is not indexed as a normal vault note.
+The import store now preserves explicitly selected files under
+`.engram/imports/originals/`, records per-file status/provenance, and supports
+local Markdown, plain text, and HTML extraction. Successful extraction creates
+a linked Dump source item; it does not write a vault note. PDF, including
+scanned or encrypted PDF, is currently preserved as `unsupported` because no
+validated local PDF adapter is enabled.
+
+Each item reports its own extraction and analysis state. Pending data and
+derived analysis remain under `.engram/dump/` and are not indexed as normal
+vault notes. Failed analysis leaves the raw item unchanged and retryable.
 
 ## Planned adapters
 

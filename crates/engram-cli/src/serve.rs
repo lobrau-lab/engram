@@ -70,6 +70,7 @@ fn handle(vault: &Path, mut stream: TcpStream) -> Result<()> {
         ("GET", "/threadline") => redirect("/threadline/"),
         ("GET", "/dump") => render_dump(vault)?,
         ("POST", "/api/v1/dump") => submit_dump(vault, body)?,
+        ("POST", path) if path.starts_with("/api/v1/dump/") && path.ends_with("/analyze") => analyze_dump(vault, path)?,
         ("GET", "/threadline/") | ("GET", "/threadline/index.html") => {
             response(200, "text/html; charset=utf-8", include_str!("../web/index.html"))
         }
@@ -163,7 +164,7 @@ fn search_vault_api(vault: &Path, query: &str) -> Result<String> {
 
 fn render_dump(vault: &Path) -> Result<Vec<u8>> {
     let items = dump::list(vault)?;
-    let rows = items.iter().map(|item| format!("<li><b>{}</b> <small>{} · {} bytes · {}</small></li>", escape(&item.filename), escape(&item.id), item.content.len(), escape(&item.status))).collect::<String>();
+    let rows = items.iter().map(|item| format!("<li><b>{}</b> <small>{} · {} bytes · {}</small> <form method=\"post\" action=\"/api/v1/dump/{}/analyze\" style=\"display:inline\"><button>Analyze locally</button></form></li>", escape(&item.filename), escape(&item.id), item.content.len(), escape(&item.status), encode(&item.id))).collect::<String>();
     let html = format!("<a href=\"/\">← Vault</a><h1>Dump / Inbox</h1><p>Supported now: pasted text, Markdown, and plain text. Items remain pending and are not indexed until approval.</p><textarea id=\"paste\" placeholder=\"Paste text here…\"></textarea><button id=\"submit-paste\">Add pasted text</button><p><input id=\"files\" type=\"file\" multiple accept=\".md,.markdown,.txt,text/plain,text/markdown\"></p><ul>{rows}</ul><script>const send=(filename,source,content)=>fetch('/api/v1/dump',{{method:'POST',headers:{{'content-type':'application/x-www-form-urlencoded'}},body:new URLSearchParams({{filename,source,content}})}}).then(r=>r.ok?r.text():r.text().then(t=>Promise.reject(t))).then(()=>location.reload());document.querySelector('#submit-paste').onclick=()=>send('pasted-text.txt','paste',document.querySelector('#paste').value);document.querySelector('#files').onchange=e=>Promise.all([...e.target.files].map(f=>new Promise((ok,bad)=>{{const r=new FileReader();r.onload=()=>send(f.name,'file',r.result).then(ok,bad);r.onerror=bad;r.readAsText(f)}})));</script>");
     Ok(page("Dump / Inbox", &html))
 }
@@ -174,6 +175,15 @@ fn submit_dump(vault: &Path, body: &str) -> Result<Vec<u8>> {
     let content = parameter(body, "content").context("missing dump content")?;
     let item = dump::submit(vault, &filename, &source, &content)?;
     Ok(response(201, "application/json; charset=utf-8", &serde_json::json!({"id": item.id, "status": item.status}).to_string()))
+}
+
+fn analyze_dump(vault: &Path, path: &str) -> Result<Vec<u8>> {
+    let id = path.strip_prefix("/api/v1/dump/").and_then(|path| path.strip_suffix("/analyze")).unwrap_or("");
+    let config_path = vault.join(".engram").join("config.toml");
+    let config = Config::load(&config_path).context("local inference configuration is missing")?;
+    let client = OpenAiCompat::new(config.llm_base, config.llm_model, config.llm_key, config.provider);
+    let analysis = dump::analyze(vault, id, &client)?;
+    Ok(response(200, "application/json; charset=utf-8", &serde_json::to_string(&analysis)?))
 }
 
 fn render_graph(vault: &Path) -> Result<Vec<u8>> {

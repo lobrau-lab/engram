@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::vault::{content_hash, Vault};
+use crate::atomic_write;
 
 pub const MANIFEST_NAME: &str = ".engram-manifest.json";
 pub const STATE_REL: &str = ".engram/state.json";
@@ -96,7 +97,8 @@ pub fn save_manifest(dir: &Path, m: &Manifest) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let p = manifest_path(dir);
     let text = serde_json::to_string_pretty(m).context("serializing manifest")?;
-    std::fs::write(&p, text).with_context(|| format!("writing {}", p.display()))?;
+    atomic_write::replace(&p, text.as_bytes())
+        .with_context(|| format!("writing {}", p.display()))?;
     Ok(())
 }
 
@@ -119,7 +121,8 @@ pub fn save_local_state(vault: &Path, s: &LocalState) -> Result<()> {
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let text = serde_json::to_string_pretty(s).context("serializing local state")?;
-    std::fs::write(&p, text).with_context(|| format!("writing {}", p.display()))?;
+    atomic_write::replace(&p, text.as_bytes())
+        .with_context(|| format!("writing {}", p.display()))?;
     Ok(())
 }
 

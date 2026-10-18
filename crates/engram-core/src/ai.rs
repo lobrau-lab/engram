@@ -2,6 +2,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::config::Provider;
 
@@ -64,6 +65,27 @@ pub trait LlmClient {
     fn complete(&self, prompt: &str, opts: &ChatOpts) -> Result<String>;
 }
 
+/// Validate Engram's Rust inference boundary.
+///
+/// Local loopback HTTP is allowed because MLX-Serve/oMLX and similar local
+/// sidecars expose HTTP APIs. Internet and arbitrary-network destinations are
+/// rejected before ureq is constructed or invoked.
+pub fn validate_local_endpoint(base: &str) -> Result<Url> {
+    let url = Url::parse(base).map_err(|_| {
+        anyhow!("inference endpoint must be a valid plain HTTP loopback URL")
+    })?;
+    if url.scheme() != "http" || !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("inference endpoint must use plain HTTP without userinfo")
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("inference endpoint must include a loopback host"))?;
+    if !matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") {
+        anyhow::bail!("inference endpoint host must be localhost, 127.0.0.1, or ::1")
+    }
+    Ok(url)
+}
+
 pub struct OpenAiCompat {
     base: String,
     model: String,
@@ -93,7 +115,8 @@ impl LlmClient for OpenAiCompat {
     }
 
     fn complete(&self, prompt: &str, opts: &ChatOpts) -> Result<String> {
-        let url = format!("{}/chat/completions", self.base.trim_end_matches('/'));
+        let endpoint = validate_local_endpoint(&self.base)?;
+        let url = format!("{}/chat/completions", endpoint.as_str().trim_end_matches('/'));
         let model = if self.model.trim().is_empty() {
             self.discover_model()?
         } else {
@@ -128,7 +151,8 @@ impl LlmClient for OpenAiCompat {
 
 impl OpenAiCompat {
     fn discover_model(&self) -> Result<String> {
-        let url = format!("{}/models", self.base.trim_end_matches('/'));
+        let endpoint = validate_local_endpoint(&self.base)?;
+        let url = format!("{}/models", endpoint.as_str().trim_end_matches('/'));
         let mut call = ureq::get(&url);
         if let Some(k) = &self.key {
             call = call.set("Authorization", &format!("Bearer {k}"));

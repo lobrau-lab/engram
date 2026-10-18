@@ -20,7 +20,7 @@ export function executeApplicationAction(name, rawArguments, callbacks = {}) {
   const validationError = validateToolArguments(tool, args);
   if (validationError) return { ok: false, code: 'invalid_arguments', error: validationError };
 
-  const authorization = authorizeToolInvocation(tool, callbacks);
+  const authorization = authorizeToolInvocation(tool, args, callbacks);
   if (!authorization.allowed) {
     return {
       ok: false,

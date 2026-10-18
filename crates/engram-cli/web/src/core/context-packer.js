@@ -1,4 +1,4 @@
-import { evidenceLabel } from './memory-manager.js';
+import { evidenceLabel, relevantConflicts } from './memory-manager.js';
 
 export function estimateTokens(text) { return Math.ceil((text || '').length / 3.7); }
 
@@ -20,6 +20,13 @@ export function packContext({ message, history, memory, evidence, vaultNotes = [
     const stateGroups = [memory.currentGoal, memory.decisions, memory.constraints, memory.preferences, memory.activeTopics, memory.openQuestions];
     const stateItems = stateGroups.flat().filter(item => item?.text).map(item => ({ ...item, kind: 'state', score: evidenceLabel(item.text, message) === 'strong lexical match' ? 0.8 : evidenceLabel(item.text, message) === 'related candidate' ? 0.4 : 0.1 })).filter(item => item.score >= 0.35);
     for (const item of stateItems.sort((a, b) => b.score - a.score)) add('state', item.text, item.sourceTurnIds, item.score);
+    for (const conflict of relevantConflicts(memory, message)) {
+      const sourceIds = [...new Set(conflict.assertions.flatMap(assertion => assertion.sourceTurnIds || []))];
+      const details = conflict.assertions.map(assertion =>
+        `- ${assertion.content} (source turn${assertion.sourceTurnIds?.length === 1 ? '' : 's'}: ${(assertion.sourceTurnIds || []).map(id => id.slice(0, 8)).join(', ') || 'unknown'})`
+      ).join('\n');
+      add('conflict', `UNRESOLVED CONFLICT: These retained assertions may disagree. Do not choose one without evidence or clarification.\n${details}`, sourceIds, 1);
+    }
     for (const item of evidence) {
       const label = evidenceLabel(item.turn.content, message);
       if (item.turn.content === message) continue;
@@ -37,7 +44,7 @@ export function packContext({ message, history, memory, evidence, vaultNotes = [
     if (turn.content === message) continue;
     add(`recent · ${turn.role}`, `${turn.role}: ${turn.content}`, [turn.id], 0.25);
   }
-  const lines = [`COMPACT CONVERSATION STATE\n${selected.filter(x => x.kind === 'state').map(x => `- ${x.text}`).join('\n') || '- No relevant state variables found.'}`, `CONVERSATION SOURCE TURNS\n${selected.filter(x => x.kind.startsWith('source')).map(x => `- ${x.text}`).join('\n') || '- No matching conversation source turns found.'}`, `ENGRAM VAULT SOURCES\n${selected.filter(x => x.kind.startsWith('vault')).map(x => `- ${x.text}`).join('\n') || '- No Engram vault notes selected.'}\nCite note IDs in square brackets when using these sources. Do not imply a note supports a claim unless its excerpt does.`, `RECENT CONTEXT\n${selected.filter(x => x.kind.startsWith('recent')).map(x => `- ${x.text}`).join('\n') || '- None.'}`];
+  const lines = [`COMPACT CONVERSATION STATE\n${selected.filter(x => x.kind === 'state').map(x => `- ${x.text}`).join('\n') || '- No relevant state variables found.'}`, `UNRESOLVED CONFLICTS\n${selected.filter(x => x.kind === 'conflict').map(x => x.text).join('\n') || '- No relevant unresolved conflicts selected.'}`, `CONVERSATION SOURCE TURNS\n${selected.filter(x => x.kind.startsWith('source')).map(x => `- ${x.text}`).join('\n') || '- No matching conversation source turns found.'}`, `ENGRAM VAULT SOURCES\n${selected.filter(x => x.kind.startsWith('vault')).map(x => `- ${x.text}`).join('\n') || '- No Engram vault notes selected.'}\nCite note IDs in square brackets when using these sources. Do not imply a note supports a claim unless its excerpt does.`, `RECENT CONTEXT\n${selected.filter(x => x.kind.startsWith('recent')).map(x => `- ${x.text}`).join('\n') || '- None.'}`];
   const assembledSystem = `${system}\n\n${lines.join('\n\n')}`;
   const items = [{ role: 'system', content: assembledSystem }, { role: 'user', content: message }];
   const counted = estimateTokens(assembledSystem) + messageCost;

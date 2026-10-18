@@ -1,6 +1,7 @@
 import { emptyMemory } from './store.js';
 
 const STOP = new Set('about above after again against all also and any are because been before being between both but can could did does doing down during each few for from further had has have having here how into its itself just more most nor not now off once only other our out over own same she should some such than that the their them then there these they this those through too under until very was were what when where which while who why will with would your you user assistant'.split(' '));
+const CORRECTION = /\b(?:correction\b|actually,?\s+(?:my|i|that|we|it|the)\b|i\s+meant\b|i\s+mean\b|i\s+was\s+(?:wrong|mistaken)\b|that\s+was\s+wrong\b|replace\s+that\b|i\s+no\s+longer\b|now\s+i\s+prefer\b|instead\s+of\b)/i;
 const words = text => (text.toLowerCase().match(/[\p{L}\p{N}_'-]{2,}/gu) || []).filter(w => !STOP.has(w));
 const compact = text => text.replace(/\s+/g, ' ').trim();
 const overlap = (a, b) => { const aw = new Set(words(a)); const bw = new Set(words(b)); if (!aw.size || !bw.size) return 0; let common = 0; for (const w of aw) if (bw.has(w)) common++; return common / Math.sqrt(aw.size * bw.size); };
@@ -10,7 +11,7 @@ export function recordAndUpdate(memory, turn) {
   const content = compact(turn.content);
   const assertion = { id: crypto.randomUUID(), content, sourceTurnIds: [turn.id], timestamp: turn.timestamp, type: inferType(content), status: 'active_candidate', inferred: false };
   const earlier = next.assertions.filter(a => a.status !== 'superseded' && overlap(a.content, content) > 0.6);
-  const explicitCorrection = /\b(i meant|correction|actually,? (?:i|that)|i was wrong|replace that|i no longer|now i prefer|instead of)\b/i.test(content);
+  const explicitCorrection = CORRECTION.test(content);
   if (explicitCorrection && earlier.length) {
     for (const item of earlier) { item.status = 'superseded'; assertion.supersedes = [...(assertion.supersedes || []), item.id]; }
     next.events ??= [];
@@ -39,7 +40,7 @@ export function recordAndUpdate(memory, turn) {
 }
 
 function inferType(text) {
-  if (/\b(i meant|correction|actually,? (?:i|that)|i was wrong)\b/i.test(text)) return 'explicit_correction';
+  if (CORRECTION.test(text)) return 'explicit_correction';
   if (/\b(i prefer|i like|i dislike|i hate|i love)\b/i.test(text)) return 'preference';
   if (/\b(i decided|we decided|decision|we will)\b/i.test(text)) return 'decision';
   if (text.endsWith('?')) return 'question';
@@ -71,6 +72,20 @@ export function evidenceLabel(text, query) {
   return score > 0.45 ? 'strong lexical match' : score > 0.16 ? 'related candidate' : 'weak candidate';
 }
 
+/** Return unresolved conflicts relevant to this query, preserving both assertions. */
+export function relevantConflicts(memory, query) {
+  const assertions = new Map((memory.assertions || []).map(item => [item.id, item]));
+  return (memory.conflicts || []).filter(conflict => conflict.status === 'unresolved' &&
+    (conflict.assertionIds || []).some(id => {
+      const assertion = assertions.get(id);
+      return assertion && overlap(assertion.content, query) > 0.16;
+    })
+  ).map(conflict => ({
+    ...conflict,
+    assertions: (conflict.assertionIds || []).map(id => assertions.get(id)).filter(Boolean)
+  }));
+}
+
 export function evaluateRules({ message, memory, evidence, settings, vaultResult, vaultSearchError }) {
   const trace = [];
   const add = (rule, condition, result) => trace.push({ rule, condition, result });
@@ -79,8 +94,8 @@ export function evaluateRules({ message, memory, evidence, settings, vaultResult
   add('History needed?', 'message references prior turns or active topic', asksHistory ? 'yes: retrieve evidence' : 'search by relevance');
   add('Evidence available?', 'retrieval returned source turns', evidence.length ? `${evidence.length} candidate turn(s)` : 'none: historical claims should be qualified');
   add('Engram vault search?', 'settings.vaultSearchEnabled', !settings.vaultSearchEnabled ? 'off: conversation-only retrieval' : vaultSearchError ? `unavailable: ${vaultSearchError.message}` : !vaultResult?.indexed ? 'enabled: vault index is missing or stale' : `${vaultResult.hits?.length || 0} note candidate(s) retrieved`);
-  const conflict = memory.conflicts.some(c => c.status === 'unresolved');
-  add('Unresolved conflict?', 'matching assertions conflict', conflict ? 'preserve both; clarify when relevant' : 'no active conflict detected');
+  const conflicts = relevantConflicts(memory, message);
+  add('Relevant unresolved conflicts?', 'a retained assertion conflicts with this request', conflicts.length ? `${conflicts.length} conflict(s): preserve both assertions and qualify the answer` : 'none relevant to this request');
   add('Context budget', 'usable input tokens > 0', settings.contextLimit - settings.outputReserve - settings.safetyMargin > 0 ? 'pack ranked context' : 'invalid budget: do not send');
   return { asksHistory, trace };
 }

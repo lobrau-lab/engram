@@ -4,6 +4,7 @@
 //! points: v0.2/v0.3 upgrades are additive rather than rewrites.
 
 pub mod ai;
+pub mod atomic_write;
 pub mod backup;
 pub mod config;
 pub mod crawler;
@@ -12,6 +13,7 @@ pub mod embed;
 pub mod error;
 pub mod events;
 pub mod index;
+pub mod import;
 pub mod sync;
 pub mod vault;
 
