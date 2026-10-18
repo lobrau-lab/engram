@@ -6,7 +6,11 @@ Engram Dump accepts pasted text and explicitly selected `.md`, `.markdown`,
 and `.txt` files. It stores immutable local intake records before analysis.
 The core now validates and stores versioned, source-hash-linked structured
 suggestions after an explicit local **Analyze** call. Review and apply UI/API
-work remains separate from this core storage step.
+The review page now persists accept/reject decisions and supports a safe
+`create_note` apply operation with source-hash checks, destination conflict and
+symlink checks, atomic writes, provenance frontmatter, audit records, and
+idempotent retries. Append/link/tag proposals remain visible but are not yet
+eligible for application.
 
 The import store now preserves explicitly selected files under
 `.engram/imports/originals/`, records per-file status/provenance, and supports

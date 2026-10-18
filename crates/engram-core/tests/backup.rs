@@ -23,3 +23,24 @@ fn encrypted_backup_round_trip_and_wrong_password_fails() {
     let _ = fs::remove_dir_all(source);
     let _ = fs::remove_dir_all(restored);
 }
+
+#[test]
+fn restore_refuses_existing_destination_and_truncated_headers() {
+    let source = temp("backup-existing-source");
+    let destination = temp("backup-existing-destination");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("note.md"), "note").unwrap();
+    let archive = source.with_extension("engram");
+    backup::create(&source, &archive, "password").unwrap();
+    fs::create_dir_all(&destination).unwrap();
+    fs::write(destination.join("keep.md"), "keep").unwrap();
+    assert!(backup::restore(&archive, &destination, "password").is_err());
+    assert_eq!(fs::read_to_string(destination.join("keep.md")).unwrap(), "keep");
+    let truncated = source.with_extension("truncated.engram");
+    fs::write(&truncated, b"ENGRAM-BACKUP-1\n\x01").unwrap();
+    let fresh = source.with_extension("fresh");
+    assert!(backup::restore(&truncated, &fresh, "password").is_err());
+    assert!(!fresh.exists());
+    let _ = fs::remove_dir_all(source);
+    let _ = fs::remove_dir_all(destination);
+}

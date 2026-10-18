@@ -101,8 +101,35 @@ impl Index {
         Ok(())
     }
 
+    /// Replace the derived index in one transaction. If any note fails, the
+    /// previous searchable index remains available.
+    pub fn rebuild(&self, notes: &[Note], embedder: &dyn Embedder, indexed_at: i64) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch("DELETE FROM notes; DELETE FROM notes_fts; DELETE FROM meta WHERE key = 'last_indexed';")?;
+        for note in notes {
+            let tags = note.tags.join(",");
+            let links = note.links.join(",");
+            let embedding = f32s_to_bytes(&embedder.embed(&format!("{} {} {}", note.title, note.body, tags)));
+            tx.execute(
+                "INSERT INTO notes(id, title, body, tags, links, mtime, embedding) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![note.id, note.title, note.body, tags, links, note.mtime, embedding],
+            )?;
+            tx.execute(
+                "INSERT INTO notes_fts(id, title, body, tags) VALUES(?1, ?2, ?3, ?4)",
+                params![note.id, note.title, note.body, tags],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES('last_indexed', ?1)",
+            params![indexed_at.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn set_last_indexed(&self, ts: i64) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO meta(key, value) VALUES('last_indexed', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![ts.to_string()],
@@ -136,7 +163,8 @@ impl Index {
         let emb = embedder.embed(&format!("{} {} {}", note.title, note.body, tags));
         let emb_bytes = f32s_to_bytes(&emb);
 
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO notes(id, title, body, tags, links, mtime, embedding)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(id) DO UPDATE SET
@@ -149,12 +177,13 @@ impl Index {
             params![note.id, note.title, note.body, tags, links, note.mtime, emb_bytes],
         )?;
 
-        self.conn
-            .execute("DELETE FROM notes_fts WHERE id = ?1", params![note.id])?;
-        self.conn.execute(
+        tx.execute(
+            "DELETE FROM notes_fts WHERE id = ?1", params![note.id])?;
+        tx.execute(
             "INSERT INTO notes_fts(id, title, body, tags) VALUES(?1, ?2, ?3, ?4)",
             params![note.id, note.title, note.body, tags],
         )?;
+        tx.commit()?;
         Ok(())
     }
 

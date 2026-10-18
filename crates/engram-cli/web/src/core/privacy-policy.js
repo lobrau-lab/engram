@@ -9,6 +9,11 @@ export function classifyEndpoint(value) {
   return { allowed: true, kind: loopback ? 'local' : 'remote', origin: url.origin, url };
 }
 
+export function canSendVaultContext(endpointValue, enabled) {
+  const endpoint = classifyEndpoint(endpointValue);
+  return Boolean(enabled && endpoint.allowed && endpoint.kind === 'local');
+}
+
 export function requestCategories({ messages = [], tools = [] } = {}) {
   const categories = [];
   if (messages.some(item => item.role === 'user')) categories.push('current message');

@@ -1,6 +1,7 @@
 //! Configuration and device identity.
 
 use anyhow::{Context, Result};
+use crate::atomic_write;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -91,7 +92,7 @@ impl Config {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let text = toml::to_string_pretty(self).context("serializing config")?;
-        std::fs::write(path, text)
+        atomic_write::replace(path, text.as_bytes())
             .with_context(|| format!("writing config {}", path.display()))?;
         Ok(())
     }

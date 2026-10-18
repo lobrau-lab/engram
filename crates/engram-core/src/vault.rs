@@ -78,8 +78,18 @@ impl Vault {
     }
 
     pub fn read_note(&self, id: &str) -> Result<Note> {
-        let path = self.root.join(id);
+        let path = self.resolve_read_path(id)?;
         self.load_note(&path)
+    }
+
+    /// Resolve a vault-relative note without following a path outside the
+    /// canonical vault root. Core callers get the same protection as routes.
+    pub fn resolve_read_path(&self, id: &str) -> Result<PathBuf> {
+        let relative = validate_relative_path(Path::new(id))?;
+        let root = self.root.canonicalize()?;
+        let path = root.join(relative).canonicalize()?;
+        if !path.starts_with(&root) { anyhow::bail!("note path escapes vault") }
+        Ok(path)
     }
 
     fn load_note(&self, path: &Path) -> Result<Note> {

@@ -79,7 +79,18 @@ const registeredTools = [
     confirmation: 'Clear all locally stored conversations, memory, and settings? This cannot be undone.',
     parameters: { type: 'object', properties: {}, additionalProperties: false }
   }
-].map(tool => Object.freeze({ ...tool, dataClasses: Object.freeze([...tool.dataClasses]) }));
+].map(tool => Object.freeze({
+  ...tool,
+  version: tool.version || 1,
+  capabilityId: tool.capabilityId || tool.scope,
+  approvalPolicy: tool.approval,
+  reversibility: tool.reversibility || (tool.effect === 'destructive_local_delete' ? 'irreversible' : 'reversible'),
+  executorId: tool.executorId || tool.name,
+  timeoutMs: tool.timeoutMs || 5000,
+  idempotency: tool.idempotency || 'invocation-id',
+  scopeResolver: tool.scopeResolver || 'static-threadline-scope',
+  dataClasses: Object.freeze([...tool.dataClasses])
+}));
 
 const registry = new Map(registeredTools.map(tool => [tool.name, tool]));
 
@@ -91,6 +102,15 @@ export const applicationTools = registeredTools.map(({ name, description, parame
 
 export function getRegisteredTool(name) {
   return registry.get(name) || null;
+}
+
+export function validateToolManifest(tool) {
+  if (!tool || typeof tool.name !== 'string' || !Number.isInteger(tool.version) || !tool.capabilityId ||
+      !tool.effect || !['low', 'medium', 'high', 'critical'].includes(tool.risk) ||
+      !['local', 'remote'].includes(tool.destination) || !Array.isArray(tool.dataClasses) ||
+      !tool.executorId || !Number.isSafeInteger(tool.timeoutMs) || tool.timeoutMs < 1 ||
+      !tool.idempotency || !tool.scopeResolver) return 'incomplete manifest';
+  return null;
 }
 
 export function listRegisteredTools() {

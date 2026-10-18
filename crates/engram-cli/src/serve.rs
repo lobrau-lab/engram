@@ -3,21 +3,34 @@ use engram_core::ai::ChatOpts;
 use engram_core::dump;
 use engram_core::index::Index;
 use engram_core::vault::validate_relative_path;
-use engram_core::{build_context_prompt, Config, HashingEmbedder, LlmClient, OpenAiCompat, Vault};
+use engram_core::{atomic_write, build_context_prompt, Config, HashingEmbedder, LlmClient, OpenAiCompat, Vault};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+use std::time::Duration;
+
+const MAX_HEADER_BYTES: usize = 16 * 1024;
+const MAX_BODY_BYTES: usize = 512 * 1024;
 
 pub fn run(vault: &Path, host: &str, port: u16) -> Result<()> {
+    validate_bind_host(host)?;
     let listener = TcpListener::bind((host, port))
         .with_context(|| format!("binding local workspace at {host}:{port}"))?;
     run_listener(vault, listener, false)
 }
 
 pub fn open(vault: &Path, host: &str, port: u16) -> Result<()> {
+    validate_bind_host(host)?;
     let listener = TcpListener::bind((host, port))
         .with_context(|| format!("binding local workspace at {host}:{port}"))?;
     run_listener(vault, listener, true)
+}
+
+fn validate_bind_host(host: &str) -> Result<()> {
+    if matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]") {
+        return Ok(());
+    }
+    anyhow::bail!("Engram is local-only and only binds to localhost, 127.0.0.1, or ::1")
 }
 
 fn run_listener(vault: &Path, listener: TcpListener, launch_browser: bool) -> Result<()> {
@@ -51,26 +64,21 @@ fn run_listener(vault: &Path, listener: TcpListener, launch_browser: bool) -> Re
 }
 
 fn handle(vault: &Path, mut stream: TcpStream) -> Result<()> {
-    let mut buffer = [0u8; 256 * 1024];
-    let size = stream.read(&mut buffer)?;
-    let request = String::from_utf8_lossy(&buffer[..size]);
-    let mut lines = request.lines();
-    let request_line = lines.next().context("missing request line")?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let target = parts.next().unwrap_or("/");
-    let body = request
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body)
-        .unwrap_or("");
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let (method, target, body) = read_request(&mut stream)?;
 
-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    let response = match (method, path) {
+    let (path, query) = target.as_str().split_once('?').unwrap_or((target.as_str(), ""));
+    let response = match (method.as_str(), path) {
         ("GET", "/") | ("GET", "/vault") => render_index(vault, query)?,
         ("GET", "/threadline") => redirect("/threadline/"),
         ("GET", "/dump") => render_dump(vault)?,
-        ("POST", "/api/v1/dump") => submit_dump(vault, body)?,
+        ("GET", "/dump/review") => render_dump_review(vault, query)?,
+        ("POST", "/api/v1/dump") => submit_dump(vault, &body)?,
         ("POST", path) if path.starts_with("/api/v1/dump/") && path.ends_with("/analyze") => analyze_dump(vault, path)?,
+        ("POST", path) if path.starts_with("/api/v1/dump/") && path.ends_with("/review") => review_dump(vault, path, &body)?,
+        ("POST", path) if path.starts_with("/api/v1/dump/") && path.ends_with("/apply") => apply_dump(vault, path, &body)?,
+        ("POST", path) if path.starts_with("/api/v1/dump/") && path.ends_with("/undo") => undo_dump(vault, path, &body)?,
         ("GET", "/threadline/") | ("GET", "/threadline/index.html") => {
             response(200, "text/html; charset=utf-8", include_str!("../web/index.html"))
         }
@@ -103,15 +111,45 @@ fn handle(vault: &Path, mut stream: TcpStream) -> Result<()> {
         }
         ("GET", "/note") => render_note(vault, query)?,
         ("GET", "/new") => render_new()?,
-        ("POST", "/new") => create_note(vault, body)?,
+        ("POST", "/new") => create_note(vault, &body)?,
         ("GET", "/graph") => render_graph(vault)?,
-        ("POST", "/save") => save_note(vault, body)?,
+        ("POST", "/save") => save_note(vault, &body)?,
         ("GET", "/ask") => render_ask()?,
-        ("POST", "/ask") => ask(vault, body)?,
+        ("POST", "/ask") => ask(vault, &body)?,
         _ => response(404, "text/plain; charset=utf-8", "Not found"),
     };
     stream.write_all(&response)?;
     Ok(())
+}
+
+fn read_request(stream: &mut TcpStream) -> Result<(String, String, String)> {
+    let mut header = Vec::new();
+    let mut byte = [0u8; 1];
+    while !header.windows(4).any(|w| w == b"\r\n\r\n") {
+        if header.len() >= MAX_HEADER_BYTES { anyhow::bail!("request headers exceed limit") }
+        stream.read_exact(&mut byte).context("reading request headers")?;
+        header.push(byte[0]);
+    }
+    let text = std::str::from_utf8(&header).context("request headers are not UTF-8")?;
+    let mut lines = text.split("\r\n");
+    let request_line = lines.next().context("missing request line")?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().context("missing HTTP method")?.to_string();
+    let target = parts.next().context("missing HTTP target")?.to_string();
+    let mut content_length = None;
+    for line in lines.filter(|line| !line.is_empty()) {
+        let (name, value) = line.split_once(':').context("malformed HTTP header")?;
+        if name.eq_ignore_ascii_case("transfer-encoding") { anyhow::bail!("transfer encoding is unsupported") }
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() { anyhow::bail!("duplicate content-length") }
+            content_length = Some(value.trim().parse::<usize>().context("invalid content-length")?);
+        }
+    }
+    let length = content_length.unwrap_or(0);
+    if length > MAX_BODY_BYTES { anyhow::bail!("request body exceeds limit") }
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body).context("reading complete request body")?;
+    Ok((method, target, String::from_utf8(body).context("request body is not UTF-8")?))
 }
 
 fn render_index(vault: &Path, query: &str) -> Result<Vec<u8>> {
@@ -164,9 +202,19 @@ fn search_vault_api(vault: &Path, query: &str) -> Result<String> {
 
 fn render_dump(vault: &Path) -> Result<Vec<u8>> {
     let items = dump::list(vault)?;
-    let rows = items.iter().map(|item| format!("<li><b>{}</b> <small>{} · {} bytes · {}</small> <form method=\"post\" action=\"/api/v1/dump/{}/analyze\" style=\"display:inline\"><button>Analyze locally</button></form></li>", escape(&item.filename), escape(&item.id), item.content.len(), escape(&item.status), encode(&item.id))).collect::<String>();
+    let rows = items.iter().map(|item| format!("<li><b>{}</b> <small>{} · {} bytes · {}</small> <a href=\"/dump/review?id={}\">Review</a> <form method=\"post\" action=\"/api/v1/dump/{}/analyze\" style=\"display:inline\"><button>Analyze locally</button></form></li>", escape(&item.filename), escape(&item.id), item.content.len(), escape(&item.status), encode(&item.id), encode(&item.id))).collect::<String>();
     let html = format!("<a href=\"/\">← Vault</a><h1>Dump / Inbox</h1><p>Supported now: pasted text, Markdown, and plain text. Items remain pending and are not indexed until approval.</p><textarea id=\"paste\" placeholder=\"Paste text here…\"></textarea><button id=\"submit-paste\">Add pasted text</button><p><input id=\"files\" type=\"file\" multiple accept=\".md,.markdown,.txt,text/plain,text/markdown\"></p><ul>{rows}</ul><script>const send=(filename,source,content)=>fetch('/api/v1/dump',{{method:'POST',headers:{{'content-type':'application/x-www-form-urlencoded'}},body:new URLSearchParams({{filename,source,content}})}}).then(r=>r.ok?r.text():r.text().then(t=>Promise.reject(t))).then(()=>location.reload());document.querySelector('#submit-paste').onclick=()=>send('pasted-text.txt','paste',document.querySelector('#paste').value);document.querySelector('#files').onchange=e=>Promise.all([...e.target.files].map(f=>new Promise((ok,bad)=>{{const r=new FileReader();r.onload=()=>send(f.name,'file',r.result).then(ok,bad);r.onerror=bad;r.readAsText(f)}})));</script>");
     Ok(page("Dump / Inbox", &html))
+}
+
+fn render_dump_review(vault: &Path, query: &str) -> Result<Vec<u8>> {
+    let id = parameter(query, "id").context("missing dump id")?;
+    let item = dump::get(vault, &id)?;
+    let analysis = dump::get_analysis(vault, &id).ok();
+    let suggestions = analysis.map(|a| a.suggestions).unwrap_or_default();
+    let cards = suggestions.iter().map(|s| format!("<article><h3>{} · {}</h3><p><b>Source evidence:</b> {}</p><p>{}</p><form method=\"post\" action=\"/api/v1/dump/{}/review\"><input type=\"hidden\" name=\"suggestion_id\" value=\"{}\"><label>Path <input name=\"path\" value=\"{}\"></label><label>Title <input name=\"title\" value=\"{}\"></label><label>Body <textarea name=\"body\">{}</textarea></label><button name=\"status\" value=\"accepted\">Accept proposal</button><button name=\"status\" value=\"rejected\">Reject</button></form><h4>Preview</h4><pre>{}</pre>{}<form method=\"post\" action=\"/api/v1/dump/{}/apply\"><input type=\"hidden\" name=\"suggestion_id\" value=\"{}\"><button>Apply accepted proposal</button></form>{}</article>", escape(&s.kind), escape(&s.review_status), escape(&s.evidence), escape(&s.rationale), encode(&id), encode(&s.id), escape(s.edited_path.as_deref().or(s.path.as_deref()).unwrap_or("")), escape(s.edited_title.as_deref().or(s.title.as_deref()).unwrap_or("")), escape(s.edited_body.as_deref().or(s.body.as_deref()).unwrap_or("")), escape(&format!("# {}\n\n{}", s.edited_title.as_deref().or(s.title.as_deref()).unwrap_or("Untitled"), s.edited_body.as_deref().or(s.body.as_deref()).unwrap_or(""))), if s.review_status == "accepted" { "" } else { "<small>Accept before applying.</small>" }, encode(&id), encode(&s.id), if s.review_status == "applied" { format!("<form method=\"post\" action=\"/api/v1/dump/{}/undo\"><input type=\"hidden\" name=\"suggestion_id\" value=\"{}\"><button>Undo</button></form>", encode(&id), encode(&s.id)) } else { String::new() })).collect::<String>();
+    let html = format!("<a href=\"/dump\">← Inbox</a><h1>Review dump item</h1><p><b>Original source:</b> {}</p><pre>{}</pre><section>{}</section>", escape(&item.filename), escape(&item.content), cards);
+    Ok(page("Dump review", &html))
 }
 
 fn submit_dump(vault: &Path, body: &str) -> Result<Vec<u8>> {
@@ -184,6 +232,25 @@ fn analyze_dump(vault: &Path, path: &str) -> Result<Vec<u8>> {
     let client = OpenAiCompat::new(config.llm_base, config.llm_model, config.llm_key, config.provider);
     let analysis = dump::analyze(vault, id, &client)?;
     Ok(response(200, "application/json; charset=utf-8", &serde_json::to_string(&analysis)?))
+}
+
+fn review_dump(vault: &Path, path: &str, body: &str) -> Result<Vec<u8>> {
+    let id = path.strip_prefix("/api/v1/dump/").and_then(|x| x.strip_suffix("/review")).unwrap_or("");
+    dump::review(vault, id, &parameter(body, "suggestion_id").context("missing suggestion id")?, &parameter(body, "status").unwrap_or_default(), parameter(body, "path"), parameter(body, "title"), parameter(body, "body"))?;
+    Ok(redirect(&format!("/dump/review?id={}", encode(id))))
+}
+
+fn apply_dump(vault: &Path, path: &str, body: &str) -> Result<Vec<u8>> {
+    let id = path.strip_prefix("/api/v1/dump/").and_then(|x| x.strip_suffix("/apply")).unwrap_or("");
+    let suggestion_id = parameter(body, "suggestion_id").context("missing suggestion id")?;
+    let report = dump::apply(vault, id, &[suggestion_id])?;
+    Ok(response(200, "application/json; charset=utf-8", &serde_json::to_string(&report)?))
+}
+
+fn undo_dump(vault: &Path, path: &str, body: &str) -> Result<Vec<u8>> {
+    let id = path.strip_prefix("/api/v1/dump/").and_then(|x| x.strip_suffix("/undo")).unwrap_or("");
+    dump::undo(vault, id, &parameter(body, "suggestion_id").context("missing suggestion id")?)?;
+    Ok(redirect(&format!("/dump/review?id={}", encode(id))))
 }
 
 fn render_graph(vault: &Path) -> Result<Vec<u8>> {
@@ -242,7 +309,7 @@ fn save_note(vault: &Path, body: &str) -> Result<Vec<u8>> {
     let content = parameter(body, "body").context("missing note body")?;
     if let Some(parent) = vault.join(&relative).parent() { std::fs::create_dir_all(parent)?; }
     let path = safe_path(vault, &relative, true)?;
-    std::fs::write(&path, content)
+    atomic_write::replace(&path, content.as_bytes())
         .with_context(|| format!("writing note {}", relative.display()))?;
     let config_path = vault.join(".engram").join("config.toml");
     let config = if config_path.exists() { Config::load(&config_path)? } else { Config::new(vault) };
@@ -264,7 +331,7 @@ fn create_note(vault: &Path, body: &str) -> Result<Vec<u8>> {
     }
     let path = safe_path(vault, &relative, true)?;
     if path.exists() { anyhow::bail!("note already exists: {}", relative.display()) }
-    std::fs::write(&path, parameter(body, "body").unwrap_or_default())?;
+    atomic_write::replace(&path, parameter(body, "body").unwrap_or_default().as_bytes())?;
     Ok(redirect(&format!("/note?path={}", encode(relative.to_string_lossy().as_ref()))))
 }
 
@@ -439,4 +506,23 @@ fn markdown_html(markdown: &str) -> String {
     }
     if in_code { html.push_str("</code></pre>"); }
     html
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_bind_host;
+
+    #[test]
+    fn accepts_loopback_bind_hosts() {
+        for host in ["127.0.0.1", "localhost", "::1", "[::1]"] {
+            assert!(validate_bind_host(host).is_ok(), "{host}");
+        }
+    }
+
+    #[test]
+    fn rejects_non_loopback_and_ambiguous_hosts() {
+        for host in ["0.0.0.0", "192.168.1.10", "10.0.0.2", "example.com", "::"] {
+            assert!(validate_bind_host(host).is_err(), "{host}");
+        }
+    }
 }

@@ -4,7 +4,8 @@ import { packContext } from './core/context-packer.js';
 import { listModels, streamChat } from './providers/openai-compatible.js';
 import { searchEngramVault } from './providers/engram-vault.js';
 import { applicationTools, executeApplicationAction } from './core/app-actions.js';
-import { classifyEndpoint, requestCategories, confirmDisclosure } from './core/privacy-policy.js';
+import { classifyEndpoint, canSendVaultContext, requestCategories, confirmDisclosure } from './core/privacy-policy.js';
+import { runMemoryBench } from './core/evaluation-bench.js';
 
 const $ = selector => document.querySelector(selector);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
@@ -96,13 +97,16 @@ function switchView(view) {
   document.querySelectorAll('.nav-item').forEach(item => item.classList.toggle('active', item.dataset.view === view));
   $('#chat-view').classList.toggle('hidden', view !== 'chat');
   $('#workspace-view').classList.toggle('hidden', view === 'chat');
-  const labels = { chat: current().title, memory: 'Memory ledger', rules: 'Decision rules', settings: 'Connections & settings' };
+  const labels = { chat: current().title, memory: 'Memory ledger', bench: 'Memory bench', rules: 'Decision rules', settings: 'Connections & settings' };
   $('#top-title').textContent = labels[view]; if (view !== 'chat') renderWorkspaceView();
 }
 
 function renderWorkspaceView() {
   const host = $('#workspace-view'); const memory = current().memory;
-  if (currentView === 'memory') {
+  if (currentView === 'bench') {
+    const report = runMemoryBench();
+    host.innerHTML = `<div class="page-heading"><div class="eyebrow">OFFLINE REPLAY</div><h1>Memory bench</h1><p>Synthetic conversations only. This measures retrieval and packing behavior; it does not prove general memory accuracy.</p><div class="ledger-grid"><section class="ledger-card"><h2>Baseline results</h2><p>Evidence recall: ${(report.evidenceRecall * 100).toFixed(0)}%</p><p>Irrelevant selection rate: ${(report.irrelevantSelectionRate * 100).toFixed(0)}%</p><p>Budget compliance: ${(report.budgetCompliance * 100).toFixed(0)}%</p><p>Conflict cases: ${report.conflictCases.join(', ') || 'none detected'}</p></section>${report.results.map(result => `<section class="ledger-card"><div class="ledger-head"><span>${result.expectedFound ? '✓' : '!'}</span><h2>${result.id}</h2></div><p><b>Query:</b> ${esc(result.query)}</p><p><b>Expected evidence:</b> ${result.expectedEvidence.join(', ') || 'none'}</p><p><b>Selected:</b> ${result.selectedEvidence.join(', ') || 'none'}</p><p><b>Excluded-but-selected:</b> ${result.irrelevantSelected.join(', ') || 'none'}</p><p><b>Budget:</b> ~${result.estimatedInputTokens} / ${result.usableInput} estimated tokens</p></section>`).join('')}</div></div>`;
+  } else if (currentView === 'memory') {
     host.innerHTML = `<div class="page-heading"><div class="eyebrow">CONVERSATION STATE</div><h1>Memory ledger</h1><p>A compact set of variables that points back to the original conversation. Nothing here replaces the transcript.</p></div><div class="ledger-grid">${[['Current goal', memory.currentGoal, '01'], ['Active topics', memory.activeTopics, '02'], ['Decisions', memory.decisions, '03'], ['Constraints', memory.constraints, '04'], ['Preferences', memory.preferences, '05'], ['Open questions', memory.openQuestions, '06']].map(([title, items, num]) => `<section class="ledger-card"><div class="ledger-head"><span>${num}</span><h2>${title}</h2><small>${items.length} variables</small></div>${items.length ? items.map(item => `<div class="ledger-item"><p>${esc(item.text)}</p><div><span class="direct-label">DIRECTLY DERIVED</span><span>Source ${item.sourceTurnIds?.map(id => id.slice(0, 8)).join(', ')}</span></div></div>`).join('') : '<div class="ledger-empty">New user messages can add a source-linked variable here.</div>'}</section>`).join('')}</div><div class="transcript-strip"><div><span class="eyebrow">SOURCE OF RECORD</span><h2>Conversation transcript</h2><p>${current().turns.length} immutable turns in this conversation.</p></div><button class="secondary-button" id="back-to-chat">Return to chat ↗</button></div>`;
   } else if (currentView === 'rules') {
     host.innerHTML = `<div class="page-heading"><div class="eyebrow">POLICY ENGINE</div><h1>Decision rules</h1><p>The “growing if statement” is an inspectable set of small policies. Each module can be swapped without rewriting the chat flow.</p></div><div class="rule-catalog">${[['01','Memory gate','IF memory is disabled, skip extraction and retrieval.','Memory policy'],['02','Evidence gate','IF a response recalls the conversation, retrieve and attach source turns.','Evidence policy'],['03','Correction handling','IF a correction is explicit, supersede the derived assertion and retain both source turns.','Conflict policy'],['04','Ambiguity handling','IF incompatible statements lack a clear correction, preserve both and surface uncertainty.','Conflict policy'],['05','Budget gate','IF candidate context exceeds the usable budget, rank and omit optional items first.','Packing policy'],['06','Provider fallback','IF the endpoint fails, preserve the draft and show a retryable connection error.','Provider policy']].map(([n,title,rule,module]) => `<article class="rule-card"><span class="rule-index">${n}</span><div><span class="module-label">${module}</span><h2>${title}</h2><p>${rule}</p></div><span class="rule-enabled">ENABLED <i></i></span></article>`).join('')}</div><div class="rule-note"><span>i</span><p>These starter rules are deterministic and transparent. Language extraction is a lightweight heuristic in this prototype; it is not a truth detector.</p></div>`;
@@ -150,6 +154,10 @@ async function submitMessage(message) {
   if (sending || !message.trim()) return;
   const settings = getWorkspace().settings;
   if (!settings.model) { switchView('settings'); toast('Connect a model before sending.'); return; }
+  const endpoint = classifyEndpoint(settings.baseUrl);
+  if (!endpoint.allowed) { toast(`Request blocked: ${endpoint.reason}`); return; }
+  const allowVaultContext = canSendVaultContext(settings.baseUrl, settings.vaultSearchEnabled);
+  if (settings.vaultSearchEnabled && !allowVaultContext) toast('Vault context is disabled for remote inference.');
   sending = true; $('#send-button').textContent = '■'; $('#send-button').setAttribute('aria-label', 'Stop generation');
   aborter = new AbortController();
   const userTurn = appendTurn({ role: 'user', content: message.trim() });
@@ -157,7 +165,7 @@ async function submitMessage(message) {
   if (settings.memoryEnabled) { updateMemory(recordAndUpdate(convo.memory, userTurn)); convo = current(); }
   const evidence = settings.memoryEnabled && settings.strategy !== 'recent' ? retrieveEvidence(convo.turns, message, convo.memory, 5) : [];
   let vaultResult = { indexed: false, hits: [] }; let vaultSearchError = null;
-  if (settings.vaultSearchEnabled) {
+  if (allowVaultContext) {
     try {
       vaultResult = await searchEngramVault(message, { signal: aborter.signal });
       if (!vaultResult.indexed) toast('Engram has no indexed vault yet. Run `engram index`, then retry.');
@@ -168,8 +176,6 @@ async function submitMessage(message) {
   }
   const decision = evaluateRules({ message, memory: convo.memory, evidence, settings, vaultResult, vaultSearchError });
   const pack = packContext({ message, history: convo.turns, memory: settings.memoryEnabled && settings.strategy !== 'recent' ? convo.memory : { ...convo.memory, currentGoal: [], activeTopics: [], decisions: [], constraints: [], preferences: [], openQuestions: [] }, evidence: settings.strategy === 'state' ? [] : evidence, vaultNotes: vaultResult.hits || [], settings });
-  const endpoint = classifyEndpoint(settings.baseUrl);
-  if (!endpoint.allowed) { appendTurn({ role: 'assistant', content: `Request blocked: ${endpoint.reason}` }); sending = false; $('#send-button').textContent = '↑'; renderAll(); return; }
   if (endpoint.kind === 'remote') {
     const approved = await confirmDisclosure({ endpoint: endpoint.origin, apiKey: getSessionApiKey(), categories: requestCategories({ messages: pack.messages, tools: applicationTools }), chars: JSON.stringify(pack.messages).length });
     if (!approved) { toast('Remote request cancelled. Your message remains in local history.'); sending = false; $('#send-button').textContent = '↑'; renderAll(); return; }
@@ -211,7 +217,8 @@ async function submitMessage(message) {
       placeholder.querySelector('.thinking-text').innerHTML = '<span class="stream-state"><i></i> applying requested workspace action</span>';
       const toolMessages = [];
       for (const call of toolCalls) {
-        const result = executeApplicationAction(call.function.name, call.function.arguments, {
+          const result = executeApplicationAction(call.function.name, call.function.arguments, {
+           actionId: call.id,
           openView: switchView,
           updateSettings: patch => { updateSettings(patch); renderAll(); },
           getMemory: () => current().memory,

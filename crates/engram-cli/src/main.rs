@@ -129,6 +129,7 @@ fn cmd_import_files(vault: &Path, config_path: &Path, source: &Path) -> Result<(
         if !matches!(entry.path().extension().and_then(|x| x.to_str()), Some("md") | Some("markdown") | Some("txt")) { continue; }
         let target = destination.join(entry.path().strip_prefix(&root)?);
         if let Some(parent) = target.parent() { std::fs::create_dir_all(parent)?; }
+        if target.exists() { anyhow::bail!("import destination already exists: {}", target.display()); }
         std::fs::copy(entry.path(), &target)?;
         copied += 1;
     }
@@ -185,12 +186,8 @@ fn cmd_index(vault: &Path, config_path: &Path) -> Result<()> {
     let v = Vault::open(vault.to_path_buf())?;
     let notes = v.scan()?;
     let idx = Index::open(&cfg.db)?;
-    idx.clear()?;
     let embedder = HashingEmbedder::new(cfg.embed_dim);
-    for note in &notes {
-        idx.upsert(note, &embedder)?;
-    }
-    idx.set_last_indexed(unix_now())?;
+    idx.rebuild(&notes, &embedder, unix_now())?;
     println!("indexed {} notes into {}", notes.len(), cfg.db.display());
     Ok(())
 }
