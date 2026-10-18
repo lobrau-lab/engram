@@ -1,11 +1,21 @@
+import { classifyEndpoint } from '../core/privacy-policy.js';
+
+function endpoint(baseUrl) {
+  const result = classifyEndpoint(baseUrl);
+  if (!result.allowed) throw new Error(result.reason);
+  return result;
+}
+
 export async function listModels({ baseUrl, apiKey }) {
-  const response = await fetch(`${baseUrl.replace(/\/$/, '')}/models`, { headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {} });
+  const target = endpoint(baseUrl);
+  const response = await fetch(`${target.url.toString().replace(/\/$/, '')}/models`, { headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {} });
   if (!response.ok) throw new Error(`Model discovery failed (${response.status}). Check the endpoint, key, and server CORS settings.`);
   const data = await response.json(); return data.data || [];
 }
 
 export async function* streamChat({ baseUrl, apiKey, model, messages, tools, signal }) {
-  const response = await fetch(`${baseUrl.replace(/\/$/, '')}/chat/completions`, {
+  const target = endpoint(baseUrl);
+  const response = await fetch(`${target.url.toString().replace(/\/$/, '')}/chat/completions`, {
     method: 'POST', signal,
     headers: { 'Content-Type': 'application/json', ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
     body: JSON.stringify({ model, messages, ...(tools?.length ? { tools, tool_choice: 'auto' } : {}), stream: true, temperature: 0.7 })

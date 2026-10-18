@@ -1,9 +1,10 @@
-import { getWorkspace, activeConversation, appendTurn, createConversation, setActiveConversation, updateActive, updateMemory, updateSettings, subscribe, clearWorkspace, removeAssertion } from './core/store.js';
+import { getWorkspace, activeConversation, appendTurn, createConversation, setActiveConversation, updateActive, updateMemory, updateSettings, subscribe, clearWorkspace, removeAssertion, getSessionApiKey, setSessionApiKey } from './core/store.js';
 import { recordAndUpdate, retrieveEvidence, evaluateRules } from './core/memory-manager.js';
 import { packContext } from './core/context-packer.js';
 import { listModels, streamChat } from './providers/openai-compatible.js';
 import { searchEngramVault } from './providers/engram-vault.js';
 import { applicationTools, executeApplicationAction } from './core/app-actions.js';
+import { classifyEndpoint, requestCategories, confirmDisclosure } from './core/privacy-policy.js';
 
 const $ = selector => document.querySelector(selector);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
@@ -44,14 +45,14 @@ function renderMessages() {
     const turnSources = turn.sourceTurnIds || []; const noteSources = turn.sourceNoteIds || [];
     const sourceCount = turnSources.length + noteSources.length;
     const sourceDetails = [...turnSources.map(id => `turn ${id.slice(0, 8)}`), ...noteSources.map(id => `<a href="/note?path=${encodeURIComponent(id)}">${esc(id)}</a>`)];
-    return `<article class="message-row ${turn.role === 'assistant' ? 'assistant-row' : 'user-row'}"><div class="message-avatar ${turn.role}">${turn.role === 'assistant' ? '<img src="./assets/engram-mark.png" alt="" />' : 'T'}</div><div class="message-main"><div class="message-meta"><strong>${turn.role === 'assistant' ? 'Threadline' : 'You'}</strong><time>${new Date(turn.timestamp).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</time>${turn.role === 'assistant' && sourceCount ? `<span class="source-badge">⌘ ${sourceCount} sources</span>` : ''}</div><div class="message-text">${esc(turn.content).replace(/\n/g, '<br>')}</div>${turn.role === 'assistant' && sourceCount ? `<details class="message-sources"><summary>Sources used</summary><span>${sourceDetails.join(' · ')}</span></details>` : ''}</div><button class="message-more" title="Message actions">···</button></article>`;
+    return `<article class="message-row ${turn.role === 'assistant' ? 'assistant-row' : 'user-row'}"><div class="message-avatar ${turn.role}">${turn.role === 'assistant' ? '<img src="./assets/engram-mark.png" alt="" />' : 'T'}</div><div class="message-main"><div class="message-meta"><strong>${turn.role === 'assistant' ? 'Threadline' : 'You'}</strong><time>${new Date(turn.timestamp).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</time>${turn.role === 'assistant' && sourceCount ? `<span class="source-badge">⌘ ${sourceCount} sources</span>` : ''}</div><div class="message-text">${esc(turn.content).replace(/\n/g, '<br>')}</div>${turn.role === 'assistant' && sourceCount ? `<details class="message-sources"><summary>Sources used</summary><span>${sourceDetails.join(' · ')}</span></details>` : ''}</div></article>`;
   }).join('');
   msgs.scrollTop = msgs.scrollHeight;
 }
 
 function renderStatus() {
   const settings = getWorkspace().settings;
-  $('#connection-label').textContent = settings.model || 'Connect a model';
+  $('#connection-label').textContent = settings.model ? `${settings.model} · ${settings.connectionStatus || 'not tested'}` : 'Connect a model';
   $('#connection-pill').classList.toggle('configured', Boolean(settings.model));
   $('#budget-label').textContent = `Context · ${Math.round(settings.contextLimit / 1024)}k`;
   $('#vault-toggle').classList.toggle('active', Boolean(settings.vaultSearchEnabled));
@@ -119,9 +120,9 @@ function renderWorkspaceView() {
     }));
     $('#base-url').addEventListener('input', e => { $('#endpoint-preview').textContent = `${e.target.value.replace(/\/$/, '')}/chat/completions`; });
     $('#recent-turns').addEventListener('input', e => { $('#recent-value').textContent = e.target.value; });
-    $('#settings-form').addEventListener('submit', e => { e.preventDefault(); const form = new FormData(e.currentTarget); updateSettings({ baseUrl: form.get('baseUrl').trim().replace(/\/$/, ''), model: form.get('model').trim(), apiKey: form.get('apiKey'), contextLimit: Number(form.get('contextLimit')), outputReserve: Number(form.get('outputReserve')), safetyMargin: Number(form.get('safetyMargin')), recentTurns: Number(form.get('recentTurns')), strategy: form.get('strategy'), memoryEnabled: form.has('memoryEnabled'), showEvidence: form.has('showEvidence'), systemPrompt: form.get('systemPrompt') }); renderAll(); $('#connection-feedback').textContent = 'Settings saved locally'; toast('Settings saved in this browser.'); });
+    $('#settings-form').addEventListener('submit', e => { e.preventDefault(); const form = new FormData(e.currentTarget); setSessionApiKey(form.get('apiKey')); updateSettings({ baseUrl: form.get('baseUrl').trim().replace(/\/$/, ''), model: form.get('model').trim(), contextLimit: Number(form.get('contextLimit')), outputReserve: Number(form.get('outputReserve')), safetyMargin: Number(form.get('safetyMargin')), recentTurns: Number(form.get('recentTurns')), strategy: form.get('strategy'), memoryEnabled: form.has('memoryEnabled'), showEvidence: form.has('showEvidence'), systemPrompt: form.get('systemPrompt') }); renderAll(); $('#connection-feedback').textContent = 'Settings saved for this page session; reload requires re-entering the key.'; toast('Settings saved locally. API key is session-only.'); });
     $('#discover-models').addEventListener('click', discoverModels);
-    $('#test-connection').addEventListener('click', async () => { const feedback = $('#connection-feedback'); feedback.textContent = 'Checking endpoint…'; try { const models = await listModels({ baseUrl: $('#base-url').value.trim().replace(/\/$/, ''), apiKey: $('#api-key').value }); feedback.textContent = `Connected · ${models.length} model(s) found`; toast('Inference server responded.'); } catch (error) { feedback.textContent = error.message; } });
+    $('#test-connection').addEventListener('click', async () => { const feedback = $('#connection-feedback'); feedback.textContent = 'Checking endpoint…'; try { const baseUrl = $('#base-url').value.trim().replace(/\/$/, ''); const target = classifyEndpoint(baseUrl); if (!target.allowed) throw new Error(target.reason); const apiKey = $('#api-key').value; if (target.kind === 'remote' && !(await confirmDisclosure({ endpoint: target.origin, apiKey, discovery: true }))) return; const models = await listModels({ baseUrl, apiKey }); updateSettings({ connectionStatus: 'reachable', connectionTestedAt: new Date().toISOString() }); feedback.textContent = `Connected · ${models.length} model(s) found`; toast('Inference server responded.'); } catch (error) { updateSettings({ connectionStatus: 'unreachable', connectionTestedAt: new Date().toISOString() }); feedback.textContent = error.message; } });
     $('#reset-data').addEventListener('click', () => { if (confirm('Delete all conversations, memory, and settings stored by this prototype in this browser?')) { clearWorkspace(); location.reload(); } });
   }
   $('#back-to-chat')?.addEventListener('click', () => switchView('chat'));
@@ -131,7 +132,7 @@ async function discoverModels() {
   const button = $('#discover-models'); button.disabled = true; button.textContent = 'Loading…';
   const feedback = $('#connection-feedback');
   try {
-    const baseUrl = $('#base-url').value.trim().replace(/\/$/, ''); const apiKey = $('#api-key').value;
+    const baseUrl = $('#base-url').value.trim().replace(/\/$/, ''); const apiKey = $('#api-key').value; const target = classifyEndpoint(baseUrl); if (!target.allowed) throw new Error(target.reason); if (target.kind === 'remote' && !(await confirmDisclosure({ endpoint: target.origin, apiKey, discovery: true }))) return;
     const models = await listModels({ baseUrl, apiKey });
     if (!models.length) feedback.textContent = 'Connected, but the server returned no model IDs.';
     else {
@@ -167,6 +168,12 @@ async function submitMessage(message) {
   }
   const decision = evaluateRules({ message, memory: convo.memory, evidence, settings, vaultResult, vaultSearchError });
   const pack = packContext({ message, history: convo.turns, memory: settings.memoryEnabled && settings.strategy !== 'recent' ? convo.memory : { ...convo.memory, currentGoal: [], activeTopics: [], decisions: [], constraints: [], preferences: [], openQuestions: [] }, evidence: settings.strategy === 'state' ? [] : evidence, vaultNotes: vaultResult.hits || [], settings });
+  const endpoint = classifyEndpoint(settings.baseUrl);
+  if (!endpoint.allowed) { appendTurn({ role: 'assistant', content: `Request blocked: ${endpoint.reason}` }); sending = false; $('#send-button').textContent = '↑'; renderAll(); return; }
+  if (endpoint.kind === 'remote') {
+    const approved = await confirmDisclosure({ endpoint: endpoint.origin, apiKey: getSessionApiKey(), categories: requestCategories({ messages: pack.messages, tools: applicationTools }), chars: JSON.stringify(pack.messages).length });
+    if (!approved) { toast('Remote request cancelled. Your message remains in local history.'); sending = false; $('#send-button').textContent = '↑'; renderAll(); return; }
+  }
   updateActive({ lastAssembly: { audit: pack.audit, trace: decision.trace, evidence: evidence.map(item => ({ id: item.turn.id, score: item.score, label: item.evidence })), vault: { indexed: vaultResult.indexed, hits: vaultResult.hits || [], error: vaultSearchError?.message || null } } });
   if (pack.audit.estimatedInputTokens > pack.audit.usableInput) {
     appendTurn({ role: 'assistant', content: `This request and required instructions need an estimated ${pack.audit.estimatedInputTokens.toLocaleString()} input tokens, above the configured ${pack.audit.usableInput.toLocaleString()} token input budget. Increase the model context setting or shorten the request. The user message was kept in local history and was not sent.` });
@@ -175,13 +182,17 @@ async function submitMessage(message) {
   renderAll(); showThinking();
   const placeholder = $('#thinking-indicator');
   try {
-    let answer = '';
-    let requestMessages = pack.messages; let actionRounds = 0;
-    while (actionRounds++ < 3) {
-      let toolCalls = [];
+     let answer = '';
+     let requestMessages = pack.messages; let actionRounds = 0;
+     while (actionRounds++ < 3) {
+       if (endpoint.kind === 'remote' && actionRounds > 1) {
+         const approvedFollowUp = await confirmDisclosure({ endpoint: endpoint.origin, apiKey: getSessionApiKey(), categories: requestCategories({ messages: requestMessages, tools: [] }), chars: JSON.stringify(requestMessages).length });
+         if (!approvedFollowUp) { placeholder.remove(); toast('Remote follow-up cancelled. Local tool results were not sent.'); return; }
+       }
+       let toolCalls = [];
       let toolSupport = true;
       try {
-        for await (const event of streamChat({ ...settings, messages: requestMessages, tools: applicationTools, signal: aborter.signal })) {
+        for await (const event of streamChat({ ...settings, apiKey: getSessionApiKey(), messages: requestMessages, tools: applicationTools, signal: aborter.signal })) {
           if (event.type === 'token') { answer += event.content; placeholder.querySelector('.thinking-text').textContent = answer; $('#messages').scrollTop = $('#messages').scrollHeight; }
           if (event.type === 'tool_calls') toolCalls = event.calls;
         }
@@ -190,7 +201,7 @@ async function submitMessage(message) {
         toolSupport = false;
         answer = '';
         placeholder.querySelector('.thinking-text').innerHTML = '<span class="stream-state">Endpoint did not accept function tools · retrying chat without app actions</span>';
-        for await (const event of streamChat({ ...settings, messages: requestMessages, signal: aborter.signal })) {
+        for await (const event of streamChat({ ...settings, apiKey: getSessionApiKey(), messages: requestMessages, signal: aborter.signal })) {
           if (event.type === 'token') { answer += event.content; placeholder.querySelector('.thinking-text').textContent = answer; }
         }
       }

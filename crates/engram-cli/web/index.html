@@ -6,9 +6,6 @@
     <meta name="theme-color" content="#101310" />
     <title>Engram · Threadline chat</title>
     <link rel="icon" type="image/png" href="./assets/engram-mark.png" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
@@ -41,7 +38,6 @@
           <div class="top-actions">
             <button class="connection-pill" id="connection-pill"><span class="status-light"></span><span id="connection-label">Connect a model</span><span class="chevron">⌄</span></button>
             <button class="icon-button" id="open-inspector" aria-label="Open context inspector" title="Context inspector">☷</button>
-            <button class="icon-button" aria-label="More options">···</button>
           </div>
         </header>
 
@@ -81,6 +77,7 @@
         <div class="inspector-footer"><span class="tiny-ring"></span><span>Incremental updates · local storage</span><button id="refresh-inspector" title="Refresh">↻</button></div>
       </aside>
     </div>
+    <dialog id="remote-consent" aria-labelledby="remote-consent-title"><form method="dialog"><h2 id="remote-consent-title">Review remote data sharing</h2><div id="remote-consent-body"></div><div class="dialog-actions"><button value="cancel">Cancel</button><button id="remote-consent-allow" value="allow">Allow this request</button></div></form></dialog>
     <div class="toast" id="toast" role="status"></div>
     <script type="module" src="./src/app.js"></script>
   </body>

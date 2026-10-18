@@ -12,8 +12,13 @@ Threadline retrieves matching snippets from Engram's same-origin
 `/api/v1/vault/search` endpoint and packs selected snippets under its existing
 estimated context budget. The inspector and assistant source list link each
 selected note to its vault page. Conversation memory and vault retrieval are
-independent toggles. The inference provider is called by the browser, so the
-configured model endpoint must allow the local page's browser origin.
+independent toggles. The inference provider is called by the browser. Endpoint
+URLs are classified with the browser URL API: loopback HTTP is local, remote
+endpoints must use HTTPS, and malformed or userinfo endpoints are rejected.
+Remote chat requests show a per-request disclosure of destination, key
+presence, and assembled data categories before sending. API keys are held in
+page-session memory only and removed from legacy local-storage state; reloads
+require re-entry. This is not OS keychain protection.
 
 The original design prototype is in the Codex outputs folder. This checked-in
 copy is the source used by the Engram binary; changes to it do not automatically

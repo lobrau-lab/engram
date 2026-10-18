@@ -1,68 +1,84 @@
-# Privacy Statement
+# Engram Privacy Policy
 
-**Effective Date: October 26, 2023**
+**Draft for owner and legal review — updated October 18, 2026**
+**Owner:** Tk (GitHub: `lobrau-lab`)
+**Contact:** [lordlobrau@gmail.com](mailto:lordlobrau@gmail.com)
 
-## 1. Scope and Controller
+This policy describes the current Engram and Threadline application behavior. The owner does not operate an Engram account service, hosted vault, analytics backend, or cloud synchronization service. The application does accept and store content locally so that notes, imports, and conversations can work. “We do not collect your data” means the owner does not automatically receive your local vault or chat data; it does not mean the software never processes or stores user-provided content.
 
-This Privacy Statement governs the collection, use, retention, and disclosure
-of information in connection with the software, applications, repositories,
-and related services (collectively, the “Service”) operated by **Tk**, doing
-business through the GitHub organization **lobrau-lab** (“Owner,” “we,” “us,”
-or “our”).
+## 1. Who this applies to
 
-## 2. Proprietary Service
+This policy covers Engram, including its local vault workspace and the Threadline chat interface (the “Application”), when provided by Tk (the “Owner”). It does not govern third-party model servers, websites, operating systems, package managers, or payment providers. Those services have their own privacy terms.
 
-The Service is proprietary and access thereto is limited to persons expressly
-authorized in writing by the Owner. This Statement applies to information
-processed in connection with authorized access and use of the Service.
+## 2. Information kept on your device
 
-## 3. Information Collected
+The Application is designed to process user content on the device where it runs. Depending on the features you use, local data may include:
 
-Subject to applicable law and the manner in which the Service is configured,
-the Owner may collect or process the following categories of information:
+- Markdown notes and attachments in the vault you select;
+- a local search index and other derived metadata under the vault’s `.engram` directory;
+- pending Dump/import files and extraction results;
+- Threadline conversations, derived memory, settings, and context-assembly records in the browser’s local storage;
+- provider configuration, with the API key held in page-session memory only;
+- encrypted backup files you choose to create and store.
 
-1. **Authentication Information**, including GitHub usernames, email
-   addresses, and access tokens;
-2. **Usage Information**, including interaction records, diagnostics, and
-   security logs; and
-3. **Payment Information**, including transaction identifiers and evidence of
-   payment. The Owner does not intend to store complete payment-card numbers.
+This is local storage by the Application, not collection by the Owner. The Application does not currently provide an owner-operated server that receives or stores your vault or conversation history. Data remains on your device until you or another program deletes, moves, or modifies it. Removing a conversation from Threadline does not necessarily remove notes, imported files, browser backups, or files in the vault.
 
-## 4. Purposes of Processing
+Provider API keys are removed from legacy local-storage state on load and are not written back. Page-session memory is not an operating-system keychain; reloads require re-entry.
 
-The Owner may process such information for the following legitimate purposes:
+## 3. Network connections and third-party services
 
-- verifying authorization, payment, and compliance with applicable license
-  terms;
-- detecting, investigating, and preventing unauthorized access, distribution,
-  copying, or reverse engineering;
-- maintaining, securing, debugging, and improving the Service; and
-- communicating material updates, notices, and support information.
+### Local inference
 
-## 5. Disclosure and Transfer
+When configured to use an inference server on the same device, Threadline sends prompts to that local server over loopback HTTP. This is local network traffic, not literal zero-network operation. The local inference server may have its own logs, storage, or network behavior; review that software separately.
 
-The Owner does not sell, rent, or trade personal information. The Owner may
-disclose information to service providers acting on the Owner’s behalf, or to
-governmental authorities, courts, or other persons, where such disclosure is
-required by law or reasonably necessary to protect the Service or enforce the
-Owner’s lawful rights.
+### User-configured remote inference
 
-## 6. Security and Monitoring
+Threadline can be configured with an OpenAI-compatible inference endpoint, including a server hosted by a third party. When you send a chat request to a remote endpoint, the request may contain your current message, system instructions, selected recent turns, derived conversation memory, retrieved conversation evidence, and—if enabled—retrieved Engram note excerpts. Follow-up requests may include model responses and results from local Threadline tools. If configured, the API key is sent in the authorization header.
 
-The Owner shall employ commercially reasonable safeguards appropriate to the
-nature of the information processed. Notwithstanding the foregoing, no method
-of transmission, storage, or security control can be guaranteed to be wholly
-secure. To the extent permitted by applicable law, the Owner may monitor access
-to and use of the Service for security, compliance, and intellectual-property
-protection purposes.
+The remote provider receives and processes the request under its own terms and settings. The Owner does not control its retention, training, access, or deletion practices. Review that provider’s privacy and data-use terms before sending personal, confidential, or regulated information. The current prototype does not yet provide a complete per-request privacy review or data-redaction boundary for remote inference.
 
-## 7. Contact
+Model discovery and connection testing also contact the configured endpoint and may send the configured API key. These requests do not intentionally include vault notes or conversation history.
 
-Questions concerning this Statement may be directed to **Tk** at
-**lordlobrau@gmail.com** or through the **lobrau-lab** GitHub organization.
+### Third-party assets
 
-## 8. Legal Review
+Threadline uses bundled assets and system font stacks; it does not load Google Fonts or other third-party startup assets.
 
-This document is a general template and does not constitute legal advice. It
-should be reviewed and adapted by qualified counsel before publication or
-reliance, including to address applicable jurisdiction-specific requirements.
+### No telemetry service
+
+The current repository does not configure an Engram-operated analytics or telemetry service. This statement does not cover the Google Fonts request above, user-configured inference endpoints, your operating system, browser, or tools you use to install and run the Application.
+
+## 4. Information the Owner may receive directly
+
+The Owner does not automatically receive your local notes, imported files, prompts, or conversation history. The Owner may receive information that you choose to send directly, for example an email or support request. That communication may contain your email address, message, and any information or files you choose to include. Do not include sensitive content unless necessary.
+
+The repository currently has no in-app purchase or payment checkout. If paid licenses are offered later, the identity, payment, order, tax, and transaction information handled by the chosen payment provider will be described before purchase. The payment provider’s own terms will also apply. No payment processor or specific collection practice is promised by this draft.
+
+## 5. Use, disclosure, and sale
+
+The Owner does not sell or rent local vault or Threadline content because the Owner does not automatically receive it. The Application has no advertising or analytics feature configured in the current repository. Information you send to a third-party endpoint is governed by that provider’s terms. The Owner may disclose information received directly from you where required by law or necessary to respond to a valid legal process.
+
+## 6. Retention and deletion
+
+Local vault, browser, and backup data is retained on your device until you delete it. The Owner has no remote copy to delete when the Application is used without sending information directly to the Owner. If you email the Owner, the email and attachments remain in the relevant email systems; the Owner may retain correspondence as reasonably needed to respond, maintain business records, or meet legal obligations. Third-party model and payment providers set their own retention periods.
+
+## 7. Security
+
+The Application is under development. It includes local storage and encrypted backup features, but no software or storage method can be guaranteed secure. In particular, the current browser-stored API key is not protected by an operating-system keychain. You are responsible for securing your device, vault, browser profile, backups, and any configured inference service.
+
+## 8. Your choices
+
+You can choose where your vault is stored, whether to enable vault retrieval in Threadline, which inference endpoint to configure, and whether to send information to a remote provider. Do not configure a remote endpoint or enable remote use with private vault context unless you accept that provider’s handling of the information. You can delete local Threadline data using the application controls and separately delete vault files, browser data, and backups using your operating system.
+
+The current prototype does not yet offer a complete export, data-subject request, or per-request remote-data consent workflow. Those limitations should be addressed before a public commercial release.
+
+## 9. Changes and contact
+
+This policy may be updated when product behavior changes. The version and effective date will be updated with material changes. Contact the Owner at [lordlobrau@gmail.com](mailto:lordlobrau@gmail.com) with privacy questions or support requests.
+
+## 10. Separate licensing terms
+
+This policy describes information handling; it does not grant a software license or set a price. Any one-time price (including a possible $20 license) and any proposed 10% revenue share must be defined in a separate written license or commercial schedule accepted by both parties. The existing user agreement is a draft and no checkout is currently implemented.
+
+---
+
+**Publication checklist:** Verify runtime network requests, remove or intentionally retain the Google Fonts connection, implement remote-inference disclosure and safer credential storage, identify any payment processor before accepting payment, and obtain jurisdiction-specific legal review. Privacy and security claims should match observed product behavior; see the [FTC privacy and security guidance](https://www.ftc.gov/business-guidance/privacy-security).

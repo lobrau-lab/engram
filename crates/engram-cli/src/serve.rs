@@ -345,6 +345,7 @@ fn threadline_asset(path: &str) -> Option<(&'static str, &'static str)> {
         "/threadline/src/core/app-actions.js" => ("text/javascript; charset=utf-8", include_str!("../web/src/core/app-actions.js")),
         "/threadline/src/core/tool-registry.js" => ("text/javascript; charset=utf-8", include_str!("../web/src/core/tool-registry.js")),
         "/threadline/src/core/permission-gate.js" => ("text/javascript; charset=utf-8", include_str!("../web/src/core/permission-gate.js")),
+        "/threadline/src/core/privacy-policy.js" => ("text/javascript; charset=utf-8", include_str!("../web/src/core/privacy-policy.js")),
         "/threadline/src/providers/openai-compatible.js" => ("text/javascript; charset=utf-8", include_str!("../web/src/providers/openai-compatible.js")),
         "/threadline/src/providers/engram-vault.js" => ("text/javascript; charset=utf-8", include_str!("../web/src/providers/engram-vault.js")),
         _ => return None,
