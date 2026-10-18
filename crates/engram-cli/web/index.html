@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#101310" />
+    <title>Engram · Threadline chat</title>
+    <link rel="icon" type="image/png" href="./assets/engram-mark.png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <a class="brand" href="#" aria-label="Engram chat home">
+          <img src="./assets/engram-logo.png" alt="Engram" />
+        </a>
+        <button class="new-chat" id="new-chat"><span class="plus">＋</span> New conversation <kbd>⌘ K</kbd></button>
+        <div class="side-label">WORKSPACE</div>
+        <nav class="nav-list" aria-label="Main navigation">
+          <button class="nav-item active" data-view="chat"><span class="nav-icon">◫</span> Chat <span class="nav-dot"></span></button>
+          <button class="nav-item" data-view="memory"><span class="nav-icon">⌘</span> Memory ledger <span class="nav-count" id="memory-count">0</span></button>
+          <button class="nav-item" data-view="rules"><span class="nav-icon">⎇</span> Decision rules</button>
+          <button class="nav-item" data-view="settings"><span class="nav-icon">⚙</span> Connections & settings</button>
+          <a class="nav-item" href="/"><span class="nav-icon">⌂</span> Engram vault</a>
+          <a class="nav-item" href="/dump"><span class="nav-icon">⇩</span> Dump / Inbox</a>
+        </nav>
+        <div class="side-label history-label">RECENT THREADS <button id="clear-history" title="Clear local history">···</button></div>
+        <div class="thread-list" id="thread-list"></div>
+        <div class="sidebar-bottom">
+          <div class="local-status"><span class="status-light"></span><div><strong>Local workspace</strong><small>Your data stays in this browser</small></div></div>
+          <button class="profile" id="profile-button"><span class="avatar">T</span><span><b>Personal workspace</b><small>Prototype · v0.1</small></span><span class="chevron">⌄</span></button>
+        </div>
+      </aside>
+
+      <main class="main-panel">
+        <header class="topbar">
+          <div class="breadcrumb"><span>Workspace</span><span class="slash">/</span><strong id="top-title">New conversation</strong></div>
+          <div class="top-actions">
+            <button class="connection-pill" id="connection-pill"><span class="status-light"></span><span id="connection-label">Connect a model</span><span class="chevron">⌄</span></button>
+            <button class="icon-button" id="open-inspector" aria-label="Open context inspector" title="Context inspector">☷</button>
+            <button class="icon-button" aria-label="More options">···</button>
+          </div>
+        </header>
+
+        <section class="chat-view" id="chat-view">
+          <div class="conversation" id="conversation">
+            <div class="welcome" id="welcome">
+              <div class="welcome-kicker"><span class="pulse"></span> A more intentional kind of memory</div>
+              <h1>Pick up the thread.<br /><em>Keep the signal.</em></h1>
+              <p>A local-first chat workspace that keeps the conversation’s useful shape, finds the original evidence, and fits only what matters into each request.</p>
+              <div class="welcome-cards">
+                <button class="prompt-card" data-prompt="Help me think through a difficult problem. First, identify the goal and constraints, then ask what is missing."><span class="card-symbol green">◎</span><strong>Think something through</strong><small>Goals, constraints, and open questions stay visible.</small><span class="card-arrow">↗</span></button>
+                <button class="prompt-card" data-prompt="Explain how context packing and retrieval could help a long conversation, and distinguish what is stored from what is sent to the model."><span class="card-symbol gold">⌘</span><strong>Explore an idea</strong><small>Retrieve the relevant past detail without replaying everything.</small><span class="card-arrow">↗</span></button>
+                <button class="prompt-card" data-prompt="Help me plan a small prototype. Keep decisions, constraints, and unresolved questions distinct."><span class="card-symbol blue">⎇</span><strong>Build a plan</strong><small>Decisions and unresolved questions have their own place.</small><span class="card-arrow">↗</span></button>
+              </div>
+            </div>
+            <div class="messages" id="messages" aria-live="polite"></div>
+          </div>
+          <div class="composer-wrap">
+            <form class="composer" id="composer-form">
+              <textarea id="message-input" rows="1" placeholder="Ask anything. Context will be assembled for this turn…" aria-label="Message"></textarea>
+              <div class="composer-tools">
+                <div class="composer-left"><button type="button" class="tool-button" id="memory-toggle"><span class="mini-icon">⌘</span> Memory <span class="toggle-dot on"></span></button><button type="button" class="tool-button" id="vault-toggle" title="Include retrieved Engram vault notes in this prompt"><span class="mini-icon">▤</span> Vault <span class="toggle-dot"></span></button><button type="button" class="tool-button" id="context-budget">▤ <span id="budget-label">Context · 8k</span></button></div>
+                <div class="composer-right"><span class="composer-hint">Enter to send · Shift + Enter for newline</span><button class="send-button" id="send-button" type="submit" aria-label="Send message">↑</button></div>
+              </div>
+            </form>
+            <div class="composer-footnote">Model output can be wrong. Retrieved conversation sources are shown in the inspector.</div>
+          </div>
+        </section>
+
+        <section class="workspace-view hidden" id="workspace-view"></section>
+      </main>
+
+      <aside class="inspector" id="inspector">
+        <div class="inspector-head"><div><div class="eyebrow">LIVE SYSTEM</div><h2>Context inspector</h2></div><button class="icon-button" id="close-inspector" aria-label="Close inspector">×</button></div>
+        <div class="inspector-tabs"><button class="inspector-tab active" data-tab="assembly">Assembly</button><button class="inspector-tab" data-tab="memory">Memory <span id="inspector-memory-count">0</span></button><button class="inspector-tab" data-tab="rules">Rules</button></div>
+        <div id="inspector-content" class="inspector-content"></div>
+        <div class="inspector-footer"><span class="tiny-ring"></span><span>Incremental updates · local storage</span><button id="refresh-inspector" title="Refresh">↻</button></div>
+      </aside>
+    </div>
+    <div class="toast" id="toast" role="status"></div>
+    <script type="module" src="./src/app.js"></script>
+  </body>
+</html>

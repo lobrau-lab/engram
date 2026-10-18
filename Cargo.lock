@@ -298,6 +298,8 @@ dependencies = [
  "anyhow",
  "clap",
  "engram-core",
+ "serde_json",
+ "walkdir",
 ]
 
 [[package]]

@@ -63,10 +63,19 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         port: u16,
     },
+    /// Start the local workspace and open it in the system browser.
+    Open {
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+    },
     /// Create an encrypted Markdown backup. Reads ENGRAM_BACKUP_PASSWORD.
     Backup { dest: PathBuf },
     /// Restore an encrypted Markdown backup. Reads ENGRAM_BACKUP_PASSWORD.
     Restore { src: PathBuf },
+    /// Copy supported local text files into the vault and index them.
+    ImportFiles { src: PathBuf },
 }
 
 fn main() -> Result<()> {
@@ -86,8 +95,10 @@ fn main() -> Result<()> {
         Cmd::Export { dest, dry_run } => cmd_export(&vault, &config_path, &dest, dry_run),
         Cmd::Import { src, dry_run } => cmd_import(&vault, &config_path, &src, dry_run),
         Cmd::Serve { host, port } => serve::run(&vault, &host, port),
+        Cmd::Open { host, port } => serve::open(&vault, &host, port),
         Cmd::Backup { dest } => cmd_backup(&vault, &dest),
         Cmd::Restore { src } => cmd_restore(&vault, &src),
+        Cmd::ImportFiles { src } => cmd_import_files(&vault, &config_path, &src),
     }
 }
 
@@ -105,6 +116,24 @@ fn cmd_backup(vault: &Path, dest: &Path) -> Result<()> {
 fn cmd_restore(vault: &Path, src: &Path) -> Result<()> {
     let manifest = engram_core::backup::restore(src, vault, &backup_password()?)?;
     println!("restored {} Markdown files into {}", manifest.files, vault.display());
+    Ok(())
+}
+
+fn cmd_import_files(vault: &Path, config_path: &Path, source: &Path) -> Result<()> {
+    let root = source.canonicalize().with_context(|| format!("reading import root {}", source.display()))?;
+    let destination = vault.join("Imported");
+    std::fs::create_dir_all(&destination)?;
+    let mut copied = 0usize;
+    for entry in walkdir::WalkDir::new(&root).into_iter().filter_map(|entry| entry.ok()) {
+        if !entry.file_type().is_file() { continue; }
+        if !matches!(entry.path().extension().and_then(|x| x.to_str()), Some("md") | Some("markdown") | Some("txt")) { continue; }
+        let target = destination.join(entry.path().strip_prefix(&root)?);
+        if let Some(parent) = target.parent() { std::fs::create_dir_all(parent)?; }
+        std::fs::copy(entry.path(), &target)?;
+        copied += 1;
+    }
+    cmd_index(vault, config_path)?;
+    println!("imported {copied} local text files into {}", destination.display());
     Ok(())
 }
 

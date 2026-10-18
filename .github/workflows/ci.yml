@@ -11,6 +11,24 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  cross-platform:
+    name: Cross-platform build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check
+        run: cargo check --workspace --all-targets
+      - name: cargo test
+        run: cargo test --workspace
+      - name: cargo build --release
+        run: cargo build --workspace --release
+
   check:
     name: Compile and smoke
     runs-on: ubuntu-latest

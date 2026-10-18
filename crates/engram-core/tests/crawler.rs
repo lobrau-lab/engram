@@ -9,7 +9,7 @@ fn crawls_only_supported_local_text_files() {
     fs::write(root.join("note.md"), "# Note\n\n[[Other]] #tag").unwrap();
     fs::write(root.join("image.bin"), [0, 1, 2]).unwrap();
 
-    let report = Crawler::default().scan_roots(&[root.clone()]).unwrap();
+    let report = Crawler.scan_roots(std::slice::from_ref(&root)).unwrap();
     assert_eq!(report.documents, 1);
     assert_eq!(report.skipped, 1);
     assert_eq!(report.links, 1);
@@ -19,6 +19,6 @@ fn crawls_only_supported_local_text_files() {
 
 #[test]
 fn rejects_network_roots() {
-    let error = Crawler::default().scan_roots(&["https://example.com".into()]);
+    let error = Crawler.scan_roots(&["https://example.com".into()]);
     assert!(error.is_err());
 }

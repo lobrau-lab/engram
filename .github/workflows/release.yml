@@ -1,0 +1,60 @@
+name: Release artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, for example 0.1.0"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+      - run: cargo build --workspace --release --target ${{ matrix.target }}
+      - name: Package Unix artifact
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          mkdir -p dist/engram-${{ inputs.version }}-${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/engram dist/engram-${{ inputs.version }}-${{ matrix.target }}/
+          cp README.md LICENSE PRIVACY.md USER_AGREEMENT.md dist/engram-${{ inputs.version }}-${{ matrix.target }}/
+          tar -C dist -czf engram-${{ inputs.version }}-${{ matrix.target }}.tar.gz engram-${{ inputs.version }}-${{ matrix.target }}
+      - name: Package Windows artifact
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "dist/engram-${{ inputs.version }}-${{ matrix.target }}"
+          Copy-Item "target/${{ matrix.target }}/release/engram.exe" "dist/engram-${{ inputs.version }}-${{ matrix.target }}/"
+          Copy-Item README.md,LICENSE,PRIVACY.md,USER_AGREEMENT.md "dist/engram-${{ inputs.version }}-${{ matrix.target }}/"
+          Compress-Archive -Path "dist/engram-${{ inputs.version }}-${{ matrix.target }}" -DestinationPath "engram-${{ inputs.version }}-${{ matrix.target }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engram-${{ inputs.version }}-${{ matrix.target }}
+          path: engram-${{ inputs.version }}-${{ matrix.target }}.*

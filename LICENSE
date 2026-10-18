@@ -1,18 +1,23 @@
 COPYRIGHT AND PROPRIETARY LICENSE NOTICE
 
-Copyright (c) 2026 Tk (lobrau-lab). All rights reserved.
+Copyright (c) 2026 Tk (GitHub: lobrau-lab). All rights reserved.
+Contact: lordlobrau@gmail.com
 
 1. DEFINITIONS
 
-“Work” means this software and all associated source code, object code,
-documentation, designs, algorithms, logic, and other materials made available
-by Tk. “Owner” means Tk.
+“Work” means the original source code, object code, documentation, designs,
+user-interface assets, and other materials owned or controlled by Tk and made
+available with this repository. “Owner” means Tk (GitHub: lobrau-lab). Work
+does not include third-party software or materials, user data, or other content
+whose rights are held by someone else; those items remain subject to their own
+licenses and terms. This notice does not claim copyright over ideas, methods,
+algorithms, or functionality as such.
 
 2. OWNERSHIP
 
-The Work is and shall remain the sole and exclusive property of the Owner.
-All right, title, and interest in and to the Work, including all intellectual
-property rights therein, are expressly reserved by the Owner.
+The Owner reserves all rights the Owner holds in the Work. No ownership
+interest in those rights is transferred to a recipient. Third-party rights
+and licenses are not changed by this notice.
 
 3. NO GENERAL LICENSE
 
@@ -27,11 +32,13 @@ Work, in whole or in part.
 
 4. COMMERCIAL TERMS
 
-Any license granted by the Owner may be conditioned upon payment of the
-applicable license fee and the payment of a royalty equal to ten percent (10%)
-of gross revenue generated through the licensed use of the Work, as specified
-in the applicable written agreement. Any payment obligation shall be enforced
-solely through lawful contractual and legal remedies.
+Any commercial license may include a royalty equal to ten percent (10%) of
+Gross Revenue attributable to the licensed commercial use, but only if that
+royalty is expressly included in a separate written commercial license agreed
+to by the Owner and Licensee. This template alone does not create a payment
+obligation, and no royalty is due merely because a person views or uses a copy
+without such an agreement. Any payment obligation shall be enforced solely
+through lawful contractual and legal remedies.
 
 5. RESERVATION OF REMEDIES
 

@@ -3,3 +3,4 @@
 # Engram runtime artifacts
 .engram/
 *.conflict-*.md
+.DS_Store

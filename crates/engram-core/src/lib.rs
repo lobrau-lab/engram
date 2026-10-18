@@ -7,6 +7,7 @@ pub mod ai;
 pub mod backup;
 pub mod config;
 pub mod crawler;
+pub mod dump;
 pub mod embed;
 pub mod error;
 pub mod events;
