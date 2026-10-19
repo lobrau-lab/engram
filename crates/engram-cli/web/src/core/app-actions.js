@@ -1,5 +1,5 @@
 import { applicationTools, getRegisteredTool, listRegisteredTools, validateToolArguments, validateToolManifest } from './tool-registry.js';
-import { authorizeToolInvocation } from './permission-gate.js';
+import { authorizeToolInvocation, formatToolDisclosure } from './permission-gate.js';
 
 export { applicationTools, listRegisteredTools };
 
@@ -86,4 +86,57 @@ function complete(invocationId, result, tool) {
 
 function unavailable(callback) {
   return { ok: false, code: 'executor_unavailable', error: `This action is unavailable (${callback}).` };
+}
+
+
+/** Run narrowly scoped project filesystem actions through the local Engram server. */
+export async function executeProjectAction(name, rawArguments, callbacks = {}) {
+  const invocationId = callbacks.actionId || crypto.randomUUID();
+  if (completedInvocations.has(invocationId)) return completedInvocations.get(invocationId);
+  let args;
+  try { args = typeof rawArguments === 'string' ? JSON.parse(rawArguments || '{}') : (rawArguments ?? {}); }
+  catch { return { ok: false, code: 'invalid_arguments', error: 'Arguments are not valid JSON.' }; }
+  const tool = getRegisteredTool(name);
+  if (!tool || !(name.startsWith('project_') || name === 'run_project_check')) return { ok: false, code: 'unknown_tool', error: `Project action not allowed: ${name}` };
+  const validationError = validateToolArguments(tool, args);
+  if (validationError) return { ok: false, code: 'invalid_arguments', error: validationError };
+  if (typeof callbacks.confirm !== 'function') return { ok: false, code: 'approval_unavailable', error: 'This project action requires an approval interface.' };
+  let confirmed = false;
+  try { confirmed = await callbacks.confirm(formatToolDisclosure(tool, args)) === true; }
+  catch { return { ok: false, code: 'approval_unavailable', error: 'The approval interface failed; the action was blocked.' }; }
+  if (!confirmed) {
+    receipt(invocationId, tool, 'cancelled', { code: 'approval_denied' });
+    return { ok: false, code: 'approval_denied', cancelled: true, error: 'The user declined this action.', invocationId };
+  }
+  const authorization = authorizeToolInvocation(tool, args, { confirm: () => true });
+  if (!authorization.allowed) {
+    receipt(invocationId, tool, 'denied', { code: authorization.code });
+    return { ok: false, code: authorization.code, cancelled: Boolean(authorization.cancelled), error: authorization.message, invocationId };
+  }
+  try {
+    const query = new URLSearchParams();
+    let response;
+    if (name === 'project_list_files') {
+      query.set('path', args.path || '.');
+      response = await fetch(`/api/v1/project/files?${query}`);
+    } else if (name === 'project_read_file') {
+      query.set('path', args.path);
+      response = await fetch(`/api/v1/project/read?${query}`);
+    } else if (name === 'project_write_file') {
+      response = await fetch('/api/v1/project/write', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(args) });
+    } else if (name === 'project_create_directory') {
+      response = await fetch('/api/v1/project/directory', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(args) });
+    } else if (name === 'run_project_check') {
+      response = await fetch('/api/v1/project/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(args) });
+    } else return { ok: false, code: 'unimplemented_tool', error: 'This project action has no executor.' };
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `Local project action failed (${response.status}).`);
+    const completed = { ok: true, ...result };
+    completedInvocations.set(invocationId, completed);
+    receipt(invocationId, tool, 'executed');
+    return completed;
+  } catch (error) {
+    receipt(invocationId, tool, 'failed', { message: String(error.message || error).slice(0, 300) });
+    return { ok: false, code: 'project_action_failed', error: String(error.message || error).slice(0, 500), invocationId };
+  }
 }

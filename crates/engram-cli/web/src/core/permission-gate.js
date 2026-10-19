@@ -68,6 +68,9 @@ export function formatToolDisclosure(tool, args = {}) {
   let serialized;
   try { serialized = JSON.stringify(args); }
   catch { serialized = '[parameters could not be serialized]'; }
+  if (tool.name === 'project_write_file') {
+    return [tool.confirmation || 'Allow this project file write?', '', `Capability: ${tool.capability}`, `Risk: ${tool.risk}`, `Data accessed or sent: ${data}`, destination, `Path: ${args.path || '(missing)'}`, `Proposed content (${String(args.content || '').length} characters):`, String(args.content || '')].join('\n');
+  }
   const parameters = serialized.length > 1200 ? `${serialized.slice(0, 1200)}… [truncated]` : serialized;
   return [
     tool.confirmation || `Allow ${tool.name}?`,

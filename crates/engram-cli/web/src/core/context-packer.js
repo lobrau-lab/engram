@@ -2,7 +2,7 @@ import { evidenceLabel, relevantConflicts } from './memory-manager.js';
 
 export function estimateTokens(text) { return Math.ceil((text || '').length / 3.7); }
 
-export function packContext({ message, history, memory, evidence, vaultNotes = [], settings }) {
+export function packContext({ message, history, memory, evidence, vaultNotes = [], vaultContextAllowed = false, settings }) {
   const system = settings.systemPrompt || 'You are a helpful assistant.';
   const instructionCost = estimateTokens(system);
   const messageCost = estimateTokens(message);
@@ -33,7 +33,9 @@ export function packContext({ message, history, memory, evidence, vaultNotes = [
       add(`source · ${label}`, `[${item.turn.role} turn ${item.turn.id.slice(0, 8)} · ${new Date(item.turn.timestamp).toLocaleString()}] ${item.turn.content}`, [item.turn.id], item.score);
     }
   }
-  if (settings.vaultSearchEnabled) {
+  // Enforce the privacy boundary at the final assembly point too. The UI
+  // preference alone must never authorize sending vault content to a provider.
+  if (settings.vaultSearchEnabled && vaultContextAllowed) {
     for (const note of vaultNotes) {
       const text = `[Engram note: ${note.title} · ${note.id}]\n${note.snippet}`;
       add('vault source', text, [], note.score || 0, [note.id]);

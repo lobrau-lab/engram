@@ -10,7 +10,10 @@ const defaults = {
 };
 
 export function loadWorkspace() {
-  try { return { ...defaults, ...JSON.parse(localStorage.getItem(KEY) || '{}') }; }
+  try {
+    const saved = JSON.parse(localStorage.getItem(KEY) || '{}');
+    return { ...defaults, ...saved, settings: { ...defaults.settings, ...(saved.settings || {}) } };
+  }
   catch { return structuredClone(defaults); }
 }
 

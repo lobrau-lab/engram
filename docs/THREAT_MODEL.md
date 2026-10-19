@@ -19,11 +19,11 @@ is not supported as a secure deployment mode.
 
 | Threat | Control | Residual risk |
 |---|---|---|
-| Vault path traversal | Relative-path validation and canonical-root checks | Symlink behavior on unusual filesystems requires platform testing |
+| Vault path traversal | Relative-path validation and canonical-root checks inside `Vault::read_note` | Symlink behavior on unusual filesystems requires platform testing |
 | Malicious backup archive | Authenticated AES-GCM payload, Argon2id password derivation, staged restore | Password strength remains the user’s responsibility |
 | Corrupt or wrong-password backup | GCM authentication failure before restore | No recovery is possible without the password |
-| Accidental overwrite | Restore refuses non-empty destinations | Users can still delete files manually |
-| Network data leakage | Localhost-only default and local crawler rejection of URLs | Users can explicitly configure external inference endpoints |
+| Accidental overwrite | Restore refuses any existing destination and stages extracted files before rename | Destination check and rename are separate operations; no-clobber race behavior needs cross-platform review |
+| Network data leakage | Rust `serve`/`open` validate loopback binds; Rust inference validates local endpoints; direct Threadline vault snippets require explicit local-context authorization at prompt packing; remote requests require disclosure consent | Prior assistant turns derived from vault content may still be included in remote conversation history; browser integration needs automated coverage |
 | Prompt injection in notes | Notes are treated as untrusted context and cited by ID | Models may still produce misleading output |
 | XSS in notes | Browser preview escapes Markdown text | Future rich-rendering features must preserve this invariant |
 | Unauthorized repository access | Proprietary license and access controls outside the binary | Repository hosting configuration is operational responsibility |
@@ -38,3 +38,8 @@ Before public distribution, maintainers must complete:
 4. Verification that release artifacts contain no vault, database, API key, or
    development files.
 5. Legal review of `LICENSE`, `PRIVACY.md`, and `USER_AGREEMENT.md`.
+
+The 2026-10-18 manual browser smoke check verified Threadline navigation,
+settings save, vault toggle, and a remote disclosure dialog using a synthetic
+endpoint that was cancelled before transmission. Automated browser, CORS, and
+real-provider integration coverage remain release gates.

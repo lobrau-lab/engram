@@ -1,7 +1,7 @@
-# Engram Roadmap Baseline
+# Engram Roadmap Status
 
-Baseline verified during Phase 0. This checklist records implementation state,
-not a production-readiness claim.
+Status reconciled against the current source tree on 2026-10-18. This checklist
+records implementation state, not a production-readiness claim.
 
 ## Implemented and verified
 
@@ -13,19 +13,39 @@ not a production-readiness claim.
 - Local Markdown/plain-text/HTML import extraction tests pass; unsupported PDF is
   reported as unsupported.
 - Threadline privacy-policy classification tests pass.
+- Threadline prompt packing requires an explicit `vaultContextAllowed`
+  authorization in addition to the vault preference. A focused regression test
+  verifies denied packing omits a sentinel vault snippet and authorized local
+  packing retains it.
+- The synthetic memory/context replay bench runs and reports evidence recall,
+  irrelevant selection, budget compliance, and detected conflicts. It is a
+  deterministic fixture bench, not a general accuracy evaluation.
 - Existing Threadline application actions use the allowlist/argument validation/
   permission gate path.
-- Remote Threadline inference is prevented from receiving vault context by the
-  current browser policy helper.
+- Loopback-only `serve`/`open`, bounded HTTP headers/bodies with read/write
+  timeouts, backup archive length checks with staged restore, and canonical-root
+  checks in `Vault::read_note` are present in the current code.
+- Threadline browser smoke check passed after adding the missing
+  `evaluation-bench.js` static route: Chat/Memory/Bench/Rules/Settings navigation,
+  suggestion prefill, vault toggle, and settings save worked. The default
+  1,200-token output reserve is now valid in the settings form.
+- A synthetic remote endpoint reached the disclosure dialog before any request;
+  the request was cancelled. No remote provider was contacted.
 
 ## Implemented but not fully verified
 
 - Threadline browser consent and session-key migration: browser runtime and
   CORS behavior need a real browser test suite.
+- Browser verification was a manual local smoke check. Automated browser
+  coverage for navigation, settings, consent, API key lifetime, and CORS remains
+  outstanding; no real model endpoint was tested.
 - Windows atomic replacement path: compiled conditionally but not executed on a
   Windows runner in this environment.
 - Threadline capability metadata and in-memory audit receipts: no browser
   integration coverage yet.
+- Guarded connector manifest validation and proposal→validation→authorization→
+  execution→result-validation state-machine seam now have deterministic fake
+  connector tests; no real connector or sandbox is implied.
 
 ## Partially implemented
 
@@ -39,21 +59,24 @@ not a production-readiness claim.
 
 ## Not implemented
 
-- Offline memory/context replay bench.
 - User-initiated local model endpoint discovery and compatibility diagnostics.
 - Permission center, durable audit retention, capability revocation UI, and
   narrow leases.
 - Sandboxed local filesystem tools.
+- Durable permission center, connector health UI, and cross-process sandboxing.
 - Reviewed web-search/API/MCP integrations.
 - Native packaging, signing, keychain integration, and independent security
   review.
 
-## Blocking security work
+## Remaining security and release work
 
-- Enforce loopback-only serving in `serve`/`open` rather than relying on CLI
-  defaults.
-- Make backup restore strictly non-destructive and validate malformed archive
-  lengths before slicing.
-- Replace one-read HTTP parsing with bounded header/body parsing and timeouts.
-- Enforce canonical-root and symlink-safe reads inside `Vault::read_note`.
+- Enforce provenance-aware remote context isolation: the packer blocks direct
+  vault-note snippets, but prior assistant turns derived from a local vault may
+  still appear in conversation history, especially when source display was off.
 - Audit remaining direct writes and import collision behavior.
+- Review the backup restore check/rename race and guarantee no-clobber behavior
+  across supported platforms.
+- Add real browser coverage for consent, API key lifetime, CORS, app navigation,
+  and the remote-vault privacy boundary.
+- Complete cross-platform filesystem, packaging, signing, credential-storage,
+  and independent security reviews before distribution.

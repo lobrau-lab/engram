@@ -1,9 +1,9 @@
 import { getWorkspace, activeConversation, appendTurn, createConversation, setActiveConversation, updateActive, updateMemory, updateSettings, subscribe, clearWorkspace, removeAssertion, getSessionApiKey, setSessionApiKey } from './core/store.js';
 import { recordAndUpdate, retrieveEvidence, evaluateRules } from './core/memory-manager.js';
 import { packContext } from './core/context-packer.js';
-import { listModels, streamChat } from './providers/openai-compatible.js';
+import { listModels, setModelLoaded, streamChat } from './providers/openai-compatible.js';
 import { searchEngramVault } from './providers/engram-vault.js';
-import { applicationTools, executeApplicationAction } from './core/app-actions.js';
+import { applicationTools, executeApplicationAction, executeProjectAction } from './core/app-actions.js';
 import { classifyEndpoint, canSendVaultContext, requestCategories, confirmDisclosure } from './core/privacy-policy.js';
 import { runMemoryBench } from './core/evaluation-bench.js';
 
@@ -112,9 +112,19 @@ function renderWorkspaceView() {
     host.innerHTML = `<div class="page-heading"><div class="eyebrow">POLICY ENGINE</div><h1>Decision rules</h1><p>The “growing if statement” is an inspectable set of small policies. Each module can be swapped without rewriting the chat flow.</p></div><div class="rule-catalog">${[['01','Memory gate','IF memory is disabled, skip extraction and retrieval.','Memory policy'],['02','Evidence gate','IF a response recalls the conversation, retrieve and attach source turns.','Evidence policy'],['03','Correction handling','IF a correction is explicit, supersede the derived assertion and retain both source turns.','Conflict policy'],['04','Ambiguity handling','IF incompatible statements lack a clear correction, preserve both and surface uncertainty.','Conflict policy'],['05','Budget gate','IF candidate context exceeds the usable budget, rank and omit optional items first.','Packing policy'],['06','Provider fallback','IF the endpoint fails, preserve the draft and show a retryable connection error.','Provider policy']].map(([n,title,rule,module]) => `<article class="rule-card"><span class="rule-index">${n}</span><div><span class="module-label">${module}</span><h2>${title}</h2><p>${rule}</p></div><span class="rule-enabled">ENABLED <i></i></span></article>`).join('')}</div><div class="rule-note"><span>i</span><p>These starter rules are deterministic and transparent. Language extraction is a lightweight heuristic in this prototype; it is not a truth detector.</p></div>`;
   } else {
     const settings = getWorkspace().settings;
-    host.innerHTML = `<div class="page-heading"><div class="eyebrow">PROVIDER & POLICIES</div><h1>Connections & settings</h1><p>Connect a compatible inference endpoint and tune how each prompt is assembled. Provider secrets are kept in this browser’s local storage for this prototype.</p></div><form id="settings-form" class="settings-layout"><section class="settings-card wide-card"><div class="settings-card-heading"><span class="settings-icon">◈</span><div><h2>Engram identity &amp; accent</h2><p>Choose the app accent and matching icon treatment</p></div><span class="module-label">APPEARANCE</span></div><p class="brand-appearance-copy">The chosen accent is saved with this browser’s settings. The original Engram wordmark remains the app identity.</p><div class="accent-picker" role="group" aria-label="App accent and icon"><button class="accent-option" type="button" data-accent="green" aria-pressed="${(settings.accent || 'green') === 'green'}"><img src="./assets/engram-mark-green.png" alt="" /><span>Green</span></button><button class="accent-option" type="button" data-accent="purple" aria-pressed="${settings.accent === 'purple'}"><img src="./assets/engram-icon-purple.png" alt="" /><span>Purple</span></button><button class="accent-option" type="button" data-accent="pink" aria-pressed="${settings.accent === 'pink'}"><img src="./assets/engram-icon-pink.png" alt="" /><span>Pink</span></button><button class="accent-option" type="button" data-accent="blue" aria-pressed="${settings.accent === 'blue'}"><img src="./assets/engram-icon-blue.png" alt="" /><span>Blue</span></button><button class="accent-option" type="button" data-accent="fire" aria-pressed="${settings.accent === 'fire'}"><img src="./assets/engram-icon-fire.png" alt="" /><span>Ember</span></button><button class="accent-option" type="button" data-accent="forest" aria-pressed="${settings.accent === 'forest'}"><img src="./assets/engram-icon-forest.png" alt="" /><span>Forest</span></button><button class="accent-option" type="button" data-accent="ice" aria-pressed="${settings.accent === 'ice'}"><img src="./assets/engram-icon-ice.png" alt="" /><span>Ice</span></button></div></section><section class="settings-card"><div class="settings-card-heading"><span class="settings-icon">↔</span><div><h2>Inference server</h2><p>OpenAI-compatible chat completions API</p></div><span class="module-label">PROVIDER MODULE</span></div><label class="field-label" for="base-url">API base URL</label><input id="base-url" name="baseUrl" type="url" value="${esc(settings.baseUrl)}" placeholder="http://localhost:8000/v1" required /><div class="field-row"><div><label class="field-label" for="model-id">Model ID</label><input id="model-id" name="model" value="${esc(settings.model)}" placeholder="Select or type a model ID" /></div><button type="button" class="secondary-button discover-button" id="discover-models">Discover models</button></div><label class="field-label" for="api-key">API key <span>optional for local servers</span></label><input id="api-key" name="apiKey" type="password" value="${esc(settings.apiKey)}" autocomplete="off" placeholder="Stored locally in this browser" /><div class="settings-actions"><button class="primary-button" type="submit">Save connection</button><button class="secondary-button" id="test-connection" type="button">Test connection</button><span id="connection-feedback" role="status"></span></div><div class="endpoint-note"><span class="status-light"></span><span>Chat endpoint: <code id="endpoint-preview">${esc(settings.baseUrl.replace(/\/$/, ''))}/chat/completions</code></span></div></section>
-      <section class="settings-card"><div class="settings-card-heading"><span class="settings-icon warm">⌘</span><div><h2>Context algorithm</h2><p>Budget, recency, and evidence packing</p></div><span class="module-label">PACKER MODULE</span></div><div class="field-row setting-numbers"><div><label class="field-label" for="context-limit">Model context limit</label><input id="context-limit" name="contextLimit" type="number" min="1024" step="512" value="${settings.contextLimit}" /></div><div><label class="field-label" for="output-reserve">Output reserve</label><input id="output-reserve" name="outputReserve" type="number" min="128" step="128" value="${settings.outputReserve}" /></div><div><label class="field-label" for="safety-margin">Safety margin</label><input id="safety-margin" name="safetyMargin" type="number" min="0" step="100" value="${settings.safetyMargin}" /></div></div><label class="field-label" for="recent-turns">Recent turns to retain <span id="recent-value">${settings.recentTurns}</span></label><input id="recent-turns" name="recentTurns" type="range" min="2" max="16" value="${settings.recentTurns}" /><label class="field-label" for="strategy">Memory strategy</label><select id="strategy" name="strategy"><option value="hybrid" ${settings.strategy === 'hybrid' ? 'selected' : ''}>Structured state + retrieved turns</option><option value="recent" ${settings.strategy === 'recent' ? 'selected' : ''}>Recent turns only</option><option value="state" ${settings.strategy === 'state' ? 'selected' : ''}>Structured state + recent turns</option></select><label class="check-row"><input type="checkbox" name="memoryEnabled" ${settings.memoryEnabled ? 'checked' : ''} /><span><b>Use conversation memory</b><small>Derive local variables and retrieve relevant turns.</small></span><i></i></label><label class="check-row"><input type="checkbox" name="showEvidence" ${settings.showEvidence ? 'checked' : ''} /><span><b>Show source references</b><small>Display turn IDs when history evidence was packed.</small></span><i></i></label></section>
-      <section class="settings-card wide-card"><div class="settings-card-heading"><span class="settings-icon blue-icon">✳</span><div><h2>Assistant operating instructions</h2><p>Baseline prompt used for every request</p></div><span class="module-label">SYSTEM MODULE</span></div><textarea id="system-prompt" name="systemPrompt" rows="4">${esc(settings.systemPrompt)}</textarea><div class="settings-actions"><button class="primary-button" type="submit">Save all settings</button><button class="text-button" type="button" id="reset-data">Delete all local data</button></div></section></form>`;
+    host.innerHTML = `<div class="page-heading"><div class="eyebrow">PROVIDER & POLICIES</div><h1>Connections & settings</h1><p>Connect a compatible inference endpoint and tune how each prompt is assembled. Provider API keys stay in memory for this page session and are not saved with workspace settings.</p></div><form id="settings-form" class="settings-layout"><section class="settings-card wide-card"><div class="settings-card-heading"><span class="settings-icon">◈</span><div><h2>Threadline appearance &amp; accent</h2><p>Choose the app accent and matching icon treatment</p></div><span class="module-label">APPEARANCE</span></div><p class="brand-appearance-copy">The chosen accent is saved with this browser’s settings. Threadline is the chat and agent workspace; Engram remains a separate local project.</p><div class="accent-picker" role="group" aria-label="App accent and icon"><button class="accent-option" type="button" data-accent="green" aria-pressed="${(settings.accent || 'green') === 'green'}"><img src="./assets/engram-mark-green.png" alt="" /><span>Green</span></button><button class="accent-option" type="button" data-accent="purple" aria-pressed="${settings.accent === 'purple'}"><img src="./assets/engram-icon-purple.png" alt="" /><span>Purple</span></button><button class="accent-option" type="button" data-accent="pink" aria-pressed="${settings.accent === 'pink'}"><img src="./assets/engram-icon-pink.png" alt="" /><span>Pink</span></button><button class="accent-option" type="button" data-accent="blue" aria-pressed="${settings.accent === 'blue'}"><img src="./assets/engram-icon-blue.png" alt="" /><span>Blue</span></button><button class="accent-option" type="button" data-accent="fire" aria-pressed="${settings.accent === 'fire'}"><img src="./assets/engram-icon-fire.png" alt="" /><span>Ember</span></button><button class="accent-option" type="button" data-accent="forest" aria-pressed="${settings.accent === 'forest'}"><img src="./assets/engram-icon-forest.png" alt="" /><span>Forest</span></button><button class="accent-option" type="button" data-accent="ice" aria-pressed="${settings.accent === 'ice'}"><img src="./assets/engram-icon-ice.png" alt="" /><span>Ice</span></button></div></section><section class="settings-card"><div class="settings-card-heading"><span class="settings-icon">↔</span><div><h2>Inference server</h2><p>OpenAI-compatible chat completions API</p></div><span class="module-label">PROVIDER MODULE</span></div><label class="field-label" for="base-url">API base URL</label><input id="base-url" name="baseUrl" type="url" value="${esc(settings.baseUrl)}" placeholder="http://localhost:8000/v1" required /><div class="field-row"><div><label class="field-label" for="model-id">Model ID</label><input id="model-id" name="model" value="${esc(settings.model)}" placeholder="Select or type a model ID" /></div><button type="button" class="secondary-button discover-button" id="discover-models">Discover models</button></div><label class="field-label" for="api-key">API key <span>optional for local servers</span></label><input id="api-key" name="apiKey" type="password" value="${esc(settings.apiKey)}" autocomplete="off" placeholder="Re-enter for each page session" /><div class="settings-actions"><button class="primary-button" type="submit">Save connection</button><button class="secondary-button" id="test-connection" type="button">Test connection</button><span id="connection-feedback" role="status"></span></div><div class="endpoint-note"><span class="status-light"></span><span>Chat endpoint: <code id="endpoint-preview">${esc(settings.baseUrl.replace(/\/$/, ''))}/chat/completions</code></span></div></section><section class="settings-card wide-card" id="omlx-manager-card"><div class="settings-card-heading"><span class="settings-icon warm">◉</span><div><h2>Local oMLX service</h2><p>Manage the on-device inference server from Threadline</p></div><span class="module-label">LOCAL SERVICE MODULE</span></div><p class="brand-appearance-copy">Controls only the installed oMLX service on this Mac. Threadline runs fixed <code>omlx start</code>, <code>stop</code>, or <code>restart</code> actions without a shell. It does not install software or download models.</p><div class="omlx-status-row"><span class="status-light" id="omlx-status-light"></span><span id="omlx-status-text" role="status">Checking local service…</span></div><div class="settings-actions omlx-actions"><button class="primary-button" type="button" data-omlx-action="start">Start oMLX</button><button class="secondary-button" type="button" data-omlx-action="restart">Restart</button><button class="secondary-button" type="button" data-omlx-action="stop">Stop</button><button class="text-button" type="button" id="refresh-omlx">Refresh status</button></div><div class="settings-actions omlx-actions"><button class="secondary-button" type="button" id="load-model">Load selected model</button><button class="secondary-button" type="button" id="unload-model">Unload selected model</button><span id="model-load-feedback" role="status"></span></div><p class="local-service-note">Loading warms the selected local model into memory for immediate requests. oMLX’s idle policy may unload it later; use oMLX model settings to pin it permanently. Threadline leaves model residency and cache policy to oMLX. This manager is available only for the local oMLX service on port 8000.</p></section>
+      <section class="settings-card"><div class="settings-card-heading"><span class="settings-icon warm">⌘</span><div><h2>Context algorithm</h2><p>Budget, recency, and evidence packing</p></div><span class="module-label">PACKER MODULE</span></div><div class="field-row setting-numbers"><div><label class="field-label" for="context-limit">Model context limit</label><input id="context-limit" name="contextLimit" type="number" min="1024" step="512" value="${settings.contextLimit}" /></div><div><label class="field-label" for="output-reserve">Output reserve</label><input id="output-reserve" name="outputReserve" type="number" min="128" step="1" value="${settings.outputReserve}" /></div><div><label class="field-label" for="safety-margin">Safety margin</label><input id="safety-margin" name="safetyMargin" type="number" min="0" step="100" value="${settings.safetyMargin}" /></div></div><label class="field-label" for="recent-turns">Recent turns to retain <span id="recent-value">${settings.recentTurns}</span></label><input id="recent-turns" name="recentTurns" type="range" min="2" max="16" value="${settings.recentTurns}" /><label class="field-label" for="strategy">Memory strategy</label><select id="strategy" name="strategy"><option value="hybrid" ${settings.strategy === 'hybrid' ? 'selected' : ''}>Structured state + retrieved turns</option><option value="recent" ${settings.strategy === 'recent' ? 'selected' : ''}>Recent turns only</option><option value="state" ${settings.strategy === 'state' ? 'selected' : ''}>Structured state + recent turns</option></select><label class="check-row"><input type="checkbox" name="memoryEnabled" ${settings.memoryEnabled ? 'checked' : ''} /><span><b>Use conversation memory</b><small>Derive local variables and retrieve relevant turns.</small></span><i></i></label><label class="check-row"><input type="checkbox" name="showEvidence" ${settings.showEvidence ? 'checked' : ''} /><span><b>Show source references</b><small>Display turn IDs when history evidence was packed.</small></span><i></i></label></section>
+      <section class="settings-card wide-card"><div class="settings-card-heading"><span class="settings-icon blue-icon">✳</span><div><h2>Assistant operating instructions</h2><p>Baseline prompt used for every request</p></div><span class="module-label">SYSTEM MODULE</span></div><textarea id="system-prompt" name="systemPrompt" rows="4">${esc(settings.systemPrompt)}</textarea><div class="settings-actions"><button class="primary-button" type="submit">Save all settings</button><button class="text-button" type="button" id="reset-data">Delete all local data</button></div></section><section class="settings-card wide-card"><div class="settings-card-heading"><span class="settings-icon blue-icon">⌘</span><div><h2>Threadline project tools</h2><p>Local file access and fixed offline checks</p></div><span class="module-label">CAPABILITY MODULE</span></div><p class="brand-appearance-copy" id="project-access-status">Checking whether a project folder was granted…</p><div class="project-tool-list"><span>Browse and read approved source files</span><span>Create directories and write files after review</span><span>Run git status and allowlisted Cargo checks (Cargo forced offline)</span></div><p class="brand-appearance-copy">Hidden credentials, the <code>.engram</code> vault data, build output, and dependency folders are excluded. Project source stays on device: project tools are withheld from remote models and require a local inference endpoint.</p></section></form>`;
+    fetch('/api/v1/project/status').then(response => response.json()).then(status => {
+      const label = $('#project-access-status');
+      if (status.enabled) label.textContent = `Project tools enabled · ${status.root} · list, read, write, and fixed offline checks. Each action requires approval.`;
+      else label.textContent = 'Project tools are off. Launch the local server with --project-root <directory> to grant a project folder.';
+    }).catch(() => { $('#project-access-status').textContent = 'Project access status could not be checked.'; });
+    refreshOmlxStatus();
+    $('#refresh-omlx').addEventListener('click', refreshOmlxStatus);
+    document.querySelectorAll('[data-omlx-action]').forEach(button => button.addEventListener('click', () => manageOmlx(button.dataset.omlxAction)));
+    $('#load-model').addEventListener('click', () => manageModelResidency(true));
+    $('#unload-model').addEventListener('click', () => manageModelResidency(false));
     document.querySelectorAll('[data-accent]').forEach(button => button.addEventListener('click', () => {
       const accent = button.dataset.accent;
       updateSettings({ accent });
@@ -130,6 +140,66 @@ function renderWorkspaceView() {
     $('#reset-data').addEventListener('click', () => { if (confirm('Delete all conversations, memory, and settings stored by this prototype in this browser?')) { clearWorkspace(); location.reload(); } });
   }
   $('#back-to-chat')?.addEventListener('click', () => switchView('chat'));
+}
+
+async function refreshOmlxStatus() {
+  const label = $('#omlx-status-text'); const light = $('#omlx-status-light');
+  if (!label || !light) return;
+  label.textContent = 'Checking local service…'; light.classList.remove('is-on', 'is-error');
+  try {
+    const response = await fetch('/api/v1/inference/omlx');
+    const status = await response.json();
+    label.textContent = status.message;
+    light.classList.toggle('is-on', Boolean(status.endpointListening));
+    light.classList.toggle('is-error', Boolean(status.supported && !status.cliAvailable));
+    document.querySelectorAll('[data-omlx-action]').forEach(button => { button.disabled = !status.supported || !status.cliAvailable; });
+    const modelControlsAllowed = status.supported && status.cliAvailable && classifyEndpoint($('#base-url')?.value || '').kind === 'local';
+    [$('#load-model'), $('#unload-model')].filter(Boolean).forEach(button => { button.disabled = !modelControlsAllowed; });
+  } catch {
+    label.textContent = 'Could not read the local service status.'; light.classList.add('is-error');
+    [...document.querySelectorAll('[data-omlx-action], #load-model, #unload-model')].forEach(button => { button.disabled = true; });
+  }
+}
+
+async function manageOmlx(action) {
+  const label = $('#omlx-status-text');
+  const buttons = [...document.querySelectorAll('[data-omlx-action]')];
+  buttons.forEach(button => { button.disabled = true; });
+  if (label) label.textContent = `Running oMLX ${action}…`;
+  try {
+    const response = await fetch(`/api/v1/inference/omlx/${action}`, { method: 'POST', headers: { 'X-Threadline-Local-Control': '1' } });
+    const result = await response.json();
+    if (!response.ok || !result.ok) throw new Error(result.error || `oMLX ${action} failed.`);
+    if (label) label.textContent = result.message;
+    if (action === 'start' || action === 'restart') {
+      for (let attempt = 0; attempt < 10; attempt++) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        const statusResponse = await fetch('/api/v1/inference/omlx');
+        const status = await statusResponse.json();
+        if (status.endpointListening) break;
+      }
+    }
+    await refreshOmlxStatus();
+  } catch (error) {
+    if (label) label.textContent = error.message;
+    $('#omlx-status-light')?.classList.add('is-error');
+    buttons.forEach(button => { button.disabled = false; });
+  }
+}
+
+async function manageModelResidency(loaded) {
+  const feedback = $('#model-load-feedback');
+  const buttons = [$('#load-model'), $('#unload-model')];
+  buttons.forEach(button => { button.disabled = true; });
+  if (feedback) feedback.textContent = loaded ? 'Loading selected model…' : 'Unloading selected model…';
+  try {
+    await setModelLoaded({ baseUrl: $('#base-url').value.trim(), apiKey: getSessionApiKey(), model: $('#model-id').value, loaded });
+    if (feedback) feedback.textContent = loaded ? 'Model load requested. It may take time to warm up.' : 'Model unload requested.';
+  } catch (error) {
+    if (feedback) feedback.textContent = error.message;
+  } finally {
+    buttons.forEach(button => { button.disabled = false; });
+  }
 }
 
 async function discoverModels() {
@@ -156,6 +226,9 @@ async function submitMessage(message) {
   if (!settings.model) { switchView('settings'); toast('Connect a model before sending.'); return; }
   const endpoint = classifyEndpoint(settings.baseUrl);
   if (!endpoint.allowed) { toast(`Request blocked: ${endpoint.reason}`); return; }
+  const modelTools = endpoint.kind === 'local'
+    ? applicationTools
+    : applicationTools.filter(tool => !tool.function.name.startsWith('project_') && tool.function.name !== 'run_project_check');
   const allowVaultContext = canSendVaultContext(settings.baseUrl, settings.vaultSearchEnabled);
   if (settings.vaultSearchEnabled && !allowVaultContext) toast('Vault context is disabled for remote inference.');
   sending = true; $('#send-button').textContent = '■'; $('#send-button').setAttribute('aria-label', 'Stop generation');
@@ -175,9 +248,9 @@ async function submitMessage(message) {
     }
   }
   const decision = evaluateRules({ message, memory: convo.memory, evidence, settings, vaultResult, vaultSearchError });
-  const pack = packContext({ message, history: convo.turns, memory: settings.memoryEnabled && settings.strategy !== 'recent' ? convo.memory : { ...convo.memory, currentGoal: [], activeTopics: [], decisions: [], constraints: [], preferences: [], openQuestions: [] }, evidence: settings.strategy === 'state' ? [] : evidence, vaultNotes: vaultResult.hits || [], settings });
+  const pack = packContext({ message, history: convo.turns, memory: settings.memoryEnabled && settings.strategy !== 'recent' ? convo.memory : { ...convo.memory, currentGoal: [], activeTopics: [], decisions: [], constraints: [], preferences: [], openQuestions: [] }, evidence: settings.strategy === 'state' ? [] : evidence, vaultNotes: vaultResult.hits || [], vaultContextAllowed: allowVaultContext, settings });
   if (endpoint.kind === 'remote') {
-    const approved = await confirmDisclosure({ endpoint: endpoint.origin, apiKey: getSessionApiKey(), categories: requestCategories({ messages: pack.messages, tools: applicationTools }), chars: JSON.stringify(pack.messages).length });
+    const approved = await confirmDisclosure({ endpoint: endpoint.origin, apiKey: getSessionApiKey(), categories: requestCategories({ messages: pack.messages, tools: modelTools }), chars: JSON.stringify(pack.messages).length });
     if (!approved) { toast('Remote request cancelled. Your message remains in local history.'); sending = false; $('#send-button').textContent = '↑'; renderAll(); return; }
   }
   updateActive({ lastAssembly: { audit: pack.audit, trace: decision.trace, evidence: evidence.map(item => ({ id: item.turn.id, score: item.score, label: item.evidence })), vault: { indexed: vaultResult.indexed, hits: vaultResult.hits || [], error: vaultSearchError?.message || null } } });
@@ -198,7 +271,7 @@ async function submitMessage(message) {
        let toolCalls = [];
       let toolSupport = true;
       try {
-        for await (const event of streamChat({ ...settings, apiKey: getSessionApiKey(), messages: requestMessages, tools: applicationTools, signal: aborter.signal })) {
+        for await (const event of streamChat({ ...settings, apiKey: getSessionApiKey(), messages: requestMessages, tools: modelTools, signal: aborter.signal })) {
           if (event.type === 'token') { answer += event.content; placeholder.querySelector('.thinking-text').textContent = answer; $('#messages').scrollTop = $('#messages').scrollHeight; }
           if (event.type === 'tool_calls') toolCalls = event.calls;
         }
@@ -217,15 +290,21 @@ async function submitMessage(message) {
       placeholder.querySelector('.thinking-text').innerHTML = '<span class="stream-state"><i></i> applying requested workspace action</span>';
       const toolMessages = [];
       for (const call of toolCalls) {
-          const result = executeApplicationAction(call.function.name, call.function.arguments, {
+          const actionCallbacks = {
            actionId: call.id,
           openView: switchView,
           updateSettings: patch => { updateSettings(patch); renderAll(); },
           getMemory: () => current().memory,
           newConversation: () => { createConversation(); switchView('chat'); renderAll(); },
           clearWorkspace: () => { clearWorkspace(); createConversation(); switchView('chat'); renderAll(); },
-          confirm: message => confirm(message)
-        });
+          confirm: message => confirmToolAction(message)
+        };
+        const isProjectTool = call.function.name.startsWith('project_') || call.function.name === 'run_project_check';
+        const result = isProjectTool && endpoint.kind !== 'local'
+          ? { ok: false, code: 'local_inference_required', error: 'Project tools are disabled for remote inference. Connect a loopback on-device model to keep Engram source offline.' }
+          : isProjectTool
+            ? await executeProjectAction(call.function.name, call.function.arguments, actionCallbacks)
+            : executeApplicationAction(call.function.name, call.function.arguments, actionCallbacks);
         toolMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(result) });
       }
       requestMessages = [...requestMessages, { role: 'assistant', content: null, tool_calls: toolCalls }, ...toolMessages];
@@ -243,6 +322,15 @@ async function submitMessage(message) {
 function showThinking() {
   $('#messages').insertAdjacentHTML('beforeend', `<article class="message-row assistant-row thinking-row" id="thinking-indicator"><div class="message-avatar assistant"><img src="./assets/engram-mark.png" alt="" /></div><div class="message-main"><div class="message-meta"><strong>Threadline</strong><span class="stream-state"><i></i> assembling and generating</span></div><div class="message-text thinking-text"><span class="loading-dots"><i></i><i></i><i></i></span></div></div></article>`);
   $('#messages').scrollTop = $('#messages').scrollHeight;
+}
+
+async function confirmToolAction(disclosure) {
+  const dialog = $('#tool-consent');
+  $('#tool-consent-content').textContent = disclosure;
+  return new Promise(resolve => {
+    dialog.onclose = () => resolve(dialog.returnValue === 'allow');
+    dialog.showModal();
+  });
 }
 
 $('#composer-form').addEventListener('submit', e => { e.preventDefault(); if (sending) { aborter?.abort(); return; } const input = $('#message-input'); const message = input.value; input.value = ''; input.style.height = 'auto'; submitMessage(message); });

@@ -4,16 +4,14 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#101310" />
-    <title>Engram · Threadline chat</title>
+    <title>Threadline · Local AI workspace</title>
     <link rel="icon" type="image/png" href="./assets/engram-mark.png" />
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
     <div class="app-shell">
       <aside class="sidebar">
-        <a class="brand" href="#" aria-label="Engram chat home">
-          <img src="./assets/engram-logo.png" alt="Engram" />
-        </a>
+        <a class="brand" href="#" aria-label="Threadline home"><span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span><span>Threadline</span></a>
         <button class="new-chat" id="new-chat"><span class="plus">＋</span> New conversation <kbd>⌘ K</kbd></button>
         <div class="side-label">WORKSPACE</div>
         <nav class="nav-list" aria-label="Main navigation">
@@ -79,6 +77,7 @@
       </aside>
     </div>
     <dialog id="remote-consent" aria-labelledby="remote-consent-title"><form method="dialog"><h2 id="remote-consent-title">Review remote data sharing</h2><div id="remote-consent-body"></div><div class="dialog-actions"><button value="cancel">Cancel</button><button id="remote-consent-allow" value="allow">Allow this request</button></div></form></dialog>
+    <dialog id="tool-consent" aria-labelledby="tool-consent-title"><form method="dialog"><h2 id="tool-consent-title">Review Threadline action</h2><pre id="tool-consent-content"></pre><div class="dialog-actions"><button value="cancel">Cancel</button><button value="allow">Approve this action</button></div></form></dialog>
     <div class="toast" id="toast" role="status"></div>
     <script type="module" src="./src/app.js"></script>
   </body>

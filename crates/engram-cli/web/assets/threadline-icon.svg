@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Threadline</title>
+  <desc id="desc">A warm luminous thread weaving through a conversation bubble.</desc>
+  <defs>
+    <linearGradient id="thread" x1="128" y1="180" x2="384" y2="300" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ff9d4d"/>
+      <stop offset=".52" stop-color="#edc06d"/>
+      <stop offset="1" stop-color="#c8f169"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientTransform="matrix(0 282 -282 0 256 40)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#35402f" stop-opacity=".7"/>
+      <stop offset="1" stop-color="#171a17" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect x="24" y="24" width="464" height="464" rx="112" fill="#171a17"/>
+  <rect x="25" y="25" width="462" height="462" rx="111" fill="url(#glow)"/>
+  <rect x="25" y="25" width="462" height="462" rx="111" stroke="#3a4437" stroke-width="2"/>
+  <path d="M144 116h224c26.51 0 48 21.49 48 48v174c0 26.51-21.49 48-48 48H240l-80 62v-62h-16c-26.51 0-48-21.49-48-48V164c0-26.51 21.49-48 48-48Z" fill="#1d231c" stroke="#475342" stroke-width="8" stroke-linejoin="round"/>
+  <path d="M151 207h100c25 0 37 13 37 32s-12 32-37 32h-34c-25 0-37 13-37 32s12 32 37 32h143" fill="none" stroke="url(#thread)" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="151" cy="207" r="13" fill="#ffb06a"/>
+  <circle cx="251" cy="207" r="8" fill="#f2d181"/>
+  <circle cx="217" cy="303" r="8" fill="#d5eb8a"/>
+  <circle cx="360" cy="335" r="13" fill="#c8f169"/>
+</svg>

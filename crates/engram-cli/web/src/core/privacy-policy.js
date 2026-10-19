@@ -20,6 +20,7 @@ export function requestCategories({ messages = [], tools = [] } = {}) {
   if (messages.some(item => item.role === 'system')) categories.push('system/custom instructions');
   if (messages.some(item => item.role === 'user' && item.content !== messages.at(-1)?.content)) categories.push('recent turns');
   if (messages.some(item => typeof item.content === 'string' && /memory|assertion|decision/i.test(item.content))) categories.push('derived memory');
+  if (messages.some(item => item.role === 'tool')) categories.push('local project files or tool results');
   if (messages.some(item => typeof item.content === 'string' && /\[.*?\.md\]/.test(item.content))) categories.push('retrieved history or vault snippets');
   if (tools.length) categories.push('registered tool definitions and possible tool results');
   return [...new Set(categories)];

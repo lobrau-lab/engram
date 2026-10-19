@@ -57,6 +57,18 @@ the configured OpenAI-compatible inference endpoint directly, which may
 require that endpoint to allow requests from the local Engram origin (CORS).
 Context token counts remain estimates.
 
+On macOS, **Connections & settings** also has an optional oMLX service manager.
+It checks the default loopback port, invokes only the official CLI's fixed
+`start`, `stop`, and `restart` subcommands, and can request that a selected
+model be loaded or unloaded through the local OpenAI-compatible model API.
+The CLI is discovered only in the documented user shim and common Homebrew
+locations; no command path or shell text is accepted from the browser. These
+controls do not install oMLX or download models. A load request warms a model,
+but oMLX's own idle timeout and pinning settings determine whether it remains
+resident. Generic compatible inference endpoints continue to work without the
+oMLX controls. Threadline still sends chat requests directly to the configured
+endpoint; this service manager is not a request proxy or a process sandbox.
+
 ## Layout
 
 ```text

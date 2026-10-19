@@ -62,6 +62,9 @@ enum Cmd {
         host: String,
         #[arg(long, default_value_t = 0)]
         port: u16,
+        /// Optional project root granted to Threadline's local file tools.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
     },
     /// Start the local workspace and open it in the system browser.
     Open {
@@ -69,6 +72,9 @@ enum Cmd {
         host: String,
         #[arg(long, default_value_t = 0)]
         port: u16,
+        /// Optional project root granted to Threadline's local file tools.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
     },
     /// Create an encrypted Markdown backup. Reads ENGRAM_BACKUP_PASSWORD.
     Backup { dest: PathBuf },
@@ -94,8 +100,8 @@ fn main() -> Result<()> {
         Cmd::Ask { question } => cmd_ask(&vault, &config_path, &question),
         Cmd::Export { dest, dry_run } => cmd_export(&vault, &config_path, &dest, dry_run),
         Cmd::Import { src, dry_run } => cmd_import(&vault, &config_path, &src, dry_run),
-        Cmd::Serve { host, port } => serve::run(&vault, &host, port),
-        Cmd::Open { host, port } => serve::open(&vault, &host, port),
+        Cmd::Serve { host, port, project_root } => serve::run(&vault, project_root.as_deref(), &host, port),
+        Cmd::Open { host, port, project_root } => serve::open(&vault, project_root.as_deref(), &host, port),
         Cmd::Backup { dest } => cmd_backup(&vault, &dest),
         Cmd::Restore { src } => cmd_restore(&vault, &src),
         Cmd::ImportFiles { src } => cmd_import_files(&vault, &config_path, &src),

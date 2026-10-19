@@ -13,6 +13,21 @@ export async function listModels({ baseUrl, apiKey }) {
   const data = await response.json(); return data.data || [];
 }
 
+export async function setModelLoaded({ baseUrl, apiKey, model, loaded }) {
+  const target = endpoint(baseUrl);
+  if (target.kind !== 'local') throw new Error('Model load controls are allowed only for a loopback inference server.');
+  const modelId = String(model || '').trim();
+  if (!modelId || !/^[\w.:-]+$/.test(modelId)) throw new Error('Enter a model ID containing only letters, numbers, dots, underscores, colons, or hyphens.');
+  const response = await fetch(`${target.url.toString().replace(/\/$/, '')}/models/${encodeURIComponent(modelId)}/${loaded ? 'load' : 'unload'}`, {
+    method: 'POST', headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {}
+  });
+  if (!response.ok) {
+    let detail = ''; try { detail = (await response.json()).detail || ''; } catch {}
+    throw new Error(detail || `The local server could not ${loaded ? 'load' : 'unload'} this model (${response.status}).`);
+  }
+  return response.json().catch(() => ({}));
+}
+
 export async function* streamChat({ baseUrl, apiKey, model, messages, tools, signal }) {
   const target = endpoint(baseUrl);
   const response = await fetch(`${target.url.toString().replace(/\/$/, '')}/chat/completions`, {

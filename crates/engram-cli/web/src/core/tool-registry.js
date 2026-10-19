@@ -1,5 +1,50 @@
 const registeredTools = [
   {
+    name: 'project_list_files',
+    description: 'List non-hidden text-oriented source files in the explicitly granted local project root.',
+    effect: 'local_file_read', scope: 'threadline:project:read', capability: 'List files in the granted project workspace',
+    risk: 'medium', destination: 'local', dataClasses: ['Project file names and sizes'], approval: 'confirm',
+    confirmation: 'Allow Threadline to list files in the project folder granted when the server was started?',
+    scopeResolver: 'granted-project-root',
+    parameters: { type: 'object', properties: { path: { type: 'string', maxLength: 500 } }, additionalProperties: false }
+  },
+  {
+    name: 'project_read_file',
+    description: 'Read a UTF-8 text file inside the explicitly granted local project root. Hidden and sensitive paths are blocked.',
+    effect: 'local_file_read', scope: 'threadline:project:read', capability: 'Read a project source file',
+    risk: 'medium', destination: 'local', dataClasses: ['Contents of the requested project source file'], approval: 'confirm',
+    confirmation: 'Allow Threadline to read this project file? Its contents may be included in the next model request.',
+    scopeResolver: 'granted-project-root',
+    parameters: { type: 'object', properties: { path: { type: 'string', minLength: 1, maxLength: 500 } }, required: ['path'], additionalProperties: false }
+  },
+  {
+    name: 'project_create_directory',
+    description: 'Create a directory under the explicitly granted local project root. Hidden paths and symbolic links are blocked.',
+    effect: 'local_file_write', scope: 'threadline:project:write', capability: 'Create a project directory',
+    risk: 'medium', destination: 'local', dataClasses: ['Project directory structure'], approval: 'confirm',
+    confirmation: 'Allow Threadline to create this directory inside the granted project folder?',
+    scopeResolver: 'granted-project-root',
+    parameters: { type: 'object', properties: { path: { type: 'string', minLength: 1, maxLength: 500 } }, required: ['path'], additionalProperties: false }
+  },
+  {
+    name: 'run_project_check',
+    description: 'Run one fixed local check in the granted project root. Cargo tasks use --offline and cannot download dependencies; arbitrary shell commands are unavailable.',
+    effect: 'shell_execution', scope: 'threadline:project:check', capability: 'Run an allowlisted offline project check',
+    risk: 'medium', destination: 'local', dataClasses: ['Check command and its output'], approval: 'confirm',
+    confirmation: 'Run this fixed local check in the project folder? Cargo will be forced offline.',
+    scopeResolver: 'granted-project-root',
+    parameters: { type: 'object', properties: { task: { type: 'string', enum: ['git_status', 'git_diff_check', 'cargo_check_cli_offline', 'cargo_test_cli_offline'] } }, required: ['task'], additionalProperties: false }
+  },
+  {
+    name: 'project_write_file',
+    description: 'Create or replace a UTF-8 text file inside the explicitly granted local project root. Hidden and sensitive paths are blocked.',
+    effect: 'local_file_write', scope: 'threadline:project:write', capability: 'Create or replace a project source file',
+    risk: 'high', destination: 'local', dataClasses: ['Content written to the requested project file'], approval: 'confirm',
+    confirmation: 'Allow Threadline to write this project file? Review the path and complete proposed content below.',
+    scopeResolver: 'granted-project-root',
+    parameters: { type: 'object', properties: { path: { type: 'string', minLength: 1, maxLength: 500 }, content: { type: 'string', maxLength: 524288 } }, required: ['path', 'content'], additionalProperties: false }
+  },
+  {
     name: 'open_workspace_view',
     description: 'Open a view in the chat application.',
     effect: 'ui_navigation',
@@ -137,6 +182,8 @@ export function validateToolArguments(tool, args) {
     const schema = properties[name];
     if (schema.type === 'boolean' && typeof value !== 'boolean') return `${name} must be a boolean.`;
     if (schema.type === 'string' && typeof value !== 'string') return `${name} must be a string.`;
+    if (schema.type === 'string' && schema.minLength != null && value.length < schema.minLength) return `${name} is too short.`;
+    if (schema.type === 'string' && schema.maxLength != null && value.length > schema.maxLength) return `${name} is too long.`;
     if (schema.type === 'integer' && !Number.isSafeInteger(value)) return `${name} must be an integer.`;
     if (schema.enum && !schema.enum.includes(value)) return `${name} has an unsupported value.`;
     if (schema.minimum != null && value < schema.minimum) return `${name} is below the supported minimum.`;

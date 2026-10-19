@@ -5,25 +5,26 @@ use engram_core::index::Index;
 use engram_core::vault::validate_relative_path;
 use engram_core::{atomic_write, build_context_prompt, Config, HashingEmbedder, LlmClient, OpenAiCompat, Vault};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::{Component, Path, PathBuf};
+use walkdir::WalkDir;
 use std::time::Duration;
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 512 * 1024;
 
-pub fn run(vault: &Path, host: &str, port: u16) -> Result<()> {
+pub fn run(vault: &Path, project_root: Option<&Path>, host: &str, port: u16) -> Result<()> {
     validate_bind_host(host)?;
     let listener = TcpListener::bind((host, port))
         .with_context(|| format!("binding local workspace at {host}:{port}"))?;
-    run_listener(vault, listener, false)
+    run_listener(vault, project_root, listener, false)
 }
 
-pub fn open(vault: &Path, host: &str, port: u16) -> Result<()> {
+pub fn open(vault: &Path, project_root: Option<&Path>, host: &str, port: u16) -> Result<()> {
     validate_bind_host(host)?;
     let listener = TcpListener::bind((host, port))
         .with_context(|| format!("binding local workspace at {host}:{port}"))?;
-    run_listener(vault, listener, true)
+    run_listener(vault, project_root, listener, true)
 }
 
 fn validate_bind_host(host: &str) -> Result<()> {
@@ -33,7 +34,12 @@ fn validate_bind_host(host: &str) -> Result<()> {
     anyhow::bail!("Engram is local-only and only binds to localhost, 127.0.0.1, or ::1")
 }
 
-fn run_listener(vault: &Path, listener: TcpListener, launch_browser: bool) -> Result<()> {
+fn run_listener(vault: &Path, project_root: Option<&Path>, listener: TcpListener, launch_browser: bool) -> Result<()> {
+    let project_root = project_root.map(|path| {
+        let root = path.canonicalize().with_context(|| format!("resolving project root {}", path.display()))?;
+        anyhow::ensure!(root.is_dir(), "project root must be a directory");
+        Ok::<_, anyhow::Error>(root)
+    }).transpose()?;
     let address = listener.local_addr()?;
     let url = format!("http://{address}");
     println!("Engram workspace: {url}");
@@ -53,7 +59,7 @@ fn run_listener(vault: &Path, listener: TcpListener, launch_browser: bool) -> Re
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(error) = handle(vault, stream) {
+                if let Err(error) = handle(vault, project_root.as_deref(), stream) {
                     eprintln!("request failed: {error:#}");
                 }
             }
@@ -63,10 +69,10 @@ fn run_listener(vault: &Path, listener: TcpListener, launch_browser: bool) -> Re
     Ok(())
 }
 
-fn handle(vault: &Path, mut stream: TcpStream) -> Result<()> {
+fn handle(vault: &Path, project_root: Option<&Path>, mut stream: TcpStream) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let (method, target, body) = read_request(&mut stream)?;
+    let (method, target, body, local_control) = read_request(&mut stream)?;
 
     let (path, query) = target.as_str().split_once('?').unwrap_or((target.as_str(), ""));
     let response = match (method.as_str(), path) {
@@ -94,6 +100,17 @@ fn handle(vault: &Path, mut stream: TcpStream) -> Result<()> {
                 None => response(404, "text/plain; charset=utf-8", "Not found"),
             }
         }
+        ("GET", "/api/v1/project/status") => project_status(project_root),
+        ("GET", "/api/v1/project/files") => project_files(project_root, query),
+        ("GET", "/api/v1/project/read") => project_read(project_root, query),
+        ("POST", "/api/v1/project/write") => project_write(project_root, &body),
+        ("POST", "/api/v1/project/directory") => project_create_directory(project_root, &body),
+        ("POST", "/api/v1/project/check") => project_run_check(project_root, &body),
+        ("GET", "/api/v1/inference/omlx") => omlx_status(),
+        ("POST", "/api/v1/inference/omlx/start") if local_control => omlx_action("start"),
+        ("POST", "/api/v1/inference/omlx/stop") if local_control => omlx_action("stop"),
+        ("POST", "/api/v1/inference/omlx/restart") if local_control => omlx_action("restart"),
+        ("POST", path) if path.starts_with("/api/v1/inference/omlx/") => project_error(403, "local control header required"),
         ("GET", "/api/v1/vault/search") => {
             let search = parameter(query, "q").unwrap_or_default();
             if search.trim().is_empty() || search.len() > 512 {
@@ -122,7 +139,396 @@ fn handle(vault: &Path, mut stream: TcpStream) -> Result<()> {
     Ok(())
 }
 
-fn read_request(stream: &mut TcpStream) -> Result<(String, String, String)> {
+fn omlx_cli() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(home).join(".omlx/bin/omlx"));
+    }
+    candidates.extend([PathBuf::from("/opt/homebrew/bin/omlx"), PathBuf::from("/usr/local/bin/omlx")]);
+    candidates.into_iter().find(|path| {
+        if !path.is_file() { return false; }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(path).map(|metadata| metadata.permissions().mode() & 0o111 != 0).unwrap_or(false)
+        }
+        #[cfg(not(unix))]
+        { true }
+    })
+}
+
+fn omlx_status() -> Vec<u8> {
+    let supported = cfg!(target_os = "macos");
+    let cli_available = supported && omlx_cli().is_some();
+    let address: SocketAddr = "127.0.0.1:8000".parse().expect("fixed loopback address");
+    let endpoint_listening = supported && TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_ok();
+    let message = if !supported {
+        "Threadline's oMLX lifecycle controls are available on macOS."
+    } else if !cli_available {
+        "oMLX CLI not found. Launch oMLX or install its official CLI shim to enable lifecycle controls."
+    } else if endpoint_listening {
+        "A service is listening on oMLX's default loopback port. This does not prove that a model is loaded."
+    } else {
+        "No service is listening on oMLX's default loopback port."
+    };
+    response(200, "application/json; charset=utf-8", &serde_json::json!({
+        "provider": "oMLX", "supported": supported, "cliAvailable": cli_available,
+        "endpointListening": endpoint_listening, "message": message
+    }).to_string())
+}
+
+fn omlx_action(action: &str) -> Vec<u8> {
+    if !cfg!(target_os = "macos") {
+        return response(501, "application/json; charset=utf-8", r#"{"ok":false,"error":"oMLX lifecycle controls are available on macOS only."}"#);
+    }
+    if !matches!(action, "start" | "stop" | "restart") {
+        return response(400, "application/json; charset=utf-8", r#"{"ok":false,"error":"Unsupported oMLX action."}"#);
+    }
+    let Some(cli) = omlx_cli() else {
+        return response(503, "application/json; charset=utf-8", r#"{"ok":false,"error":"oMLX CLI not found. Launch oMLX or install its official CLI shim."}"#);
+    };
+    // Fixed executable and fixed subcommands only: never invoke a shell or
+    // accept a command path/argument from the browser.
+    let result = std::process::Command::new(cli).arg(action).output();
+    match result {
+        Ok(output) if output.status.success() => response(200, "application/json; charset=utf-8", &serde_json::json!({
+            "ok": true, "action": action, "message": format!("oMLX {action} command completed.")
+        }).to_string()),
+        Ok(output) => {
+            let detail = String::from_utf8_lossy(&output.stderr);
+            let detail = detail.trim();
+            let detail = if detail.is_empty() { format!("oMLX {action} exited with {}.", output.status) } else { detail.chars().take(1200).collect() };
+            response(500, "application/json; charset=utf-8", &serde_json::json!({"ok": false, "error": detail}).to_string())
+        }
+        Err(error) => response(500, "application/json; charset=utf-8", &serde_json::json!({"ok": false, "error": format!("Could not run the oMLX CLI: {error}")}).to_string()),
+    }
+}
+
+fn project_status(root: Option<&Path>) -> Vec<u8> {
+    match root {
+        Some(root) => response(200, "application/json; charset=utf-8", &serde_json::json!({"enabled": true, "root": root.display().to_string(), "access": ["list", "read", "write"]}).to_string()),
+        None => response(200, "application/json; charset=utf-8", r#"{"enabled":false,"access":[]}"#),
+    }
+}
+
+fn project_files(root: Option<&Path>, query: &str) -> Vec<u8> {
+    let Some(root) = root else {
+        return project_disabled();
+    };
+    let relative = parameter(query, "path").unwrap_or_else(|| ".".to_string());
+    let directory = if relative == "." {
+        root.to_path_buf()
+    } else {
+        match resolve_project_path(root, &relative, false) {
+            Ok(path) if path.is_dir() => path,
+            Ok(_) => {
+                return response(
+                    400,
+                    "application/json; charset=utf-8",
+                    r#"{"error":"path is not a directory"}"#,
+                )
+            }
+            Err(error) => return project_error(400, &error.to_string()),
+        }
+    };
+    let mut files = Vec::new();
+    for entry in WalkDir::new(&directory)
+        .min_depth(1)
+        .max_depth(5)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            entry
+                .path()
+                .strip_prefix(root)
+                .ok()
+                .is_some_and(|relative| !is_sensitive_project_path(relative))
+        })
+        .filter_map(Result::ok)
+    {
+        if files.len() >= 500 {
+            break;
+        }
+        let path = entry.path();
+        let rel = match path.strip_prefix(root) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        if entry.file_type().is_file() && !is_sensitive_project_path(rel) {
+            files.push(serde_json::json!({"path": rel.to_string_lossy(), "bytes": entry.metadata().map(|meta| meta.len()).unwrap_or(0)}));
+        }
+    }
+    response(
+        200,
+        "application/json; charset=utf-8",
+        &serde_json::json!({"files": files, "truncated": files.len() >= 500}).to_string(),
+    )
+}
+
+fn project_read(root: Option<&Path>, query: &str) -> Vec<u8> {
+    let Some(root) = root else {
+        return project_disabled();
+    };
+    let Some(relative) = parameter(query, "path") else {
+        return project_error(400, "path is required");
+    };
+    match resolve_project_path(root, &relative, false) {
+        Ok(path) if path.is_file() && !is_sensitive_project_path(Path::new(&relative)) => {
+            match std::fs::metadata(&path) {
+                Ok(meta) if meta.len() <= 1024 * 1024 => match std::fs::read_to_string(&path) {
+                    Ok(content) => response(
+                        200,
+                        "application/json; charset=utf-8",
+                        &serde_json::json!({"path": relative, "content": content}).to_string(),
+                    ),
+                    Err(_) => project_error(415, "file is not UTF-8 text"),
+                },
+                Ok(_) => project_error(413, "file exceeds the 1 MiB read limit"),
+                Err(error) => project_error(400, &error.to_string()),
+            }
+        }
+        Ok(_) => project_error(400, "path is not a readable project file"),
+        Err(error) => project_error(400, &error.to_string()),
+    }
+}
+
+fn project_write(root: Option<&Path>, body: &str) -> Vec<u8> {
+    let Some(root) = root else {
+        return project_disabled();
+    };
+    let payload: serde_json::Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return project_error(400, "expected a JSON object"),
+    };
+    let Some(relative) = payload.get("path").and_then(serde_json::Value::as_str) else {
+        return project_error(400, "path is required");
+    };
+    let Some(content) = payload.get("content").and_then(serde_json::Value::as_str) else {
+        return project_error(400, "content is required");
+    };
+    if content.len() > 512 * 1024 {
+        return project_error(413, "file exceeds the 512 KiB write limit");
+    }
+    if is_sensitive_project_path(Path::new(relative)) {
+        return project_error(403, "writes to sensitive or hidden paths are blocked");
+    }
+    let path = match resolve_project_path(root, relative, true) {
+        Ok(path) => path,
+        Err(error) => return project_error(400, &error.to_string()),
+    };
+    if path.exists() && !path.is_file() {
+        return project_error(400, "target is not a regular file");
+    }
+    if let Some(parent) = path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            return project_error(500, &error.to_string());
+        }
+    }
+    if let Err(error) = atomic_write::replace(&path, content.as_bytes()) {
+        return project_error(500, &error.to_string());
+    }
+    response(
+        200,
+        "application/json; charset=utf-8",
+        &serde_json::json!({"written": true, "path": relative, "bytes": content.len()}).to_string(),
+    )
+}
+
+fn resolve_project_path(root: &Path, raw: &str, allow_missing: bool) -> Result<PathBuf> {
+    let relative = Path::new(raw);
+    anyhow::ensure!(!relative.is_absolute(), "absolute paths are not allowed");
+    anyhow::ensure!(
+        relative
+            .components()
+            .all(|part| matches!(part, Component::Normal(_))),
+        "path must contain only normal relative components"
+    );
+    anyhow::ensure!(!raw.is_empty(), "path cannot be empty");
+    ensure_no_project_symlinks(root, relative)?;
+    let candidate = root.join(relative);
+    let checked = if candidate.exists() {
+        candidate.canonicalize().context("resolving project path")?
+    } else if allow_missing {
+        let parent = candidate
+            .parent()
+            .context("target has no parent")?
+            .canonicalize()
+            .context("parent directory must already exist")?;
+        parent.join(candidate.file_name().context("target has no filename")?)
+    } else {
+        anyhow::bail!("project path does not exist")
+    };
+    anyhow::ensure!(
+        checked.starts_with(root),
+        "path escapes the granted project root"
+    );
+    Ok(checked)
+}
+
+fn ensure_no_project_symlinks(root: &Path, relative: &Path) -> Result<()> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => anyhow::ensure!(
+                !metadata.file_type().is_symlink(),
+                "symbolic links are not allowed in project paths"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn project_create_directory(root: Option<&Path>, body: &str) -> Vec<u8> {
+    let Some(root) = root else {
+        return project_disabled();
+    };
+    let payload: serde_json::Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return project_error(400, "expected a JSON object"),
+    };
+    let Some(relative) = payload.get("path").and_then(serde_json::Value::as_str) else {
+        return project_error(400, "path is required");
+    };
+    let rel = Path::new(relative);
+    if relative.trim().is_empty() { return project_error(400, "path is required"); }
+    if is_sensitive_project_path(rel) {
+        return project_error(403, "hidden or sensitive directory paths are blocked");
+    }
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return project_error(400, "path must contain only normal relative components");
+    }
+    let mut current = root.to_path_buf();
+    for component in rel.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return project_error(400, "directory path crosses a symlink or non-directory");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Err(error) = std::fs::create_dir(&current) {
+                    return project_error(500, &error.to_string());
+                }
+            }
+            Err(error) => return project_error(500, &error.to_string()),
+        }
+    }
+    response(
+        200,
+        "application/json; charset=utf-8",
+        &serde_json::json!({"created": true, "path": relative}).to_string(),
+    )
+}
+
+fn is_sensitive_project_path(path: &Path) -> bool {
+    path.components().any(|part| match part {
+        Component::Normal(name) => {
+            let name = name.to_string_lossy().to_ascii_lowercase();
+            matches!(
+                name.as_str(),
+                ".git"
+                    | ".engram"
+                    | ".ssh"
+                    | ".aws"
+                    | ".codex"
+                    | ".secrets"
+                    | "node_modules"
+                    | "target"
+                    | "vendor"
+            ) || name == ".env"
+                || name.starts_with(".env.")
+        }
+        _ => true,
+    })
+}
+
+fn project_run_check(root: Option<&Path>, body: &str) -> Vec<u8> {
+    let Some(root) = root else {
+        return project_disabled();
+    };
+    let payload: serde_json::Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return project_error(400, "expected a JSON object"),
+    };
+    let Some(task) = payload.get("task").and_then(serde_json::Value::as_str) else {
+        return project_error(400, "task is required");
+    };
+    let (program, args, label): (&str, &[&str], &str) = match task {
+        "git_status" => ("git", &["status", "--short"], "git status --short"),
+        "git_diff_check" => ("git", &["diff", "--check"], "git diff --check"),
+        "cargo_check_cli_offline" => (
+            "cargo",
+            &["check", "--offline", "-p", "engram-cli"],
+            "cargo check --offline -p engram-cli",
+        ),
+        "cargo_test_cli_offline" => (
+            "cargo",
+            &["test", "--offline", "-p", "engram-cli"],
+            "cargo test --offline -p engram-cli",
+        ),
+        _ => {
+            return project_error(
+                400,
+                "unsupported task; only fixed local/offline checks are allowed",
+            )
+        }
+    };
+    let output = match std::process::Command::new(program)
+        .args(args)
+        .current_dir(root)
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => return project_error(500, &format!("could not run {label}: {error}")),
+    };
+    let success = output.status.success();
+    let exit_code = output.status.code();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!(
+        "{}{}",
+        stdout,
+        if stderr.is_empty() {
+            String::new()
+        } else {
+            format!("\n{stderr}")
+        }
+    );
+    let truncated = combined.len() > 64 * 1024;
+    let output = if truncated {
+        combined.chars().take(64 * 1024).collect::<String>()
+    } else {
+        combined
+    };
+    response(200, "application/json; charset=utf-8", &serde_json::json!({"task": label, "success": success, "exitCode": exit_code, "output": output, "truncated": truncated}).to_string())
+}
+
+fn project_disabled() -> Vec<u8> {
+    project_error(
+        403,
+        "project file tools are disabled; restart with --project-root <directory>",
+    )
+}
+fn project_error(status: u16, message: &str) -> Vec<u8> {
+    response(
+        status,
+        "application/json; charset=utf-8",
+        &serde_json::json!({"error": message}).to_string(),
+    )
+}
+
+fn read_request(stream: &mut TcpStream) -> Result<(String, String, String, bool)> {
     let mut header = Vec::new();
     let mut byte = [0u8; 1];
     while !header.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -137,9 +543,13 @@ fn read_request(stream: &mut TcpStream) -> Result<(String, String, String)> {
     let method = parts.next().context("missing HTTP method")?.to_string();
     let target = parts.next().context("missing HTTP target")?.to_string();
     let mut content_length = None;
+    let mut local_control = false;
     for line in lines.filter(|line| !line.is_empty()) {
         let (name, value) = line.split_once(':').context("malformed HTTP header")?;
         if name.eq_ignore_ascii_case("transfer-encoding") { anyhow::bail!("transfer encoding is unsupported") }
+        if name.eq_ignore_ascii_case("x-threadline-local-control") && value.trim() == "1" {
+            local_control = true;
+        }
         if name.eq_ignore_ascii_case("content-length") {
             if content_length.is_some() { anyhow::bail!("duplicate content-length") }
             content_length = Some(value.trim().parse::<usize>().context("invalid content-length")?);
@@ -149,7 +559,7 @@ fn read_request(stream: &mut TcpStream) -> Result<(String, String, String)> {
     if length > MAX_BODY_BYTES { anyhow::bail!("request body exceeds limit") }
     let mut body = vec![0u8; length];
     stream.read_exact(&mut body).context("reading complete request body")?;
-    Ok((method, target, String::from_utf8(body).context("request body is not UTF-8")?))
+    Ok((method, target, String::from_utf8(body).context("request body is not UTF-8")?, local_control))
 }
 
 fn render_index(vault: &Path, query: &str) -> Result<Vec<u8>> {
@@ -390,7 +800,12 @@ fn response_bytes(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
+        413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
+        501 => "Not Implemented",
+        503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
     let header = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
@@ -409,6 +824,7 @@ fn threadline_asset(path: &str) -> Option<(&'static str, &'static str)> {
         "/threadline/src/core/store.js" => ("text/javascript; charset=utf-8", include_str!("../web/src/core/store.js")),
         "/threadline/src/core/memory-manager.js" => ("text/javascript; charset=utf-8", include_str!("../web/src/core/memory-manager.js")),
         "/threadline/src/core/context-packer.js" => ("text/javascript; charset=utf-8", include_str!("../web/src/core/context-packer.js")),
+        "/threadline/src/core/evaluation-bench.js" => ("text/javascript; charset=utf-8", include_str!("../web/src/core/evaluation-bench.js")),
         "/threadline/src/core/app-actions.js" => ("text/javascript; charset=utf-8", include_str!("../web/src/core/app-actions.js")),
         "/threadline/src/core/tool-registry.js" => ("text/javascript; charset=utf-8", include_str!("../web/src/core/tool-registry.js")),
         "/threadline/src/core/permission-gate.js" => ("text/javascript; charset=utf-8", include_str!("../web/src/core/permission-gate.js")),
@@ -510,7 +926,7 @@ fn markdown_html(markdown: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_bind_host;
+    use super::{threadline_asset, validate_bind_host};
 
     #[test]
     fn accepts_loopback_bind_hosts() {
@@ -523,6 +939,25 @@ mod tests {
     fn rejects_non_loopback_and_ambiguous_hosts() {
         for host in ["0.0.0.0", "192.168.1.10", "10.0.0.2", "example.com", "::"] {
             assert!(validate_bind_host(host).is_err(), "{host}");
+        }
+    }
+
+    #[test]
+    fn serves_every_threadline_module_imported_by_app() {
+        for path in [
+            "/threadline/src/core/evaluation-bench.js",
+            "/threadline/src/core/store.js",
+            "/threadline/src/core/memory-manager.js",
+            "/threadline/src/core/context-packer.js",
+            "/threadline/src/core/app-actions.js",
+            "/threadline/src/core/privacy-policy.js",
+            "/threadline/src/providers/openai-compatible.js",
+            "/threadline/src/providers/engram-vault.js",
+        ] {
+            assert!(
+                threadline_asset(path).is_some(),
+                "missing module route: {path}"
+            );
         }
     }
 }
