@@ -22,10 +22,16 @@ fn replaces_with_a_complete_payload_and_leaves_no_temp_file() {
     fs::write(&path, "old").unwrap();
     replace(&path, br#"{"new":true}"#).unwrap();
     assert_eq!(fs::read_to_string(&path).unwrap(), r#"{"new":true}"#);
-    let names: Vec<_> = fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().file_name()).collect();
-    assert!(!names.iter().any(|name| {
-        name.to_string_lossy().contains(TEMP_MARKER)
-    }), "leftover entries: {names:?}");
+    let names: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(
+        !names
+            .iter()
+            .any(|name| { name.to_string_lossy().contains(TEMP_MARKER) }),
+        "leftover entries: {names:?}"
+    );
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -37,7 +43,11 @@ fn failed_replacement_preserves_existing_destination_and_cleans_temp() {
     replace(&destination, b"must not replace a directory").unwrap_err();
     assert!(destination.is_dir());
     assert!(!fs::read_dir(&dir).unwrap().any(|entry| {
-        entry.unwrap().file_name().to_string_lossy().contains(TEMP_MARKER)
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(TEMP_MARKER)
     }));
     let _ = fs::remove_dir_all(dir);
 }

@@ -34,8 +34,15 @@ fn create_temp(parent: &Path, destination: &Path) -> Result<PathBuf> {
         .context("metadata destination has no filename")?;
     for _ in 0..128 {
         let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-        let candidate = parent.join(format!(".{name}{TEMP_MARKER}{}-{sequence}", std::process::id()));
-        match OpenOptions::new().write(true).create_new(true).open(&candidate) {
+        let candidate = parent.join(format!(
+            ".{name}{TEMP_MARKER}{}-{sequence}",
+            std::process::id()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
             Ok(file) => {
                 if let Err(error) = preserve_permissions(destination, &file) {
                     let _ = fs::remove_file(&candidate);
@@ -62,24 +69,40 @@ fn write_and_replace(temp: &Path, destination: &Path, payload: &[u8]) -> Result<
 
 #[cfg(unix)]
 fn replace_existing(temp: &Path, destination: &Path) -> Result<()> {
-    fs::rename(temp, destination).with_context(|| format!("replacing {}", destination.display()))?;
+    fs::rename(temp, destination)
+        .with_context(|| format!("replacing {}", destination.display()))?;
     Ok(())
 }
 
 #[cfg(windows)]
 fn replace_existing(temp: &Path, destination: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
     let source: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
-    let target: Vec<u16> = destination.as_os_str().encode_wide().chain(Some(0)).collect();
-    let ok = unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) };
-    if ok == 0 { return Err(io::Error::last_os_error().into()); }
+    let target: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let ok = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            target.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error().into());
+    }
     Ok(())
 }
 
 #[cfg(not(any(unix, windows)))]
 fn replace_existing(temp: &Path, destination: &Path) -> Result<()> {
-    fs::rename(temp, destination).with_context(|| format!("replacing {}", destination.display()))?;
+    fs::rename(temp, destination)
+        .with_context(|| format!("replacing {}", destination.display()))?;
     Ok(())
 }
 

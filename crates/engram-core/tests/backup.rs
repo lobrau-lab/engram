@@ -19,7 +19,10 @@ fn encrypted_backup_round_trip_and_wrong_password_fails() {
     assert_eq!(manifest.files, 1);
     assert!(backup::restore(&archive, &restored, "wrong horse").is_err());
     backup::restore(&archive, &restored, "correct horse").unwrap();
-    assert_eq!(fs::read_to_string(restored.join("note.md")).unwrap(), "# secret\n");
+    assert_eq!(
+        fs::read_to_string(restored.join("note.md")).unwrap(),
+        "# secret\n"
+    );
     let _ = fs::remove_dir_all(source);
     let _ = fs::remove_dir_all(restored);
 }
@@ -35,7 +38,10 @@ fn restore_refuses_existing_destination_and_truncated_headers() {
     fs::create_dir_all(&destination).unwrap();
     fs::write(destination.join("keep.md"), "keep").unwrap();
     assert!(backup::restore(&archive, &destination, "password").is_err());
-    assert_eq!(fs::read_to_string(destination.join("keep.md")).unwrap(), "keep");
+    assert_eq!(
+        fs::read_to_string(destination.join("keep.md")).unwrap(),
+        "keep"
+    );
     let truncated = source.with_extension("truncated.engram");
     fs::write(&truncated, b"ENGRAM-BACKUP-1\n\x01").unwrap();
     let fresh = source.with_extension("fresh");

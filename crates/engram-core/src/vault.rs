@@ -88,13 +88,15 @@ impl Vault {
         let relative = validate_relative_path(Path::new(id))?;
         let root = self.root.canonicalize()?;
         let path = root.join(relative).canonicalize()?;
-        if !path.starts_with(&root) { anyhow::bail!("note path escapes vault") }
+        if !path.starts_with(&root) {
+            anyhow::bail!("note path escapes vault")
+        }
         Ok(path)
     }
 
     fn load_note(&self, path: &Path) -> Result<Note> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let content =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let id = rel_id(&self.root, path);
         let (fm, body) = split_frontmatter(&content);
         let fm = fm.unwrap_or("");

@@ -13,7 +13,11 @@ use engram_core::{
 mod serve;
 
 #[derive(Parser, Debug)]
-#[command(name = "engram", version, about = "Local-first, AI-native second brain")]
+#[command(
+    name = "engram",
+    version,
+    about = "Local-first, AI-native second brain"
+)]
 struct Cli {
     /// Vault root (Markdown source of truth).
     #[arg(long, global = true, default_value = ".")]
@@ -100,8 +104,16 @@ fn main() -> Result<()> {
         Cmd::Ask { question } => cmd_ask(&vault, &config_path, &question),
         Cmd::Export { dest, dry_run } => cmd_export(&vault, &config_path, &dest, dry_run),
         Cmd::Import { src, dry_run } => cmd_import(&vault, &config_path, &src, dry_run),
-        Cmd::Serve { host, port, project_root } => serve::run(&vault, project_root.as_deref(), &host, port),
-        Cmd::Open { host, port, project_root } => serve::open(&vault, project_root.as_deref(), &host, port),
+        Cmd::Serve {
+            host,
+            port,
+            project_root,
+        } => serve::run(&vault, project_root.as_deref(), &host, port),
+        Cmd::Open {
+            host,
+            port,
+            project_root,
+        } => serve::open(&vault, project_root.as_deref(), &host, port),
         Cmd::Backup { dest } => cmd_backup(&vault, &dest),
         Cmd::Restore { src } => cmd_restore(&vault, &src),
         Cmd::ImportFiles { src } => cmd_import_files(&vault, &config_path, &src),
@@ -115,32 +127,59 @@ fn backup_password() -> Result<String> {
 
 fn cmd_backup(vault: &Path, dest: &Path) -> Result<()> {
     let manifest = engram_core::backup::create(vault, dest, &backup_password()?)?;
-    println!("encrypted backup: {} Markdown files -> {}", manifest.files, dest.display());
+    println!(
+        "encrypted backup: {} Markdown files -> {}",
+        manifest.files,
+        dest.display()
+    );
     Ok(())
 }
 
 fn cmd_restore(vault: &Path, src: &Path) -> Result<()> {
     let manifest = engram_core::backup::restore(src, vault, &backup_password()?)?;
-    println!("restored {} Markdown files into {}", manifest.files, vault.display());
+    println!(
+        "restored {} Markdown files into {}",
+        manifest.files,
+        vault.display()
+    );
     Ok(())
 }
 
 fn cmd_import_files(vault: &Path, config_path: &Path, source: &Path) -> Result<()> {
-    let root = source.canonicalize().with_context(|| format!("reading import root {}", source.display()))?;
+    let root = source
+        .canonicalize()
+        .with_context(|| format!("reading import root {}", source.display()))?;
     let destination = vault.join("Imported");
     std::fs::create_dir_all(&destination)?;
     let mut copied = 0usize;
-    for entry in walkdir::WalkDir::new(&root).into_iter().filter_map(|entry| entry.ok()) {
-        if !entry.file_type().is_file() { continue; }
-        if !matches!(entry.path().extension().and_then(|x| x.to_str()), Some("md") | Some("markdown") | Some("txt")) { continue; }
+    for entry in walkdir::WalkDir::new(&root)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if !matches!(
+            entry.path().extension().and_then(|x| x.to_str()),
+            Some("md") | Some("markdown") | Some("txt")
+        ) {
+            continue;
+        }
         let target = destination.join(entry.path().strip_prefix(&root)?);
-        if let Some(parent) = target.parent() { std::fs::create_dir_all(parent)?; }
-        if target.exists() { anyhow::bail!("import destination already exists: {}", target.display()); }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if target.exists() {
+            anyhow::bail!("import destination already exists: {}", target.display());
+        }
         std::fs::copy(entry.path(), &target)?;
         copied += 1;
     }
     cmd_index(vault, config_path)?;
-    println!("imported {copied} local text files into {}", destination.display());
+    println!(
+        "imported {copied} local text files into {}",
+        destination.display()
+    );
     Ok(())
 }
 
@@ -292,7 +331,10 @@ fn cmd_export(vault: &Path, config_path: &Path, dest: &Path, dry_run: bool) -> R
     let sync = FolderSync::new(cfg.device_id, dry_run);
     let stats = sync.export(vault, dest)?;
     let tag = if dry_run { "[dry-run] " } else { "" };
-    println!("{tag}export: {} copied, {} skipped", stats.copied, stats.skipped);
+    println!(
+        "{tag}export: {} copied, {} skipped",
+        stats.copied, stats.skipped
+    );
     Ok(())
 }
 

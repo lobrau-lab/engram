@@ -71,9 +71,8 @@ pub trait LlmClient {
 /// sidecars expose HTTP APIs. Internet and arbitrary-network destinations are
 /// rejected before ureq is constructed or invoked.
 pub fn validate_local_endpoint(base: &str) -> Result<Url> {
-    let url = Url::parse(base).map_err(|_| {
-        anyhow!("inference endpoint must be a valid plain HTTP loopback URL")
-    })?;
+    let url = Url::parse(base)
+        .map_err(|_| anyhow!("inference endpoint must be a valid plain HTTP loopback URL"))?;
     if url.scheme() != "http" || !url.username().is_empty() || url.password().is_some() {
         anyhow::bail!("inference endpoint must use plain HTTP without userinfo")
     }
@@ -116,7 +115,10 @@ impl LlmClient for OpenAiCompat {
 
     fn complete(&self, prompt: &str, opts: &ChatOpts) -> Result<String> {
         let endpoint = validate_local_endpoint(&self.base)?;
-        let url = format!("{}/chat/completions", endpoint.as_str().trim_end_matches('/'));
+        let url = format!(
+            "{}/chat/completions",
+            endpoint.as_str().trim_end_matches('/')
+        );
         let model = if self.model.trim().is_empty() {
             self.discover_model()?
         } else {
@@ -172,7 +174,11 @@ impl OpenAiCompat {
 
 /// Build a grounded prompt from retrieved notes. Has an explicit empty-hits
 /// guard and a divide-by-zero-safe per-note budget.
-pub fn build_context_prompt(question: &str, notes: &[(String, String)], max_chars: usize) -> String {
+pub fn build_context_prompt(
+    question: &str,
+    notes: &[(String, String)],
+    max_chars: usize,
+) -> String {
     if notes.is_empty() {
         return format!(
             "You are Engram, a local-first notes assistant. No notes in the vault matched \
