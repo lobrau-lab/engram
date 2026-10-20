@@ -47,7 +47,7 @@ enum Cmd {
     },
     /// Lexical similarity via hash embeddings (brute-force cosine).
     Lexical { query: String },
-    /// Ask the local LLM a question, grounded in the vault.
+    /// Ask the configured model a question, grounded in the vault.
     Ask { question: String },
     /// Export the vault to a sync folder.
     Export {
@@ -215,7 +215,8 @@ fn cmd_init(vault: &Path, config_path: &Path) -> Result<()> {
              Try: `engram index` then `engram search welcome`.\n\n\
              ## How it works\n\n\
              Markdown files are the source of truth. A SQLite FTS5 index powers full-text \
-             search, and a local LLM sidecar can answer questions grounded in these notes.\n",
+             search. Threadline can answer questions grounded in these notes with the built-in \
+             on-device model on macOS 26+, or a local OpenAI-compatible endpoint you configure.\n",
         )
         .with_context(|| format!("writing {}", welcome.display()))?;
         println!("created {}", welcome.display());

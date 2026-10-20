@@ -157,6 +157,9 @@ of Engram still builds and reports takeover as unavailable.
 cargo check --workspace --all-targets
 cargo build --workspace --release
 
+# Initialize a fresh vault (config + Welcome.md)
+./target/release/engram --vault /path/to/vault init
+
 # Open the local browser workspace
 ./target/release/engram --vault /path/to/vault serve
 
@@ -171,6 +174,10 @@ export ENGRAM_BACKUP_PASSWORD='use a strong password'
 # Import local Markdown/text files into the vault
 ./target/release/engram --vault /path/to/vault import-files /path/to/files
 ```
+
+`serve` and `open` do not initialize an empty vault. Run `init` once first;
+without it Threadline chat still works, but the vault has no config, starter
+note, or search index.
 
 ## Smoke test
 
