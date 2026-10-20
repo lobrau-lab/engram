@@ -83,6 +83,19 @@ asks for confirmation each time. A replaced binary fails closed until it is
 inspected again. This is the safe foundation for teaching Threadline new
 applications; broader GUI takeover is intentionally not enabled.
 
+### Workshop
+
+**Workshop** drafts changes to Threadline's own source without applying them.
+Start the server with `--project-root .`, name up to three source files, and
+describe a goal. The built-in model writes a proposal (intent, files, suggested
+diff, tests, risks) into `.engram/workshop/`. Hidden and sensitive paths are
+refused, the selected files are bounded, and the model cannot run commands or
+apply a patch. A human reviews the proposal and makes the change through the
+normal repository tests.
+
+This is the first, deliberately narrow slice of self-improvement. Sandboxed
+test execution and an approved apply step are not enabled yet.
+
 ## Layout
 
 ```text

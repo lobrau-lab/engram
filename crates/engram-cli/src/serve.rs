@@ -233,6 +233,8 @@ fn dispatch(vault: &Path, project_root: Option<&Path>, request: &Request) -> Res
         ("GET", "/api/v1/apps") => list_apps(vault),
         ("POST", "/api/v1/apps/inspect") => inspect_app(vault, body),
         ("POST", "/api/v1/apps/run") => run_app(vault, body),
+        ("GET", "/api/v1/workshop") => list_workshop(vault),
+        ("POST", "/api/v1/workshop/propose") => workshop_propose(project_root, vault, body),
         ("GET", "/v1/models") => embedded_models(),
         ("POST", "/v1/chat/completions") => chat_completions(body),
         ("GET", "/api/v1/inference/omlx") => omlx_status(),
@@ -447,6 +449,209 @@ fn run_app(vault: &Path, body: &str) -> Vec<u8> {
             &serde_json::to_string(&result).unwrap_or_else(|_| "{}".into()),
         ),
         Err(error) => inference_error(400, &error.to_string()),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct WorkshopRequest {
+    goal: String,
+    #[serde(default)]
+    files: Vec<String>,
+}
+
+fn list_workshop(vault: &Path) -> Vec<u8> {
+    let dir = vault.join(".engram").join("workshop");
+    let mut proposals = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|part| part.to_str()) != Some("md") {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let created = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs())
+                .unwrap_or_default();
+            let title = content
+                .lines()
+                .find_map(|line| line.strip_prefix("# Workshop proposal:"))
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .unwrap_or("Workshop proposal");
+            proposals.push((
+                created,
+                serde_json::json!({
+                    "id": path.file_stem().and_then(|part| part.to_str()).unwrap_or("proposal"),
+                    "title": title,
+                    "created": created,
+                    "content": content,
+                }),
+            ));
+        }
+    }
+    proposals.sort_by_key(|left| std::cmp::Reverse(left.0));
+    let proposals = proposals
+        .into_iter()
+        .take(12)
+        .map(|(_, proposal)| proposal)
+        .collect::<Vec<_>>();
+    response(
+        200,
+        "application/json; charset=utf-8",
+        &serde_json::json!({ "proposals": proposals }).to_string(),
+    )
+}
+
+fn workshop_propose(project_root: Option<&Path>, vault: &Path, body: &str) -> Vec<u8> {
+    let Some(root) = project_root else {
+        return project_error(
+            403,
+            "the workshop is disabled; restart with --project-root <directory> to grant source access",
+        );
+    };
+    let request: WorkshopRequest = match serde_json::from_str(body) {
+        Ok(request) => request,
+        Err(error) => return inference_error(400, &format!("invalid workshop request: {error}")),
+    };
+    let goal = request.goal.trim();
+    if goal.is_empty() || goal.len() > 4000 {
+        return inference_error(400, "provide a goal between 1 and 4000 bytes");
+    }
+    if request.files.is_empty() || request.files.len() > 3 {
+        return inference_error(400, "choose between 1 and 3 source files");
+    }
+
+    let root = match root.canonicalize() {
+        Ok(root) => root,
+        Err(error) => return inference_error(500, &error.to_string()),
+    };
+    let mut excerpts = String::new();
+    let mut included = Vec::new();
+    for relative in &request.files {
+        if relative.len() > 500 {
+            return inference_error(400, "a source file path is too long");
+        }
+        if is_sensitive_project_path(Path::new(relative)) {
+            return inference_error(
+                403,
+                "sensitive or hidden project paths are not available to the workshop",
+            );
+        }
+        let path = match resolve_project_path(&root, relative, false) {
+            Ok(path) => path,
+            Err(error) => return inference_error(400, &error.to_string()),
+        };
+        if !path.is_file() {
+            return inference_error(400, "workshop paths must be regular files");
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(_) => return inference_error(415, "workshop files must be UTF-8 text"),
+        };
+        let excerpt = truncate_text(&content, 8000);
+        excerpts.push_str(&format!(
+            "\n--- FILE: {} ---\n{}\n",
+            relative.trim(),
+            excerpt
+        ));
+        included.push(relative.trim().to_string());
+        if excerpts.len() > 24000 {
+            return inference_error(
+                400,
+                "the selected source files exceed the workshop context budget",
+            );
+        }
+    }
+
+    let system = "You are the Threadline Workshop, a careful senior engineer. Propose the smallest reviewable change to Engram's own source code. Never claim a change was applied, tested, or merged. Never propose disabling tests, consent, Host/Origin checks, hidden-path checks, hash verification, or any other security control. Do not use tools or run commands. Output exactly these sections: 1) Intent, 2) Files, 3) Unified diff, 4) Tests, 5) Risks.";
+    let prompt = format!(
+        "GOAL:\n{goal}\n\nSOURCE EXCERPTS:{excerpts}\n\nReturn a proposal only. The human will review, apply, and test it."
+    );
+    let proposal = match engram_core::embedded::complete(
+        &[
+            ChatMessage {
+                role: "system".into(),
+                content: system.into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: prompt,
+            },
+        ],
+        Some(1600),
+    ) {
+        Ok(proposal) => proposal,
+        Err(error) => return inference_error(503, &error.to_string()),
+    };
+
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let id = format!("{created}-{}", workshop_slug(goal));
+    let path = vault
+        .join(".engram")
+        .join("workshop")
+        .join(format!("{id}.md"));
+    let document = format!(
+        "# Workshop proposal: {goal}\n\n- Created: {created}\n- Files: {}\n- Status: proposed, not applied\n\n{proposal}\n",
+        included.join(", ")
+    );
+    if let Err(error) = atomic_write::replace(&path, document.as_bytes()) {
+        return inference_error(500, &error.to_string());
+    }
+    response(
+        200,
+        "application/json; charset=utf-8",
+        &serde_json::json!({
+            "id": id,
+            "title": goal,
+            "files": included,
+            "proposal": document,
+            "path": path.to_string_lossy(),
+            "status": "proposed",
+        })
+        .to_string(),
+    )
+}
+
+fn truncate_text(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        return value.to_string();
+    }
+    let mut end = limit;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &value[..end])
+}
+
+fn workshop_slug(value: &str) -> String {
+    let mut slug = String::new();
+    let mut previous_dash = false;
+    for character in value.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character);
+            previous_dash = false;
+        } else if !previous_dash && !slug.is_empty() {
+            slug.push('-');
+            previous_dash = true;
+        }
+        if slug.len() >= 40 {
+            break;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "proposal".into()
+    } else {
+        slug.to_string()
     }
 }
 

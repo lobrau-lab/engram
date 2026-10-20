@@ -9,7 +9,7 @@ import { runMemoryBench } from './core/evaluation-bench.js';
 
 const $ = selector => document.querySelector(selector);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
-let currentView = 'chat'; let inspectorTab = 'assembly'; let sending = false; let aborter = null; let embeddedModel = null; let appDigests = []; let appResult = ''; let appsLoaded = false;
+let currentView = 'chat'; let inspectorTab = 'assembly'; let sending = false; let aborter = null; let embeddedModel = null; let appDigests = []; let appResult = ''; let appsLoaded = false; let workshopProposals = []; let workshopResult = ''; let workshopLoaded = false;
 
 const accentOptions = {
   green: { label: 'Green', color: '#c8f169', image: 'engram-mark-green.png' },
@@ -97,7 +97,7 @@ function switchView(view) {
   document.querySelectorAll('.nav-item').forEach(item => item.classList.toggle('active', item.dataset.view === view));
   $('#chat-view').classList.toggle('hidden', view !== 'chat');
   $('#workspace-view').classList.toggle('hidden', view === 'chat');
-  const labels = { chat: current().title, memory: 'Memory ledger', bench: 'Memory bench', rules: 'Decision rules', apps: 'Application digests', settings: 'Connections & settings' };
+  const labels = { chat: current().title, memory: 'Memory ledger', bench: 'Memory bench', rules: 'Decision rules', apps: 'Application digests', workshop: 'Workshop', settings: 'Connections & settings' };
   $('#top-title').textContent = labels[view]; if (view !== 'chat') renderWorkspaceView();
 }
 
@@ -110,6 +110,8 @@ function renderWorkspaceView() {
     host.innerHTML = `<div class="page-heading"><div class="eyebrow">CONVERSATION STATE</div><h1>Memory ledger</h1><p>A compact set of variables that points back to the original conversation. Nothing here replaces the transcript.</p></div><div class="ledger-grid">${[['Current goal', memory.currentGoal, '01'], ['Active topics', memory.activeTopics, '02'], ['Decisions', memory.decisions, '03'], ['Constraints', memory.constraints, '04'], ['Preferences', memory.preferences, '05'], ['Open questions', memory.openQuestions, '06']].map(([title, items, num]) => `<section class="ledger-card"><div class="ledger-head"><span>${num}</span><h2>${title}</h2><small>${items.length} variables</small></div>${items.length ? items.map(item => `<div class="ledger-item"><p>${esc(item.text)}</p><div><span class="direct-label">DIRECTLY DERIVED</span><span>Source ${item.sourceTurnIds?.map(id => id.slice(0, 8)).join(', ')}</span></div></div>`).join('') : '<div class="ledger-empty">New user messages can add a source-linked variable here.</div>'}</section>`).join('')}</div><div class="transcript-strip"><div><span class="eyebrow">SOURCE OF RECORD</span><h2>Conversation transcript</h2><p>${current().turns.length} immutable turns in this conversation.</p></div><button class="secondary-button" id="back-to-chat">Return to chat ↗</button></div>`;
   } else if (currentView === 'apps') {
     renderAppsView(host);
+  } else if (currentView === 'workshop') {
+    renderWorkshopView(host);
   } else if (currentView === 'rules') {
     host.innerHTML = `<div class="page-heading"><div class="eyebrow">POLICY ENGINE</div><h1>Decision rules</h1><p>The “growing if statement” is an inspectable set of small policies. Each module can be swapped without rewriting the chat flow.</p></div><div class="rule-catalog">${[['01','Memory gate','IF memory is disabled, skip extraction and retrieval.','Memory policy'],['02','Evidence gate','IF a response recalls the conversation, retrieve and attach source turns.','Evidence policy'],['03','Correction handling','IF a correction is explicit, supersede the derived assertion and retain both source turns.','Conflict policy'],['04','Ambiguity handling','IF incompatible statements lack a clear correction, preserve both and surface uncertainty.','Conflict policy'],['05','Budget gate','IF candidate context exceeds the usable budget, rank and omit optional items first.','Packing policy'],['06','Provider fallback','IF the endpoint fails, preserve the draft and show a retryable connection error.','Provider policy']].map(([n,title,rule,module]) => `<article class="rule-card"><span class="rule-index">${n}</span><div><span class="module-label">${module}</span><h2>${title}</h2><p>${rule}</p></div><span class="rule-enabled">ENABLED <i></i></span></article>`).join('')}</div><div class="rule-note"><span>i</span><p>These starter rules are deterministic and transparent. Language extraction is a lightweight heuristic in this prototype; it is not a truth detector.</p></div>`;
   } else {
@@ -207,6 +209,53 @@ async function runApplicationForTool(id, action) {
   const data = await response.json();
   if (!response.ok) throw new Error(data.error?.message || 'The application could not run.');
   return data;
+}
+
+function renderWorkshopView(host) {
+  const proposals = workshopProposals.length ? workshopProposals.map(proposal => {
+    const when = proposal.created ? new Date(proposal.created * 1000).toLocaleString() : 'unknown time';
+    return `<section class="ledger-card"><div class="ledger-head"><span>✦</span><h2>${esc(proposal.title)}</h2><small>${esc(when)}</small></div><details><summary>Read the proposal</summary><pre class="app-result">${esc(proposal.content)}</pre></details></section>`;
+  }).join('') : '<section class="ledger-card"><div class="ledger-empty">No workshop proposals yet. Draft one to see a reviewable plan for changing Threadline itself.</div></section>';
+
+  host.innerHTML = `<div class="page-heading"><div class="eyebrow">GATED SELF-IMPROVEMENT</div><h1>Workshop</h1><p>Draft a change to Threadline’s own source. The built-in model proposes; nothing is applied or executed. A human reviews the diff, runs the tests, and decides.</p></div><form id="workshop-form" class="settings-card wide-card"><div class="settings-card-heading"><span class="settings-icon warm">✦</span><div><h2>Draft a proposal</h2><p>Choose up to three source files for context</p></div><span class="module-label">REVIEW REQUIRED</span></div><label class="field-label" for="workshop-goal">Goal</label><textarea id="workshop-goal" rows="3" required placeholder="Add a compact capability card to the Applications view…"></textarea><label class="field-label" for="workshop-files">Source files (relative to the project root, comma-separated)</label><input id="workshop-files" value="crates/engram-core/src/capability.rs" autocomplete="off" required /><div class="settings-actions"><button class="primary-button" type="submit">Draft proposal</button><span id="workshop-feedback" role="status">Proposals are never applied automatically.</span></div><p class="local-service-note">The workshop needs the server started with <code>--project-root .</code>. It reads only the files you name, refuses hidden or sensitive paths, and stores the proposal under <code>.engram/workshop/</code>. It does not weaken tests or consent checks.</p></form><div class="ledger-grid">${proposals}</div>${workshopResult ? `<pre class="app-result" aria-live="polite">${esc(workshopResult)}</pre>` : ''}`;
+
+  $('#workshop-form').addEventListener('submit', event => {
+    event.preventDefault();
+    draftWorkshopProposal($('#workshop-goal').value.trim(), $('#workshop-files').value);
+  });
+  if (!workshopLoaded) { workshopLoaded = true; loadWorkshop(); }
+}
+
+async function loadWorkshop() {
+  try {
+    const response = await fetch('/api/v1/workshop');
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error?.message || 'Could not load workshop proposals.');
+    workshopProposals = data.proposals || [];
+    renderWorkspaceView();
+  } catch (error) {
+    workshopLoaded = false;
+    workshopResult = `Could not load workshop proposals: ${error.message}`;
+    renderWorkspaceView();
+  }
+}
+
+async function draftWorkshopProposal(goal, filesInput) {
+  const files = filesInput.split(',').map(item => item.trim()).filter(Boolean);
+  if (!goal || !files.length) return;
+  workshopResult = `Drafting a proposal for “${goal}”…\nThis runs the built-in model over the selected source files. Nothing is applied.`;
+  renderWorkspaceView();
+  try {
+    const response = await fetch('/api/v1/workshop/propose', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ goal, files }) });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error?.message || 'The workshop could not draft a proposal.');
+    workshopResult = data.proposal;
+    await loadWorkshop();
+    toast('Workshop proposal saved for review. Nothing was applied.');
+  } catch (error) {
+    workshopResult = `Workshop failed: ${error.message}`;
+    renderWorkspaceView();
+  }
 }
 
 function renderAppsView(host) {

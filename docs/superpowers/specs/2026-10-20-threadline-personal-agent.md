@@ -113,24 +113,28 @@ its interface, not relicensing its implementation.
 - Export and delete are first-class operations. The vault is always readable as
   plain Markdown, so the user is never locked in.
 
-### Self-improvement workshop (planned)
+### Self-improvement workshop (first slice implemented)
 
 The workshop is a gated loop, not autonomous self-modification:
 
-1. Threadline reads an explicit, bounded snapshot of its own source.
-2. It proposes a patch or a new adapter in `.engram/workshop/<id>/`; the live
-   tree is untouched.
+1. Threadline reads an explicit, bounded snapshot of its own source. This is
+   implemented: the Workshop view accepts at most three named files, rejects
+   hidden/sensitive paths, and enforces a context budget.
+2. It proposes a patch or a new adapter in `.engram/workshop/<id>.md`; the live
+   tree is untouched. This is implemented.
 3. A sandboxed worker runs formatting, `cargo check`, and the relevant tests
-   against a copy.
-4. Threadline shows the diff, test evidence, and risks.
+   against a copy. Not implemented yet.
+4. Threadline shows the diff, test evidence, and risks. The proposal already
+   includes intent, files, a suggested diff, tests, and risks.
 5. The human approves; only then is the patch applied, and the old state remains
-   recoverable.
+   recoverable. Not implemented yet; proposals are review-only.
 6. The app never applies a patch that weakens a security test, disables a
    permission check, or changes its own approval policy without an explicit,
    separate confirmation.
 
-Until the workshop exists, code changes go through the normal project tools and
-the repository's tests.
+Until the sandbox and apply steps exist, code changes go through the normal
+project tools and the repository's tests. The workshop model cannot invoke
+tools, run commands, or write to the live tree.
 
 ## Tauri Migration
 
@@ -156,6 +160,7 @@ Tauri window:
       covered by tests.
 - [x] JavaScript and Rust tests run in CI.
 - [ ] Tauri window and native keychain.
-- [ ] Workshop with isolated test execution and diff approval.
+- [x] Workshop proposal path with bounded source access (review-only).
+- [ ] Workshop sandbox tests and approved apply.
 - [ ] Durable audit log and one-click export/delete review screen.
 - [ ] Accessibility pass on the Threadline shell.
