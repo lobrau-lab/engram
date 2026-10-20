@@ -383,6 +383,7 @@ async function loadTakeover(render = true) {
 
 async function armTakeover(minutes) {
   if (takeoverBusy) return;
+  takeoverRequest += 1;
   takeoverBusy = true;
   takeoverResult = `Arming a ${minutes}-minute takeover session…`;
   renderTakeoverView($('#workspace-view'));
@@ -404,6 +405,7 @@ async function armTakeover(minutes) {
 }
 
 async function stopTakeover(quiet = false) {
+  takeoverRequest += 1;
   clearTakeoverSession();
   try {
     await fetch('/api/v1/takeover/disarm', { method: 'POST', headers: takeoverHeaders(), body: '{}' });
@@ -792,4 +794,9 @@ applyAccent(getWorkspace().settings.accent || 'green');
 if (!getWorkspace().conversations.length) createConversation();
 renderAll();
 configureEmbeddedDefault();
-loadTakeover(false);
+// Keep first paint and embedded-model discovery off the takeover probe's path.
+// The bounded idle callback still surfaces an armed-session Stop pill within ~1s.
+const scheduleTakeoverProbe = window.requestIdleCallback
+  ? callback => window.requestIdleCallback(callback, { timeout: 1000 })
+  : callback => setTimeout(callback, 500);
+scheduleTakeoverProbe(() => loadTakeover(false));

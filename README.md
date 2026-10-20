@@ -175,9 +175,10 @@ export ENGRAM_BACKUP_PASSWORD='use a strong password'
 ./target/release/engram --vault /path/to/vault import-files /path/to/files
 ```
 
-`serve` and `open` do not initialize an empty vault. Run `init` once first;
-without it Threadline chat still works, but the vault has no config, starter
-note, or search index.
+`open` initializes an empty vault automatically (config + `Welcome.md`).
+`serve` does not. If the vault already contains notes but has no config, run
+`init` once first; otherwise Threadline chat still works, but the vault has no
+search index.
 
 ## Smoke test
 

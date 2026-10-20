@@ -114,7 +114,10 @@ fn main() -> Result<()> {
             host,
             port,
             project_root,
-        } => serve::open(&vault, project_root.as_deref(), &host, port),
+        } => {
+            ensure_open_vault(&vault, &config_path)?;
+            serve::open(&vault, project_root.as_deref(), &host, port)
+        }
         Cmd::Backup { dest } => cmd_backup(&vault, &dest),
         Cmd::Restore { src } => cmd_restore(&vault, &src),
         Cmd::ImportFiles { src } => cmd_import_files(&vault, &config_path, &src),
@@ -192,6 +195,40 @@ fn load_config(vault: &Path, config_path: &Path) -> Result<Config> {
         // work before `init` without minting a stored identity.
         Ok(Config::new(vault.to_path_buf()))
     }
+}
+
+fn ensure_open_vault(vault: &Path, config_path: &Path) -> Result<()> {
+    if config_path.exists() {
+        return Ok(());
+    }
+
+    if vault_has_visible_content(vault) {
+        eprintln!(
+            "warning: {} is not initialized; Threadline chat will work, but run `engram --vault {} init` to add config, a starter note, and indexing",
+            vault.display(),
+            vault.display()
+        );
+        return Ok(());
+    }
+
+    // `open` is the first-run path for a new vault. Initialization is best-effort:
+    // a read-only or otherwise unavailable vault can still serve the chat UI.
+    if let Err(error) = cmd_init(vault, config_path) {
+        eprintln!(
+            "warning: could not initialize {}: {error:#}; continuing without a config",
+            vault.display()
+        );
+    }
+    Ok(())
+}
+
+fn vault_has_visible_content(vault: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(vault) else {
+        return true;
+    };
+    entries
+        .filter_map(Result::ok)
+        .any(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
 }
 
 fn cmd_init(vault: &Path, config_path: &Path) -> Result<()> {
@@ -379,4 +416,74 @@ fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn test_vault(label: &str) -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "engram-open-{label}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test vault");
+        dir
+    }
+
+    fn config_path(vault: &Path) -> PathBuf {
+        vault.join(".engram").join("config.toml")
+    }
+
+    #[test]
+    fn open_initializes_an_empty_vault() {
+        let vault = test_vault("empty");
+        let config = config_path(&vault);
+        ensure_open_vault(&vault, &config).expect("initialize empty vault");
+        assert!(config.exists());
+        assert!(vault.join("Welcome.md").exists());
+        let _ = std::fs::remove_dir_all(vault);
+    }
+
+    #[test]
+    fn open_ignores_hidden_files_when_deciding_whether_a_vault_is_empty() {
+        let vault = test_vault("hidden");
+        std::fs::write(vault.join(".DS_Store"), b"finder metadata").unwrap();
+        let config = config_path(&vault);
+        ensure_open_vault(&vault, &config).expect("initialize vault with hidden metadata");
+        assert!(config.exists());
+        assert!(vault.join("Welcome.md").exists());
+        let _ = std::fs::remove_dir_all(vault);
+    }
+
+    #[test]
+    fn open_does_not_inject_a_starter_note_into_an_existing_vault() {
+        let vault = test_vault("existing");
+        std::fs::write(vault.join("note.md"), "# Existing note\n").unwrap();
+        let config = config_path(&vault);
+        ensure_open_vault(&vault, &config).expect("leave existing vault explicit");
+        assert!(!config.exists());
+        assert!(!vault.join("Welcome.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(vault.join("note.md")).unwrap(),
+            "# Existing note\n"
+        );
+        let _ = std::fs::remove_dir_all(vault);
+    }
+
+    #[test]
+    fn open_does_not_overwrite_an_existing_config() {
+        let vault = test_vault("configured");
+        let config = config_path(&vault);
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "sentinel").unwrap();
+        ensure_open_vault(&vault, &config).expect("leave existing config alone");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), "sentinel");
+        assert!(!vault.join("Welcome.md").exists());
+        let _ = std::fs::remove_dir_all(vault);
+    }
 }

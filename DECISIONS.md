@@ -30,6 +30,21 @@ Models in-process. There is no model server, API key, or model download. Other
 platforms and users who want a larger model can configure an OpenAI-compatible
 endpoint; no cloud endpoint is contacted by default.
 
+## First-run initialization
+
+`engram open` initializes an empty vault (config plus a starter note) before
+serving. It does not inject a starter note into a folder that already has
+visible content; those vaults get an explicit `init` warning instead. `serve`
+remains side-effect free apart from derived server state. Initialization is
+best-effort so a read-only vault can still use the chat UI.
+
+## First-load probe
+
+Threadline defers the macOS takeover status probe until the browser is idle,
+with a bounded timeout, so first paint and embedded-model discovery are not
+competed with by Accessibility/app enumeration. Arming or stopping a session
+invalidates any older in-flight status response.
+
 ## Takeover
 
 macOS GUI takeover is implemented as an explicitly armed, time-boxed session.
