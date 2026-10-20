@@ -17,6 +17,19 @@ assert.equal((await executeApplicationAction('update_workspace_settings', '{"mem
 assert.equal(changed, 1);
 assert.equal((await executeApplicationAction('update_workspace_settings', '{"memoryEnabled":false}', { ...callbacks, updateSettings: () => { changed += 1; }, confirm: async () => false })).cancelled, true);
 assert.equal(changed, 1);
+
+const listed = await executeApplicationAction('list_digested_applications', '{}', { ...callbacks, actionId: 'list-apps', listApplications: async () => [{ id: 'echo' }] });
+assert.equal(listed.ok, true);
+assert.deepEqual(listed.apps, [{ id: 'echo' }]);
+
+const inspected = await executeApplicationAction('inspect_local_application', '{"path":"/bin/echo"}', { ...callbacks, actionId: 'inspect-app', inspectApplication: async path => ({ id: 'echo', path }) });
+assert.equal(inspected.ok, true);
+assert.equal(inspected.path, '/bin/echo');
+
+const ran = await executeApplicationAction('run_digested_application', '{"id":"echo","action":"version"}', { ...callbacks, actionId: 'run-app', runApplication: async (id, action) => ({ id, action, stdout: 'ok' }) });
+assert.equal(ran.ok, true);
+assert.equal(ran.stdout, 'ok');
+assert.equal((await executeApplicationAction('run_digested_application', '{"id":"echo","action":"rm"}', { ...callbacks, actionId: 'bad-app-action', runApplication: async () => ({}) })).code, 'invalid_arguments');
 const invocation = 'duplicate-action';
 const first = await executeApplicationAction('open_workspace_view', '{"view":"rules"}', { ...callbacks, actionId: invocation });
 const second = await executeApplicationAction('open_workspace_view', '{"view":"settings"}', { ...callbacks, actionId: invocation });

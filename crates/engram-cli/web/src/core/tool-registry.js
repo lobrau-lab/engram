@@ -56,7 +56,8 @@ const registeredTools = [
     name: 'list_digested_applications',
     description: 'List applications already digested for this vault, including their reviewed actions and risk level.',
     effect: 'local_file_read', scope: 'threadline:apps:read', capability: 'List digested local applications',
-    risk: 'low', destination: 'local', dataClasses: ['Application names, paths, and capability metadata'], approval: 'none',
+    risk: 'low', destination: 'local', dataClasses: ['Application names, paths, and capability metadata'], approval: 'confirm',
+    confirmation: 'Allow Threadline to list the applications already digested for this vault?',
     parameters: { type: 'object', properties: {}, additionalProperties: false }
   },
   {
