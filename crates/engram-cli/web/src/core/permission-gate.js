@@ -20,7 +20,7 @@ const EFFECT_POLICIES = new Map([
 
 const RISK_LEVELS = new Set(['low', 'medium', 'high', 'critical']);
 
-export function authorizeToolInvocation(tool, args = {}, callbacks = {}) {
+export async function authorizeToolInvocation(tool, args = {}, callbacks = {}) {
   if (!tool) return denied('unknown_tool', 'This tool is not registered.');
   const minimumApproval = EFFECT_POLICIES.get(tool.effect);
   if (!minimumApproval) return denied('unknown_effect', 'The tool has no recognized effect policy.');
@@ -50,7 +50,9 @@ export function authorizeToolInvocation(tool, args = {}, callbacks = {}) {
   const disclosure = formatToolDisclosure(tool, args);
   let accepted = false;
   try {
-    accepted = callbacks.confirm(disclosure) === true;
+    // Confirmation may be synchronous (tests, native dialog) or asynchronous
+    // (the browser approval sheet). Both must be awaited before dispatch.
+    accepted = (await callbacks.confirm(disclosure)) === true;
   } catch {
     return denied('approval_unavailable', 'The confirmation interface failed; the action was blocked.');
   }

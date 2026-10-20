@@ -6,7 +6,7 @@ export function validateConnectorManifest(manifest) {
   if (missing.length) return { valid: false, code: 'incomplete_manifest', missing };
   if (!Number.isInteger(manifest.version) || manifest.version < 1) return { valid: false, code: 'invalid_version' };
   if (!Array.isArray(manifest.capabilities) || manifest.capabilities.some(value => typeof value !== 'string' || !value)) return { valid: false, code: 'invalid_capabilities' };
-  if (!['read', 'local_write', 'external_read', 'external_write', 'delete', 'app_control'].includes(manifest.effect)) return { valid: false, code: 'unknown_effect' };
+  if (!['read', 'ui_navigation', 'conversation_read', 'local_state_write', 'local_settings_write', 'local_file_read', 'local_file_write', 'shell_execution', 'destructive_local_delete', 'external_read', 'external_write', 'delete', 'app_control'].includes(manifest.effect)) return { valid: false, code: 'unknown_effect' };
   if (!['low', 'medium', 'high', 'critical'].includes(manifest.risk)) return { valid: false, code: 'invalid_risk' };
   if (!['local', 'remote'].includes(manifest.destination)) return { valid: false, code: 'unknown_destination' };
   if (manifest.destination === 'remote' && !manifest.destinationLabel) return { valid: false, code: 'missing_remote_destination' };

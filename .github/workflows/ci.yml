@@ -58,9 +58,14 @@ jobs:
           test -f /tmp/sync/.engram-manifest.json
           test -f /tmp/brain/.engram/state.json
 
-      - name: cargo clippy (advisory, non-blocking on first run)
-        run: cargo clippy --workspace --all-targets
-        continue-on-error: true
+      - name: JavaScript tests
+        run: |
+          for test in crates/engram-cli/web/tests/*.test.mjs; do
+            node "$test"
+          done
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: cargo test
         run: cargo test --workspace --verbose

@@ -3,10 +3,10 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use crate::vault::{content_hash, Vault};
 use crate::atomic_write;
+use crate::vault::{content_hash, validate_relative_path, Vault};
 
 pub const MANIFEST_NAME: &str = ".engram-manifest.json";
 pub const STATE_REL: &str = ".engram/state.json";
@@ -86,8 +86,7 @@ pub fn load_manifest(dir: &Path) -> Result<Option<Manifest>> {
     if !p.exists() {
         return Ok(None);
     }
-    let text =
-        std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
+    let text = std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
     let m: Manifest =
         serde_json::from_str(&text).with_context(|| format!("parsing {}", p.display()))?;
     Ok(Some(m))
@@ -107,8 +106,7 @@ pub fn load_local_state(vault: &Path) -> Result<LocalState> {
     if !p.exists() {
         return Ok(LocalState::default());
     }
-    let text =
-        std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
+    let text = std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
     let s: LocalState =
         serde_json::from_str(&text).with_context(|| format!("parsing {}", p.display()))?;
     Ok(s)
@@ -164,6 +162,61 @@ fn copy_file(src: &Path, dst: &Path) -> Result<()> {
     std::fs::copy(src, dst)
         .with_context(|| format!("copying {} -> {}", src.display(), dst.display()))?;
     Ok(())
+}
+
+fn has_hidden_component(path: &Path) -> bool {
+    path.components().any(|part| match part {
+        Component::Normal(name) => name.to_string_lossy().starts_with('.'),
+        _ => false,
+    })
+}
+
+/// Reject symlinks in every existing component so a sync manifest cannot
+/// escape the vault through a link placed inside it.
+fn ensure_no_symlink_components(root: &Path, relative: &Path) -> Result<()> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => anyhow::ensure!(
+                !metadata.file_type().is_symlink(),
+                "symbolic links are not allowed in sync paths"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Validate a manifest entry before it is allowed to touch the filesystem.
+/// The sync folder is treated as untrusted input: entries must be relative
+/// Markdown paths with no hidden components, traversal, or symlink escapes.
+fn safe_manifest_target(vault: &Path, raw: &str) -> Result<(PathBuf, PathBuf)> {
+    let relative = validate_relative_path(Path::new(raw))
+        .with_context(|| format!("invalid sync path {raw:?}"))?;
+    anyhow::ensure!(
+        relative
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("md")),
+        "sync entries must be Markdown files"
+    );
+    anyhow::ensure!(
+        !has_hidden_component(&relative),
+        "sync entries may not use hidden paths"
+    );
+
+    let root = vault
+        .canonicalize()
+        .with_context(|| format!("resolving vault {}", vault.display()))?;
+    ensure_no_symlink_components(&root, &relative)?;
+    let target = root.join(&relative);
+    if target.exists() {
+        let resolved = target.canonicalize()?;
+        anyhow::ensure!(resolved.starts_with(&root), "sync target escapes the vault");
+    }
+    Ok((relative, target))
 }
 
 impl SyncBackend for FolderSync {
@@ -241,20 +294,31 @@ impl SyncBackend for FolderSync {
             Some(m) => m,
             None => anyhow::bail!("no manifest found in {}", src.display()),
         };
+        anyhow::ensure!(manifest.version == 1, "unsupported sync manifest version");
         let mut state = load_local_state(vault)?;
         if state.device_id.is_empty() {
             state.device_id = self.device_id.clone();
         }
+        let src_root = src
+            .canonicalize()
+            .with_context(|| format!("resolving sync folder {}", src.display()))?;
 
         let mut stats = SyncStats::default();
         let mut max_lamport = state.lamport.max(manifest.lamport);
 
         for entry in &manifest.entries {
-            let src_file = src.join(&entry.path);
-            if !src_file.exists() {
+            let (relative, dst) = safe_manifest_target(vault, &entry.path)?;
+            let source = src_root.join(&relative);
+            if !source.exists() {
                 continue;
             }
-            let dst = vault.join(&entry.path);
+            let src_file = source
+                .canonicalize()
+                .with_context(|| format!("resolving sync entry {}", relative.display()))?;
+            anyhow::ensure!(
+                src_file.starts_with(&src_root),
+                "sync entry escapes the sync folder"
+            );
 
             let incoming = std::fs::read_to_string(&src_file)
                 .with_context(|| format!("reading {}", src_file.display()))?;
@@ -318,7 +382,8 @@ impl SyncBackend for FolderSync {
                     } else {
                         // Concurrent (equal lamport, divergent content): fork.
                         if !self.dry_run {
-                            let cpath = conflict_path(vault, &entry.path, &entry.device);
+                            let cpath =
+                                conflict_path(vault, &relative.to_string_lossy(), &entry.device);
                             copy_file(&src_file, &cpath)?;
                             // Evict the stale entry so the next export re-adopts
                             // the file with a fresh, higher lamport.

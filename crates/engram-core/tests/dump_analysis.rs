@@ -1,18 +1,28 @@
+use anyhow::Result;
 use engram_core::dump::{self, MAX_BYTES};
 use engram_core::{ChatOpts, LlmClient, Provider};
-use anyhow::Result;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_VAULT: AtomicU64 = AtomicU64::new(0);
 
-struct FakeClient { response: String }
+struct FakeClient {
+    response: String,
+}
 impl LlmClient for FakeClient {
-    fn provider(&self) -> Provider { Provider::OpenAiCompatible }
-    fn complete(&self, _prompt: &str, _opts: &ChatOpts) -> Result<String> { Ok(self.response.clone()) }
+    fn provider(&self) -> Provider {
+        Provider::OpenAiCompatible
+    }
+    fn complete(&self, _prompt: &str, _opts: &ChatOpts) -> Result<String> {
+        Ok(self.response.clone())
+    }
 }
 
 fn vault() -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!("engram-dump-test-{}-{}", std::process::id(), NEXT_VAULT.fetch_add(1, Ordering::Relaxed)));
+    let path = std::env::temp_dir().join(format!(
+        "engram-dump-test-{}-{}",
+        std::process::id(),
+        NEXT_VAULT.fetch_add(1, Ordering::Relaxed)
+    ));
     let _ = std::fs::remove_dir_all(&path);
     std::fs::create_dir_all(&path).unwrap();
     path
@@ -31,6 +41,10 @@ fn analysis_is_separate_and_raw_item_remains_unchanged() {
     assert_eq!(before.content, after.content);
     assert_eq!(before.hash, after.hash);
     assert!(dump::analysis_path(&root, &item.id).exists());
+    // Regression: derived analysis records must not break the inbox listing.
+    let listed = dump::list(&root).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, item.id);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -53,18 +67,33 @@ fn review_accept_apply_is_idempotent_and_preserves_source() {
     let item = dump::submit(&root, "note.txt", "file", "Evidence for a note.").unwrap();
     let fake = FakeClient { response: r#"{"version":1,"suggestions":[{"id":"one","type":"create_note","path":"notes/source.md","title":"Source","body":"Evidence for a note.","rationale":"create","evidence":"Evidence for a note."}]}"#.into() };
     dump::analyze(&root, &item.id, &fake).unwrap();
-    dump::review(&root, &item.id, "s0-one", "accepted", Some("notes/edited.md".into()), Some("Edited".into()), Some("Edited body".into())).unwrap();
+    dump::review(
+        &root,
+        &item.id,
+        "s0-one",
+        "accepted",
+        Some("notes/edited.md".into()),
+        Some("Edited".into()),
+        Some("Edited body".into()),
+    )
+    .unwrap();
     let report = dump::apply(&root, &item.id, &["s0-one".into()]).unwrap();
     assert_eq!(report.applied, 1);
     assert!(root.join("notes/edited.md").exists());
-    assert_eq!(dump::get(&root, &item.id).unwrap().content, "Evidence for a note.");
+    assert_eq!(
+        dump::get(&root, &item.id).unwrap().content,
+        "Evidence for a note."
+    );
     let second = dump::apply(&root, &item.id, &["s0-one".into()]).unwrap();
     assert_eq!(second.skipped, 1);
     let audit = std::fs::read_to_string(root.join(".engram/dump-audit.jsonl")).unwrap();
     assert!(audit.contains("s0-one"));
     dump::undo(&root, &item.id, "s0-one").unwrap();
     assert!(!root.join("notes/edited.md").exists());
-    assert_eq!(dump::get(&root, &item.id).unwrap().content, "Evidence for a note.");
+    assert_eq!(
+        dump::get(&root, &item.id).unwrap().content,
+        "Evidence for a note."
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -80,7 +109,8 @@ fn apply_rejects_existing_destination_and_stale_source() {
     let conflict_report = dump::apply(&root, &item.id, &["s0-one".into()]).unwrap();
     assert_eq!(conflict_report.errors.len(), 1);
     let item_path = root.join(".engram/dump").join(format!("{}.json", item.id));
-    let mut raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&item_path).unwrap()).unwrap();
+    let mut raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&item_path).unwrap()).unwrap();
     raw["content"] = serde_json::Value::String("changed".into());
     raw["hash"] = serde_json::Value::String("changed-hash".into());
     std::fs::write(item_path, serde_json::to_vec(&raw).unwrap()).unwrap();
@@ -101,6 +131,9 @@ fn partial_apply_reports_success_and_failure_without_claiming_batch_success() {
     assert_eq!(report.applied, 1);
     assert_eq!(report.errors.len(), 1);
     assert!(root.join("one.md").exists());
-    assert_eq!(std::fs::read_to_string(root.join("two.md")).unwrap(), "conflict");
+    assert_eq!(
+        std::fs::read_to_string(root.join("two.md")).unwrap(),
+        "conflict"
+    );
     let _ = std::fs::remove_dir_all(root);
 }

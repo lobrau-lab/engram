@@ -31,43 +31,57 @@ Local-first, AI-native "second brain" MVP.
 - **Rust** CLI (single `engram` binary).
 - **SQLite FTS5** full-text index.
 - **Hash embeddings** + brute-force cosine (no ML at build time).
-- **OpenAI-compatible** LLM sidecar (MLX-Serve / oMLX / vLLM / llama.cpp / hosted APIs).
-  If `llm_model` is empty, Engram discovers the first model from `/v1/models`.
+- **Built-in on-device inference** on macOS 26+ through Apple Foundation Models:
+  no separate model server, API key, or model download.
+- **Optional OpenAI-compatible** endpoints (MLX-Serve / oMLX / vLLM / llama.cpp)
+  for other platforms or larger models.
 - **Folder-based** last-write-wins sync with conflict files.
 
 The local workspace runs on macOS, Linux, and Windows. It binds to localhost
 only by default and can be started with `engram open`.
 
-## Threadline chat workspace
+## Threadline
 
-The CLI also serves the Threadline modular chat interface at
-`http://127.0.0.1:<port>/threadline/`. Open it from the vault page's “Open
-Threadline chat” link, or navigate directly to that path. The Threadline source
-snapshot is under `crates/engram-cli/web/`; Engram embeds those assets in the
-binary, so no separate frontend build step is needed. The existing Markdown
-vault remains available at `/` (also `/vault`).
+Threadline is the front door. `engram open` opens the Threadline workspace at
+`/`; the Markdown vault remains available at `/vault`. Threadline is a
+local-first chat and agent workspace whose source snapshot lives under
+`crates/engram-cli/web/`. Engram embeds those assets in the binary, so there is
+no separate frontend build or model server.
+
+On macOS 26+ with Apple Intelligence enabled, Threadline uses the operating
+system's Foundation Models model **inside the Engram process**. There is no
+API key, no model download, and no loopback model server. The app detects the
+built-in model on first launch and selects it automatically. **Connections &
+settings** shows its readiness and lets you switch back to it at any time.
 
 Threadline conversations, settings, and derived conversation memory remain in
 browser `localStorage`; Engram notes and the SQLite index remain in the vault.
 The **Vault** composer toggle queries Engram's same-origin read-only search API
 and packs selected note snippets into the request alongside conversation
 context. The context inspector shows which notes were packed and links back to
-their source. Run `engram index` after changing notes. The browser still calls
-the configured OpenAI-compatible inference endpoint directly, which may
-require that endpoint to allow requests from the local Engram origin (CORS).
-Context token counts remain estimates.
+their source. Run `engram index` after changing notes. Context token counts
+remain estimates.
 
-On macOS, **Connections & settings** also has an optional oMLX service manager.
-It checks the default loopback port, invokes only the official CLI's fixed
-`start`, `stop`, and `restart` subcommands, and can request that a selected
-model be loaded or unloaded through the local OpenAI-compatible model API.
-The CLI is discovered only in the documented user shim and common Homebrew
-locations; no command path or shell text is accepted from the browser. These
-controls do not install oMLX or download models. A load request warms a model,
-but oMLX's own idle timeout and pinning settings determine whether it remains
-resident. Generic compatible inference endpoints continue to work without the
-oMLX controls. Threadline still sends chat requests directly to the configured
-endpoint; this service manager is not a request proxy or a process sandbox.
+Optional OpenAI-compatible endpoints remain supported. The browser calls the
+configured endpoint directly, so a loopback endpoint is preferred; remote
+endpoints require HTTPS and an explicit disclosure before any context is sent.
+On macOS, **Connections & settings** also has an optional oMLX service manager
+for fixed `start`, `stop`, and `restart` actions. It does not install software
+or download models, and it is not required for the built-in path.
+
+### Capability digest
+
+**Applications** teaches Threadline about a local program. Give it an absolute
+path to an executable or a macOS `.app` bundle. Threadline records the
+program's version, usage line, and flags in
+`.engram/capabilities/<id>.json`, along with a SHA-256 hash of the executable.
+
+The digest can run only the actions reviewed during inspection (`--help`,
+`--version`, or opening an app bundle). It never uses a shell, accepts no
+arbitrary arguments from the model, re-checks the hash before every run, and
+asks for confirmation each time. A replaced binary fails closed until it is
+inspected again. This is the safe foundation for teaching Threadline new
+applications; broader GUI takeover is intentionally not enabled.
 
 ## Layout
 

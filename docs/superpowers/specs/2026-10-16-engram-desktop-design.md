@@ -1,5 +1,11 @@
 # Engram Desktop Design
 
+> The active product direction, including Threadline-first routing, in-process
+> Apple Foundation Models inference, capability digests, and the gated workshop,
+> is in [`2026-10-20-threadline-personal-agent.md`](2026-10-20-threadline-personal-agent.md).
+> This document remains the desktop baseline for vault, crawling, backup, and
+> recovery behavior.
+
 ## Intent
 
 Engram is a private, local-first replacement for a Markdown knowledge

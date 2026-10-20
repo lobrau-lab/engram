@@ -45,6 +45,29 @@ const registeredTools = [
     parameters: { type: 'object', properties: { path: { type: 'string', minLength: 1, maxLength: 500 }, content: { type: 'string', maxLength: 524288 } }, required: ['path', 'content'], additionalProperties: false }
   },
   {
+    name: 'inspect_local_application',
+    description: 'Inspect an absolute path to a local executable or macOS .app bundle. Records its version, usage, and flags as a capability digest under the vault; runs the program only with --help and --version.',
+    effect: 'application_control', scope: 'threadline:apps:inspect', capability: 'Inspect and digest a local application',
+    risk: 'high', destination: 'local', dataClasses: ['Application path', 'Help and version output', 'Application metadata'], approval: 'confirm',
+    confirmation: 'Inspect this local application? Threadline will run it with only --help and --version and store the resulting capability digest in the vault.',
+    parameters: { type: 'object', properties: { path: { type: 'string', minLength: 1, maxLength: 2000 } }, required: ['path'], additionalProperties: false }
+  },
+  {
+    name: 'list_digested_applications',
+    description: 'List applications already digested for this vault, including their reviewed actions and risk level.',
+    effect: 'local_file_read', scope: 'threadline:apps:read', capability: 'List digested local applications',
+    risk: 'low', destination: 'local', dataClasses: ['Application names, paths, and capability metadata'], approval: 'none',
+    parameters: { type: 'object', properties: {}, additionalProperties: false }
+  },
+  {
+    name: 'run_digested_application',
+    description: 'Run one reviewed action for an application that has already been digested. The exact binary hash is re-checked before every run; arbitrary arguments and shell text are not accepted.',
+    effect: 'application_control', scope: 'threadline:apps:run', capability: 'Run a reviewed application action',
+    risk: 'high', destination: 'local', dataClasses: ['Application path', 'Action output'], approval: 'confirm',
+    confirmation: 'Run this reviewed application action? The exact program path and digest are checked before execution.',
+    parameters: { type: 'object', properties: { id: { type: 'string', minLength: 1, maxLength: 120 }, action: { type: 'string', enum: ['help', 'version', 'open'] } }, required: ['id', 'action'], additionalProperties: false }
+  },
+  {
     name: 'open_workspace_view',
     description: 'Open a view in the chat application.',
     effect: 'ui_navigation',
@@ -56,7 +79,7 @@ const registeredTools = [
     approval: 'none',
     parameters: {
       type: 'object',
-      properties: { view: { type: 'string', enum: ['chat', 'memory', 'rules', 'settings'] } },
+      properties: { view: { type: 'string', enum: ['chat', 'memory', 'rules', 'apps', 'settings'] } },
       required: ['view'],
       additionalProperties: false
     }
@@ -126,13 +149,15 @@ const registeredTools = [
   }
 ].map(tool => Object.freeze({
   ...tool,
+  id: tool.id || tool.name,
   version: tool.version || 1,
   capabilityId: tool.capabilityId || tool.scope,
+  capabilities: tool.capabilities || [tool.capabilityId || tool.scope],
   approvalPolicy: tool.approval,
   reversibility: tool.reversibility || (tool.effect === 'destructive_local_delete' ? 'irreversible' : 'reversible'),
   executorId: tool.executorId || tool.name,
   timeoutMs: tool.timeoutMs || 5000,
-  idempotency: tool.idempotency || 'invocation-id',
+  idempotency: tool.idempotency || 'idempotent',
   scopeResolver: tool.scopeResolver || 'static-threadline-scope',
   dataClasses: Object.freeze([...tool.dataClasses])
 }));

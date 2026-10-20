@@ -1,14 +1,18 @@
 use anyhow::{Context, Result};
 use engram_core::ai::ChatOpts;
+use engram_core::capability;
 use engram_core::dump;
+use engram_core::embedded::{self, ChatMessage};
 use engram_core::index::Index;
 use engram_core::vault::validate_relative_path;
-use engram_core::{atomic_write, build_context_prompt, Config, HashingEmbedder, LlmClient, OpenAiCompat, Vault};
+use engram_core::{
+    atomic_write, build_context_prompt, Config, HashingEmbedder, LlmClient, OpenAiCompat, Vault,
+};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
-use std::time::Duration;
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 512 * 1024;
@@ -34,12 +38,21 @@ fn validate_bind_host(host: &str) -> Result<()> {
     anyhow::bail!("Engram is local-only and only binds to localhost, 127.0.0.1, or ::1")
 }
 
-fn run_listener(vault: &Path, project_root: Option<&Path>, listener: TcpListener, launch_browser: bool) -> Result<()> {
-    let project_root = project_root.map(|path| {
-        let root = path.canonicalize().with_context(|| format!("resolving project root {}", path.display()))?;
-        anyhow::ensure!(root.is_dir(), "project root must be a directory");
-        Ok::<_, anyhow::Error>(root)
-    }).transpose()?;
+fn run_listener(
+    vault: &Path,
+    project_root: Option<&Path>,
+    listener: TcpListener,
+    launch_browser: bool,
+) -> Result<()> {
+    let project_root = project_root
+        .map(|path| {
+            let root = path
+                .canonicalize()
+                .with_context(|| format!("resolving project root {}", path.display()))?;
+            anyhow::ensure!(root.is_dir(), "project root must be a directory");
+            Ok::<_, anyhow::Error>(root)
+        })
+        .transpose()?;
     let address = listener.local_addr()?;
     let url = format!("http://{address}");
     println!("Engram workspace: {url}");
@@ -48,7 +61,9 @@ fn run_listener(vault: &Path, project_root: Option<&Path>, listener: TcpListener
         let result = if cfg!(target_os = "macos") {
             std::process::Command::new("open").arg(&url).spawn()
         } else if cfg!(target_os = "windows") {
-            std::process::Command::new("cmd").args(["/C", "start", &url]).spawn()
+            std::process::Command::new("cmd")
+                .args(["/C", "start", &url])
+                .spawn()
         } else {
             std::process::Command::new("xdg-open").arg(&url).spawn()
         };
@@ -59,7 +74,7 @@ fn run_listener(vault: &Path, project_root: Option<&Path>, listener: TcpListener
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(error) = handle(vault, project_root.as_deref(), stream) {
+                if let Err(error) = handle(vault, project_root.as_deref(), stream, address) {
                     eprintln!("request failed: {error:#}");
                 }
             }
@@ -69,25 +84,133 @@ fn run_listener(vault: &Path, project_root: Option<&Path>, listener: TcpListener
     Ok(())
 }
 
-fn handle(vault: &Path, project_root: Option<&Path>, mut stream: TcpStream) -> Result<()> {
+struct Request {
+    method: String,
+    target: String,
+    body: String,
+    local_control: bool,
+    host: String,
+    origin: Option<String>,
+    sec_fetch_site: Option<String>,
+}
+
+fn handle(
+    vault: &Path,
+    project_root: Option<&Path>,
+    mut stream: TcpStream,
+    address: SocketAddr,
+) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let (method, target, body, local_control) = read_request(&mut stream)?;
+    let response = match read_request(&mut stream) {
+        Ok(request) => match validate_request(&request, address) {
+            Ok(()) => match dispatch(vault, project_root, &request) {
+                Ok(response) => response,
+                Err(error) => {
+                    eprintln!("request failed: {error:#}");
+                    response(
+                        400,
+                        "text/plain; charset=utf-8",
+                        &format!("request failed: {error:#}"),
+                    )
+                }
+            },
+            Err(error) => response(
+                403,
+                "text/plain; charset=utf-8",
+                &format!("rejected: {error:#}"),
+            ),
+        },
+        Err(error) => response(
+            400,
+            "text/plain; charset=utf-8",
+            &format!("bad request: {error:#}"),
+        ),
+    };
+    stream.write_all(&response)?;
+    Ok(())
+}
 
-    let (path, query) = target.as_str().split_once('?').unwrap_or((target.as_str(), ""));
-    let response = match (method.as_str(), path) {
-        ("GET", "/") | ("GET", "/vault") => render_index(vault, query)?,
+fn validate_request(request: &Request, address: SocketAddr) -> Result<()> {
+    anyhow::ensure!(
+        host_is_local(&request.host, address),
+        "unexpected Host header"
+    );
+    if request.method == "GET" || request.method == "HEAD" {
+        return Ok(());
+    }
+    if let Some(origin) = &request.origin {
+        anyhow::ensure!(
+            origin_is_local(origin, &request.host),
+            "cross-origin requests are not allowed"
+        );
+    }
+    if let Some(site) = &request.sec_fetch_site {
+        anyhow::ensure!(
+            site == "same-origin" || site == "none",
+            "cross-site requests are not allowed"
+        );
+    }
+    Ok(())
+}
+
+fn host_is_local(host: &str, address: SocketAddr) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    let port = address.port();
+    let mut allowed = vec![
+        format!("127.0.0.1:{port}"),
+        format!("localhost:{port}"),
+        format!("[::1]:{port}"),
+    ];
+    if port == 80 {
+        allowed.extend([
+            "127.0.0.1".to_string(),
+            "localhost".to_string(),
+            "[::1]".to_string(),
+        ]);
+    }
+    allowed.iter().any(|candidate| candidate == &host)
+}
+
+fn origin_is_local(origin: &str, host: &str) -> bool {
+    origin
+        .trim()
+        .to_ascii_lowercase()
+        .eq_ignore_ascii_case(&format!("http://{}", host.trim().to_ascii_lowercase()))
+}
+
+fn dispatch(vault: &Path, project_root: Option<&Path>, request: &Request) -> Result<Vec<u8>> {
+    let (path, query) = request
+        .target
+        .as_str()
+        .split_once('?')
+        .unwrap_or((request.target.as_str(), ""));
+    let body = &request.body;
+    let local_control = request.local_control;
+    let response = match (request.method.as_str(), path) {
+        ("GET", "/") => redirect("/threadline/"),
+        ("GET", "/vault") => render_index(vault, query)?,
         ("GET", "/threadline") => redirect("/threadline/"),
         ("GET", "/dump") => render_dump(vault)?,
         ("GET", "/dump/review") => render_dump_review(vault, query)?,
-        ("POST", "/api/v1/dump") => submit_dump(vault, &body)?,
-        ("POST", path) if path.starts_with("/api/v1/dump/") && path.ends_with("/analyze") => analyze_dump(vault, path)?,
-        ("POST", path) if path.starts_with("/api/v1/dump/") && path.ends_with("/review") => review_dump(vault, path, &body)?,
-        ("POST", path) if path.starts_with("/api/v1/dump/") && path.ends_with("/apply") => apply_dump(vault, path, &body)?,
-        ("POST", path) if path.starts_with("/api/v1/dump/") && path.ends_with("/undo") => undo_dump(vault, path, &body)?,
-        ("GET", "/threadline/") | ("GET", "/threadline/index.html") => {
-            response(200, "text/html; charset=utf-8", include_str!("../web/index.html"))
+        ("POST", "/api/v1/dump") => submit_dump(vault, body)?,
+        ("POST", path) if path.starts_with("/api/v1/dump/") && path.ends_with("/analyze") => {
+            analyze_dump(vault, path)?
         }
+        ("POST", path) if path.starts_with("/api/v1/dump/") && path.ends_with("/review") => {
+            review_dump(vault, path, body)?
+        }
+        ("POST", path) if path.starts_with("/api/v1/dump/") && path.ends_with("/apply") => {
+            apply_dump(vault, path, body)?
+        }
+        ("POST", path) if path.starts_with("/api/v1/dump/") && path.ends_with("/undo") => {
+            undo_dump(vault, path, body)?
+        }
+        ("GET", "/threadline/") | ("GET", "/threadline/index.html") => response(
+            200,
+            "text/html; charset=utf-8",
+            include_str!("../web/index.html"),
+        ),
         ("GET", asset_path) if asset_path.starts_with("/threadline/assets/") => {
             match threadline_image(asset_path) {
                 Some(contents) => response_bytes(200, "image/png", contents),
@@ -103,18 +226,30 @@ fn handle(vault: &Path, project_root: Option<&Path>, mut stream: TcpStream) -> R
         ("GET", "/api/v1/project/status") => project_status(project_root),
         ("GET", "/api/v1/project/files") => project_files(project_root, query),
         ("GET", "/api/v1/project/read") => project_read(project_root, query),
-        ("POST", "/api/v1/project/write") => project_write(project_root, &body),
-        ("POST", "/api/v1/project/directory") => project_create_directory(project_root, &body),
-        ("POST", "/api/v1/project/check") => project_run_check(project_root, &body),
+        ("POST", "/api/v1/project/write") => project_write(project_root, body),
+        ("POST", "/api/v1/project/directory") => project_create_directory(project_root, body),
+        ("POST", "/api/v1/project/check") => project_run_check(project_root, body),
+        ("GET", "/api/v1/inference/embedded") => embedded_status(),
+        ("GET", "/api/v1/apps") => list_apps(vault),
+        ("POST", "/api/v1/apps/inspect") => inspect_app(vault, body),
+        ("POST", "/api/v1/apps/run") => run_app(vault, body),
+        ("GET", "/v1/models") => embedded_models(),
+        ("POST", "/v1/chat/completions") => chat_completions(body),
         ("GET", "/api/v1/inference/omlx") => omlx_status(),
         ("POST", "/api/v1/inference/omlx/start") if local_control => omlx_action("start"),
         ("POST", "/api/v1/inference/omlx/stop") if local_control => omlx_action("stop"),
         ("POST", "/api/v1/inference/omlx/restart") if local_control => omlx_action("restart"),
-        ("POST", path) if path.starts_with("/api/v1/inference/omlx/") => project_error(403, "local control header required"),
+        ("POST", path) if path.starts_with("/api/v1/inference/omlx/") => {
+            project_error(403, "local control header required")
+        }
         ("GET", "/api/v1/vault/search") => {
             let search = parameter(query, "q").unwrap_or_default();
             if search.trim().is_empty() || search.len() > 512 {
-                response(400, "application/json; charset=utf-8", "{\"error\":\"query must contain 1–512 bytes\"}")
+                response(
+                    400,
+                    "application/json; charset=utf-8",
+                    "{\"error\":\"query must contain 1–512 bytes\"}",
+                )
             } else {
                 match search_vault_api(vault, &search) {
                     Ok(json) => response(200, "application/json; charset=utf-8", &json),
@@ -128,15 +263,191 @@ fn handle(vault: &Path, project_root: Option<&Path>, mut stream: TcpStream) -> R
         }
         ("GET", "/note") => render_note(vault, query)?,
         ("GET", "/new") => render_new()?,
-        ("POST", "/new") => create_note(vault, &body)?,
+        ("POST", "/new") => create_note(vault, body)?,
         ("GET", "/graph") => render_graph(vault)?,
-        ("POST", "/save") => save_note(vault, &body)?,
+        ("POST", "/save") => save_note(vault, body)?,
         ("GET", "/ask") => render_ask()?,
-        ("POST", "/ask") => ask(vault, &body)?,
+        ("POST", "/ask") => ask(vault, body)?,
         _ => response(404, "text/plain; charset=utf-8", "Not found"),
     };
-    stream.write_all(&response)?;
-    Ok(())
+    Ok(response)
+}
+
+#[derive(serde::Deserialize)]
+struct ChatCompletionRequest {
+    #[serde(default)]
+    messages: Vec<ChatMessage>,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+}
+
+fn embedded_status() -> Vec<u8> {
+    let status = embedded::availability();
+    response(
+        200,
+        "application/json; charset=utf-8",
+        &serde_json::json!({
+            "available": status.available,
+            "provider": status.provider,
+            "model": status.model,
+            "reason": status.reason,
+        })
+        .to_string(),
+    )
+}
+
+fn embedded_models() -> Vec<u8> {
+    let status = embedded::availability();
+    let data = if status.available {
+        vec![serde_json::json!({
+            "id": status.model,
+            "object": "model",
+            "owned_by": "local",
+        })]
+    } else {
+        Vec::new()
+    };
+    response(
+        200,
+        "application/json; charset=utf-8",
+        &serde_json::json!({ "object": "list", "data": data }).to_string(),
+    )
+}
+
+fn inference_error(status: u16, message: &str) -> Vec<u8> {
+    response(
+        status,
+        "application/json; charset=utf-8",
+        &serde_json::json!({
+            "error": {
+                "message": message,
+                "type": "embedded_inference_error",
+            }
+        })
+        .to_string(),
+    )
+}
+
+fn chat_completions(body: &str) -> Vec<u8> {
+    let request: ChatCompletionRequest = match serde_json::from_str(body) {
+        Ok(request) => request,
+        Err(error) => return inference_error(400, &format!("invalid chat request: {error}")),
+    };
+    if request.messages.is_empty() {
+        return inference_error(400, "messages must contain at least one entry");
+    }
+    let max_tokens = request.max_tokens.unwrap_or(1024).clamp(1, 4096);
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let content = match embedded::complete(&request.messages, Some(max_tokens)) {
+        Ok(content) => content,
+        Err(error) => return inference_error(503, &error.to_string()),
+    };
+    let model = embedded::availability().model;
+
+    if request.stream {
+        let chunk = serde_json::json!({
+            "id": format!("chatcmpl-embedded-{created}"),
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": { "role": "assistant", "content": content },
+                "finish_reason": serde_json::Value::Null,
+            }],
+        });
+        let stop = serde_json::json!({
+            "id": format!("chatcmpl-embedded-{created}"),
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop",
+            }],
+        });
+        let body = format!("data: {chunk}\n\ndata: {stop}\n\ndata: [DONE]\n\n");
+        return response_bytes(200, "text/event-stream; charset=utf-8", body.as_bytes());
+    }
+
+    response(
+        200,
+        "application/json; charset=utf-8",
+        &serde_json::json!({
+            "id": format!("chatcmpl-embedded-{created}"),
+            "object": "chat.completion",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": content },
+                "finish_reason": "stop",
+            }],
+            "usage": serde_json::Value::Null,
+        })
+        .to_string(),
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct InspectAppRequest {
+    path: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RunAppRequest {
+    id: String,
+    action: String,
+}
+
+fn list_apps(vault: &Path) -> Vec<u8> {
+    match capability::list(vault) {
+        Ok(apps) => response(
+            200,
+            "application/json; charset=utf-8",
+            &serde_json::json!({ "apps": apps }).to_string(),
+        ),
+        Err(error) => inference_error(500, &error.to_string()),
+    }
+}
+
+fn inspect_app(vault: &Path, body: &str) -> Vec<u8> {
+    let request: InspectAppRequest = match serde_json::from_str(body) {
+        Ok(request) => request,
+        Err(error) => return inference_error(400, &format!("invalid inspect request: {error}")),
+    };
+    if request.path.trim().is_empty() || request.path.len() > 2000 {
+        return inference_error(400, "provide a path between 1 and 2000 bytes");
+    }
+    match capability::inspect(vault, &request.path) {
+        Ok(digest) => response(
+            200,
+            "application/json; charset=utf-8",
+            &serde_json::to_string(&digest).unwrap_or_else(|_| "{}".into()),
+        ),
+        Err(error) => inference_error(400, &error.to_string()),
+    }
+}
+
+fn run_app(vault: &Path, body: &str) -> Vec<u8> {
+    let request: RunAppRequest = match serde_json::from_str(body) {
+        Ok(request) => request,
+        Err(error) => return inference_error(400, &format!("invalid run request: {error}")),
+    };
+    match capability::run(vault, &request.id, &request.action) {
+        Ok(result) => response(
+            200,
+            "application/json; charset=utf-8",
+            &serde_json::to_string(&result).unwrap_or_else(|_| "{}".into()),
+        ),
+        Err(error) => inference_error(400, &error.to_string()),
+    }
 }
 
 fn omlx_cli() -> Option<PathBuf> {
@@ -144,16 +455,25 @@ fn omlx_cli() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("HOME") {
         candidates.push(PathBuf::from(home).join(".omlx/bin/omlx"));
     }
-    candidates.extend([PathBuf::from("/opt/homebrew/bin/omlx"), PathBuf::from("/usr/local/bin/omlx")]);
+    candidates.extend([
+        PathBuf::from("/opt/homebrew/bin/omlx"),
+        PathBuf::from("/usr/local/bin/omlx"),
+    ]);
     candidates.into_iter().find(|path| {
-        if !path.is_file() { return false; }
+        if !path.is_file() {
+            return false;
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::metadata(path).map(|metadata| metadata.permissions().mode() & 0o111 != 0).unwrap_or(false)
+            std::fs::metadata(path)
+                .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
         }
         #[cfg(not(unix))]
-        { true }
+        {
+            true
+        }
     })
 }
 
@@ -161,7 +481,8 @@ fn omlx_status() -> Vec<u8> {
     let supported = cfg!(target_os = "macos");
     let cli_available = supported && omlx_cli().is_some();
     let address: SocketAddr = "127.0.0.1:8000".parse().expect("fixed loopback address");
-    let endpoint_listening = supported && TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_ok();
+    let endpoint_listening =
+        supported && TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_ok();
     let message = if !supported {
         "Threadline's oMLX lifecycle controls are available on macOS."
     } else if !cli_available {
@@ -171,21 +492,38 @@ fn omlx_status() -> Vec<u8> {
     } else {
         "No service is listening on oMLX's default loopback port."
     };
-    response(200, "application/json; charset=utf-8", &serde_json::json!({
-        "provider": "oMLX", "supported": supported, "cliAvailable": cli_available,
-        "endpointListening": endpoint_listening, "message": message
-    }).to_string())
+    response(
+        200,
+        "application/json; charset=utf-8",
+        &serde_json::json!({
+            "provider": "oMLX", "supported": supported, "cliAvailable": cli_available,
+            "endpointListening": endpoint_listening, "message": message
+        })
+        .to_string(),
+    )
 }
 
 fn omlx_action(action: &str) -> Vec<u8> {
     if !cfg!(target_os = "macos") {
-        return response(501, "application/json; charset=utf-8", r#"{"ok":false,"error":"oMLX lifecycle controls are available on macOS only."}"#);
+        return response(
+            501,
+            "application/json; charset=utf-8",
+            r#"{"ok":false,"error":"oMLX lifecycle controls are available on macOS only."}"#,
+        );
     }
     if !matches!(action, "start" | "stop" | "restart") {
-        return response(400, "application/json; charset=utf-8", r#"{"ok":false,"error":"Unsupported oMLX action."}"#);
+        return response(
+            400,
+            "application/json; charset=utf-8",
+            r#"{"ok":false,"error":"Unsupported oMLX action."}"#,
+        );
     }
     let Some(cli) = omlx_cli() else {
-        return response(503, "application/json; charset=utf-8", r#"{"ok":false,"error":"oMLX CLI not found. Launch oMLX or install its official CLI shim."}"#);
+        return response(
+            503,
+            "application/json; charset=utf-8",
+            r#"{"ok":false,"error":"oMLX CLI not found. Launch oMLX or install its official CLI shim."}"#,
+        );
     };
     // Fixed executable and fixed subcommands only: never invoke a shell or
     // accept a command path/argument from the browser.
@@ -396,7 +734,9 @@ fn project_create_directory(root: Option<&Path>, body: &str) -> Vec<u8> {
         return project_error(400, "path is required");
     };
     let rel = Path::new(relative);
-    if relative.trim().is_empty() { return project_error(400, "path is required"); }
+    if relative.trim().is_empty() {
+        return project_error(400, "path is required");
+    }
     if is_sensitive_project_path(rel) {
         return project_error(403, "hidden or sensitive directory paths are blocked");
     }
@@ -528,12 +868,16 @@ fn project_error(status: u16, message: &str) -> Vec<u8> {
     )
 }
 
-fn read_request(stream: &mut TcpStream) -> Result<(String, String, String, bool)> {
+fn read_request(stream: &mut TcpStream) -> Result<Request> {
     let mut header = Vec::new();
     let mut byte = [0u8; 1];
     while !header.windows(4).any(|w| w == b"\r\n\r\n") {
-        if header.len() >= MAX_HEADER_BYTES { anyhow::bail!("request headers exceed limit") }
-        stream.read_exact(&mut byte).context("reading request headers")?;
+        if header.len() >= MAX_HEADER_BYTES {
+            anyhow::bail!("request headers exceed limit")
+        }
+        stream
+            .read_exact(&mut byte)
+            .context("reading request headers")?;
         header.push(byte[0]);
     }
     let text = std::str::from_utf8(&header).context("request headers are not UTF-8")?;
@@ -542,24 +886,71 @@ fn read_request(stream: &mut TcpStream) -> Result<(String, String, String, bool)
     let mut parts = request_line.split_whitespace();
     let method = parts.next().context("missing HTTP method")?.to_string();
     let target = parts.next().context("missing HTTP target")?.to_string();
+    let version = parts.next().context("missing HTTP version")?;
+    anyhow::ensure!(
+        version == "HTTP/1.1" || version == "HTTP/1.0",
+        "unsupported HTTP version"
+    );
     let mut content_length = None;
     let mut local_control = false;
+    let mut host = None;
+    let mut origin = None;
+    let mut sec_fetch_site = None;
     for line in lines.filter(|line| !line.is_empty()) {
         let (name, value) = line.split_once(':').context("malformed HTTP header")?;
-        if name.eq_ignore_ascii_case("transfer-encoding") { anyhow::bail!("transfer encoding is unsupported") }
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            anyhow::bail!("transfer encoding is unsupported")
+        }
         if name.eq_ignore_ascii_case("x-threadline-local-control") && value.trim() == "1" {
             local_control = true;
         }
         if name.eq_ignore_ascii_case("content-length") {
-            if content_length.is_some() { anyhow::bail!("duplicate content-length") }
-            content_length = Some(value.trim().parse::<usize>().context("invalid content-length")?);
+            if content_length.is_some() {
+                anyhow::bail!("duplicate content-length")
+            }
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .context("invalid content-length")?,
+            );
+        }
+        if name.eq_ignore_ascii_case("host") {
+            if host.is_some() {
+                anyhow::bail!("duplicate host")
+            }
+            host = Some(value.trim().to_string());
+        }
+        if name.eq_ignore_ascii_case("origin") {
+            if origin.is_some() {
+                anyhow::bail!("duplicate origin")
+            }
+            origin = Some(value.trim().to_string());
+        }
+        if name.eq_ignore_ascii_case("sec-fetch-site") {
+            if sec_fetch_site.is_some() {
+                anyhow::bail!("duplicate sec-fetch-site")
+            }
+            sec_fetch_site = Some(value.trim().to_ascii_lowercase());
         }
     }
     let length = content_length.unwrap_or(0);
-    if length > MAX_BODY_BYTES { anyhow::bail!("request body exceeds limit") }
+    if length > MAX_BODY_BYTES {
+        anyhow::bail!("request body exceeds limit")
+    }
     let mut body = vec![0u8; length];
-    stream.read_exact(&mut body).context("reading complete request body")?;
-    Ok((method, target, String::from_utf8(body).context("request body is not UTF-8")?, local_control))
+    stream
+        .read_exact(&mut body)
+        .context("reading complete request body")?;
+    Ok(Request {
+        method,
+        target,
+        body: String::from_utf8(body).context("request body is not UTF-8")?,
+        local_control,
+        host: host.context("missing Host header")?,
+        origin,
+        sec_fetch_site,
+    })
 }
 
 fn render_index(vault: &Path, query: &str) -> Result<Vec<u8>> {
@@ -613,7 +1004,7 @@ fn search_vault_api(vault: &Path, query: &str) -> Result<String> {
 fn render_dump(vault: &Path) -> Result<Vec<u8>> {
     let items = dump::list(vault)?;
     let rows = items.iter().map(|item| format!("<li><b>{}</b> <small>{} · {} bytes · {}</small> <a href=\"/dump/review?id={}\">Review</a> <form method=\"post\" action=\"/api/v1/dump/{}/analyze\" style=\"display:inline\"><button>Analyze locally</button></form></li>", escape(&item.filename), escape(&item.id), item.content.len(), escape(&item.status), encode(&item.id), encode(&item.id))).collect::<String>();
-    let html = format!("<a href=\"/\">← Vault</a><h1>Dump / Inbox</h1><p>Supported now: pasted text, Markdown, and plain text. Items remain pending and are not indexed until approval.</p><textarea id=\"paste\" placeholder=\"Paste text here…\"></textarea><button id=\"submit-paste\">Add pasted text</button><p><input id=\"files\" type=\"file\" multiple accept=\".md,.markdown,.txt,text/plain,text/markdown\"></p><ul>{rows}</ul><script>const send=(filename,source,content)=>fetch('/api/v1/dump',{{method:'POST',headers:{{'content-type':'application/x-www-form-urlencoded'}},body:new URLSearchParams({{filename,source,content}})}}).then(r=>r.ok?r.text():r.text().then(t=>Promise.reject(t))).then(()=>location.reload());document.querySelector('#submit-paste').onclick=()=>send('pasted-text.txt','paste',document.querySelector('#paste').value);document.querySelector('#files').onchange=e=>Promise.all([...e.target.files].map(f=>new Promise((ok,bad)=>{{const r=new FileReader();r.onload=()=>send(f.name,'file',r.result).then(ok,bad);r.onerror=bad;r.readAsText(f)}})));</script>");
+    let html = format!("<a href=\"/vault\">← Vault</a><h1>Dump / Inbox</h1><p>Supported now: pasted text, Markdown, and plain text. Items remain pending and are not indexed until approval.</p><textarea id=\"paste\" placeholder=\"Paste text here…\"></textarea><button id=\"submit-paste\">Add pasted text</button><p><input id=\"files\" type=\"file\" multiple accept=\".md,.markdown,.txt,text/plain,text/markdown\"></p><ul>{rows}</ul><script>const send=(filename,source,content)=>fetch('/api/v1/dump',{{method:'POST',headers:{{'content-type':'application/x-www-form-urlencoded'}},body:new URLSearchParams({{filename,source,content}})}}).then(r=>r.ok?r.text():r.text().then(t=>Promise.reject(t))).then(()=>location.reload());document.querySelector('#submit-paste').onclick=()=>send('pasted-text.txt','paste',document.querySelector('#paste').value);document.querySelector('#files').onchange=e=>Promise.all([...e.target.files].map(f=>new Promise((ok,bad)=>{{const r=new FileReader();r.onload=()=>send(f.name,'file',r.result).then(ok,bad);r.onerror=bad;r.readAsText(f)}})));</script>");
     Ok(page("Dump / Inbox", &html))
 }
 
@@ -632,48 +1023,94 @@ fn submit_dump(vault: &Path, body: &str) -> Result<Vec<u8>> {
     let source = parameter(body, "source").unwrap_or_else(|| "paste".into());
     let content = parameter(body, "content").context("missing dump content")?;
     let item = dump::submit(vault, &filename, &source, &content)?;
-    Ok(response(201, "application/json; charset=utf-8", &serde_json::json!({"id": item.id, "status": item.status}).to_string()))
+    Ok(response(
+        201,
+        "application/json; charset=utf-8",
+        &serde_json::json!({"id": item.id, "status": item.status}).to_string(),
+    ))
 }
 
 fn analyze_dump(vault: &Path, path: &str) -> Result<Vec<u8>> {
-    let id = path.strip_prefix("/api/v1/dump/").and_then(|path| path.strip_suffix("/analyze")).unwrap_or("");
+    let id = path
+        .strip_prefix("/api/v1/dump/")
+        .and_then(|path| path.strip_suffix("/analyze"))
+        .unwrap_or("");
     let config_path = vault.join(".engram").join("config.toml");
     let config = Config::load(&config_path).context("local inference configuration is missing")?;
-    let client = OpenAiCompat::new(config.llm_base, config.llm_model, config.llm_key, config.provider);
+    let client = OpenAiCompat::new(
+        config.llm_base,
+        config.llm_model,
+        config.llm_key,
+        config.provider,
+    );
     let analysis = dump::analyze(vault, id, &client)?;
-    Ok(response(200, "application/json; charset=utf-8", &serde_json::to_string(&analysis)?))
+    Ok(response(
+        200,
+        "application/json; charset=utf-8",
+        &serde_json::to_string(&analysis)?,
+    ))
 }
 
 fn review_dump(vault: &Path, path: &str, body: &str) -> Result<Vec<u8>> {
-    let id = path.strip_prefix("/api/v1/dump/").and_then(|x| x.strip_suffix("/review")).unwrap_or("");
-    dump::review(vault, id, &parameter(body, "suggestion_id").context("missing suggestion id")?, &parameter(body, "status").unwrap_or_default(), parameter(body, "path"), parameter(body, "title"), parameter(body, "body"))?;
+    let id = path
+        .strip_prefix("/api/v1/dump/")
+        .and_then(|x| x.strip_suffix("/review"))
+        .unwrap_or("");
+    dump::review(
+        vault,
+        id,
+        &parameter(body, "suggestion_id").context("missing suggestion id")?,
+        &parameter(body, "status").unwrap_or_default(),
+        parameter(body, "path"),
+        parameter(body, "title"),
+        parameter(body, "body"),
+    )?;
     Ok(redirect(&format!("/dump/review?id={}", encode(id))))
 }
 
 fn apply_dump(vault: &Path, path: &str, body: &str) -> Result<Vec<u8>> {
-    let id = path.strip_prefix("/api/v1/dump/").and_then(|x| x.strip_suffix("/apply")).unwrap_or("");
+    let id = path
+        .strip_prefix("/api/v1/dump/")
+        .and_then(|x| x.strip_suffix("/apply"))
+        .unwrap_or("");
     let suggestion_id = parameter(body, "suggestion_id").context("missing suggestion id")?;
     let report = dump::apply(vault, id, &[suggestion_id])?;
-    Ok(response(200, "application/json; charset=utf-8", &serde_json::to_string(&report)?))
+    Ok(response(
+        200,
+        "application/json; charset=utf-8",
+        &serde_json::to_string(&report)?,
+    ))
 }
 
 fn undo_dump(vault: &Path, path: &str, body: &str) -> Result<Vec<u8>> {
-    let id = path.strip_prefix("/api/v1/dump/").and_then(|x| x.strip_suffix("/undo")).unwrap_or("");
-    dump::undo(vault, id, &parameter(body, "suggestion_id").context("missing suggestion id")?)?;
+    let id = path
+        .strip_prefix("/api/v1/dump/")
+        .and_then(|x| x.strip_suffix("/undo"))
+        .unwrap_or("");
+    dump::undo(
+        vault,
+        id,
+        &parameter(body, "suggestion_id").context("missing suggestion id")?,
+    )?;
     Ok(redirect(&format!("/dump/review?id={}", encode(id))))
 }
 
 fn render_graph(vault: &Path) -> Result<Vec<u8>> {
     let notes = Vault::open(vault.to_path_buf())?.scan()?;
-    let mut body = String::from("<a href=\"/\">← Vault</a><h1>Knowledge graph</h1><svg viewBox=\"0 0 900 520\" style=\"width:100%;border:1px solid #ddd;background:#fafafa\">");
+    let mut body = String::from("<a href=\"/vault\">← Vault</a><h1>Knowledge graph</h1><svg viewBox=\"0 0 900 520\" style=\"width:100%;border:1px solid #ddd;background:#fafafa\">");
     for (index, note) in notes.iter().enumerate() {
         let x = 100 + (index % 5) * 170;
         let y = 100 + (index / 5) * 150;
         for link in &note.links {
-            if let Some(target) = notes.iter().position(|candidate| candidate.id == *link || candidate.path.file_stem().and_then(|s| s.to_str()) == Some(link)) {
+            if let Some(target) = notes.iter().position(|candidate| {
+                candidate.id == *link
+                    || candidate.path.file_stem().and_then(|s| s.to_str()) == Some(link)
+            }) {
                 let tx = 100 + (target % 5) * 170;
                 let ty = 100 + (target / 5) * 150;
-                body.push_str(&format!("<line x1=\"{x}\" y1=\"{y}\" x2=\"{tx}\" y2=\"{ty}\" stroke=\"#999\"/>",));
+                body.push_str(&format!(
+                    "<line x1=\"{x}\" y1=\"{y}\" x2=\"{tx}\" y2=\"{ty}\" stroke=\"#999\"/>",
+                ));
             }
         }
     }
@@ -689,21 +1126,33 @@ fn render_graph(vault: &Path) -> Result<Vec<u8>> {
 fn render_note(vault: &Path, query: &str) -> Result<Vec<u8>> {
     let relative = parameter(query, "path").context("missing note path")?;
     let relative = validate_relative_path(Path::new(&relative))?;
+    anyhow::ensure!(is_markdown(&relative), "notes must use the .md extension");
     let path = safe_path(vault, &relative, false)?;
     let note = std::fs::read_to_string(&path)
         .with_context(|| format!("reading note {}", relative.display()))?;
     let notes = Vault::open(vault.to_path_buf())?.scan()?;
     let target = relative.to_string_lossy();
-    let stem = relative.file_stem().and_then(|x| x.to_str()).unwrap_or_default();
+    let stem = relative
+        .file_stem()
+        .and_then(|x| x.to_str())
+        .unwrap_or_default();
     let mut backlinks = String::from("<h2>Backlinks</h2><ul>");
     for candidate in notes {
-        if candidate.links.iter().any(|link| link == target.as_ref() || link == stem) {
-            backlinks.push_str(&format!("<li><a href=\"/note?path={}\">{}</a></li>", encode(&candidate.id), escape(&candidate.title)));
+        if candidate
+            .links
+            .iter()
+            .any(|link| link == target.as_ref() || link == stem)
+        {
+            backlinks.push_str(&format!(
+                "<li><a href=\"/note?path={}\">{}</a></li>",
+                encode(&candidate.id),
+                escape(&candidate.title)
+            ));
         }
     }
     backlinks.push_str("</ul>");
     let body = format!(
-        "<a href=\"/\">← Vault</a><h1>{}</h1><form method=\"post\" action=\"/save\"><input type=\"hidden\" name=\"path\" value=\"{}\"><textarea name=\"body\" autofocus>{}</textarea><button>Save</button></form><h2>Preview</h2><article class=\"preview\">{}</article>{}",
+        "<a href=\"/vault\">← Vault</a><h1>{}</h1><form method=\"post\" action=\"/save\"><input type=\"hidden\" name=\"path\" value=\"{}\"><textarea name=\"body\" autofocus>{}</textarea><button>Save</button></form><h2>Preview</h2><article class=\"preview\">{}</article>{}",
         escape(relative.to_string_lossy().as_ref()),
         encode(relative.to_string_lossy().as_ref()),
         escape(&note),
@@ -716,13 +1165,17 @@ fn render_note(vault: &Path, query: &str) -> Result<Vec<u8>> {
 fn save_note(vault: &Path, body: &str) -> Result<Vec<u8>> {
     let relative = parameter(body, "path").context("missing note path")?;
     let relative = validate_relative_path(Path::new(&relative))?;
+    anyhow::ensure!(is_markdown(&relative), "notes must use the .md extension");
     let content = parameter(body, "body").context("missing note body")?;
-    if let Some(parent) = vault.join(&relative).parent() { std::fs::create_dir_all(parent)?; }
     let path = safe_path(vault, &relative, true)?;
     atomic_write::replace(&path, content.as_bytes())
         .with_context(|| format!("writing note {}", relative.display()))?;
     let config_path = vault.join(".engram").join("config.toml");
-    let config = if config_path.exists() { Config::load(&config_path)? } else { Config::new(vault) };
+    let config = if config_path.exists() {
+        Config::load(&config_path)?
+    } else {
+        Config::new(vault)
+    };
     let index = Index::open(&config.db)?;
     let note = Vault::open(vault.to_path_buf())?.read_note(&relative.to_string_lossy())?;
     index.upsert(&note, &HashingEmbedder::new(config.embed_dim))?;
@@ -730,23 +1183,32 @@ fn save_note(vault: &Path, body: &str) -> Result<Vec<u8>> {
 }
 
 fn render_new() -> Result<Vec<u8>> {
-    Ok(page("New note", "<a href=\"/\">← Vault</a><h1>New note</h1><form method=\"post\" action=\"/new\"><input name=\"path\" placeholder=\"notes/my-note.md\" required><textarea name=\"body\" placeholder=\"# Title\n\nWrite here…\" autofocus></textarea><button>Create note</button></form>"))
+    Ok(page("New note", "<a href=\"/vault\">← Vault</a><h1>New note</h1><form method=\"post\" action=\"/new\"><input name=\"path\" placeholder=\"notes/my-note.md\" required><textarea name=\"body\" placeholder=\"# Title\n\nWrite here…\" autofocus></textarea><button>Create note</button></form>"))
 }
 
 fn create_note(vault: &Path, body: &str) -> Result<Vec<u8>> {
     let relative = parameter(body, "path").context("missing note path")?;
     let relative = validate_relative_path(Path::new(&relative))?;
-    if relative.extension().and_then(|x| x.to_str()) != Some("md") {
-        anyhow::bail!("new notes must use the .md extension")
-    }
+    anyhow::ensure!(
+        is_markdown(&relative),
+        "new notes must use the .md extension"
+    );
     let path = safe_path(vault, &relative, true)?;
-    if path.exists() { anyhow::bail!("note already exists: {}", relative.display()) }
-    atomic_write::replace(&path, parameter(body, "body").unwrap_or_default().as_bytes())?;
-    Ok(redirect(&format!("/note?path={}", encode(relative.to_string_lossy().as_ref()))))
+    if path.exists() {
+        anyhow::bail!("note already exists: {}", relative.display())
+    }
+    atomic_write::replace(
+        &path,
+        parameter(body, "body").unwrap_or_default().as_bytes(),
+    )?;
+    Ok(redirect(&format!(
+        "/note?path={}",
+        encode(relative.to_string_lossy().as_ref())
+    )))
 }
 
 fn render_ask() -> Result<Vec<u8>> {
-    Ok(page("Ask Engram", "<a href=\"/\">← Vault</a><h1>Ask Engram</h1><form method=\"post\" action=\"/ask\"><textarea name=\"question\" placeholder=\"Ask about your local notes\" autofocus></textarea><button>Ask</button></form><p>Answers use the configured on-device OpenAI-compatible endpoint and cite note ids.</p>"))
+    Ok(page("Ask Engram", "<a href=\"/vault\">← Vault</a><h1>Ask Engram</h1><form method=\"post\" action=\"/ask\"><textarea name=\"question\" placeholder=\"Ask about your local notes\" autofocus></textarea><button>Ask</button></form><p>Answers use the configured on-device OpenAI-compatible endpoint and cite note ids.</p>"))
 }
 
 fn ask(vault: &Path, body: &str) -> Result<Vec<u8>> {
@@ -756,25 +1218,91 @@ fn ask(vault: &Path, body: &str) -> Result<Vec<u8>> {
     let hits = index.search(&question, false, 6)?;
     let mut notes = Vec::new();
     for hit in hits {
-        notes.push((hit.id.clone(), index.get_note_body(&hit.id)?.unwrap_or_default()));
+        notes.push((
+            hit.id.clone(),
+            index.get_note_body(&hit.id)?.unwrap_or_default(),
+        ));
     }
     let prompt = build_context_prompt(&question, &notes, config.context_window.saturating_mul(4));
-    let client = OpenAiCompat::new(config.llm_base, config.llm_model, config.llm_key, config.provider);
+    let client = OpenAiCompat::new(
+        config.llm_base,
+        config.llm_model,
+        config.llm_key,
+        config.provider,
+    );
     let answer = client.complete(&prompt, &ChatOpts::default())?;
     let history = vault.join(".engram").join("conversations");
     std::fs::create_dir_all(&history)?;
-    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
-    std::fs::write(history.join(format!("{stamp}.md")), format!("# {question}\n\n## Question\n\n{question}\n\n## Answer\n\n{answer}\n"))?;
-    Ok(page("Answer", &format!("<a href=\"/ask\">← Ask again</a><h1>Answer</h1><pre>{}</pre>", escape(&answer))))
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    std::fs::write(
+        history.join(format!("{stamp}.md")),
+        format!("# {question}\n\n## Question\n\n{question}\n\n## Answer\n\n{answer}\n"),
+    )?;
+    Ok(page(
+        "Answer",
+        &format!(
+            "<a href=\"/ask\">← Ask again</a><h1>Answer</h1><pre>{}</pre>",
+            escape(&answer)
+        ),
+    ))
+}
+
+fn has_hidden_component(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        Component::Normal(name) => name.to_string_lossy().starts_with('.'),
+        _ => false,
+    })
+}
+
+fn is_markdown(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+}
+
+/// Reject symlinks in every existing component so a note path cannot reach
+/// outside the vault through a link placed inside it.
+fn ensure_no_symlink_components(root: &Path, relative: &Path) -> Result<()> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => anyhow::ensure!(
+                !metadata.file_type().is_symlink(),
+                "symbolic links are not allowed in notes"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 fn safe_path(vault: &Path, relative: &Path, for_write: bool) -> Result<std::path::PathBuf> {
+    anyhow::ensure!(
+        !has_hidden_component(relative),
+        "hidden paths are not accessible"
+    );
     let root = vault.canonicalize().context("canonicalizing vault root")?;
     let candidate = root.join(relative);
+    ensure_no_symlink_components(&root, relative)?;
+    if for_write {
+        if let Some(parent) = candidate.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+    }
     let checked = if candidate.exists() {
-        candidate.canonicalize().context("canonicalizing vault path")?
+        candidate
+            .canonicalize()
+            .context("canonicalizing vault path")?
     } else if for_write {
-        let parent = candidate.parent().context("note has no parent")?.canonicalize()?;
+        let parent = candidate
+            .parent()
+            .context("note has no parent")?
+            .canonicalize()?;
         parent.join(candidate.file_name().context("note has no filename")?)
     } else {
         anyhow::bail!("note does not exist")
@@ -808,7 +1336,10 @@ fn response_bytes(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
         503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
-    let header = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+    let header = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
     let mut response = Vec::with_capacity(header.len() + body.len());
     response.extend_from_slice(header.as_bytes());
     response.extend_from_slice(body);
@@ -820,17 +1351,54 @@ fn response_bytes(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
 fn threadline_asset(path: &str) -> Option<(&'static str, &'static str)> {
     let asset = match path {
         "/threadline/styles.css" => ("text/css; charset=utf-8", include_str!("../web/styles.css")),
-        "/threadline/src/app.js" => ("text/javascript; charset=utf-8", include_str!("../web/src/app.js")),
-        "/threadline/src/core/store.js" => ("text/javascript; charset=utf-8", include_str!("../web/src/core/store.js")),
-        "/threadline/src/core/memory-manager.js" => ("text/javascript; charset=utf-8", include_str!("../web/src/core/memory-manager.js")),
-        "/threadline/src/core/context-packer.js" => ("text/javascript; charset=utf-8", include_str!("../web/src/core/context-packer.js")),
-        "/threadline/src/core/evaluation-bench.js" => ("text/javascript; charset=utf-8", include_str!("../web/src/core/evaluation-bench.js")),
-        "/threadline/src/core/app-actions.js" => ("text/javascript; charset=utf-8", include_str!("../web/src/core/app-actions.js")),
-        "/threadline/src/core/tool-registry.js" => ("text/javascript; charset=utf-8", include_str!("../web/src/core/tool-registry.js")),
-        "/threadline/src/core/permission-gate.js" => ("text/javascript; charset=utf-8", include_str!("../web/src/core/permission-gate.js")),
-        "/threadline/src/core/privacy-policy.js" => ("text/javascript; charset=utf-8", include_str!("../web/src/core/privacy-policy.js")),
-        "/threadline/src/providers/openai-compatible.js" => ("text/javascript; charset=utf-8", include_str!("../web/src/providers/openai-compatible.js")),
-        "/threadline/src/providers/engram-vault.js" => ("text/javascript; charset=utf-8", include_str!("../web/src/providers/engram-vault.js")),
+        "/threadline/src/app.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("../web/src/app.js"),
+        ),
+        "/threadline/src/core/store.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("../web/src/core/store.js"),
+        ),
+        "/threadline/src/core/memory-manager.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("../web/src/core/memory-manager.js"),
+        ),
+        "/threadline/src/core/context-packer.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("../web/src/core/context-packer.js"),
+        ),
+        "/threadline/src/core/evaluation-bench.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("../web/src/core/evaluation-bench.js"),
+        ),
+        "/threadline/src/core/app-actions.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("../web/src/core/app-actions.js"),
+        ),
+        "/threadline/src/core/agent-execution.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("../web/src/core/agent-execution.js"),
+        ),
+        "/threadline/src/core/tool-registry.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("../web/src/core/tool-registry.js"),
+        ),
+        "/threadline/src/core/permission-gate.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("../web/src/core/permission-gate.js"),
+        ),
+        "/threadline/src/core/privacy-policy.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("../web/src/core/privacy-policy.js"),
+        ),
+        "/threadline/src/providers/openai-compatible.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("../web/src/providers/openai-compatible.js"),
+        ),
+        "/threadline/src/providers/engram-vault.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("../web/src/providers/engram-vault.js"),
+        ),
         _ => return None,
     };
     Some(asset)
@@ -838,15 +1406,33 @@ fn threadline_asset(path: &str) -> Option<(&'static str, &'static str)> {
 
 fn threadline_image(path: &str) -> Option<&'static [u8]> {
     match path {
-        "/threadline/assets/engram-logo.png" => Some(include_bytes!("../web/assets/engram-logo.png")),
-        "/threadline/assets/engram-mark.png" => Some(include_bytes!("../web/assets/engram-mark.png")),
-        "/threadline/assets/engram-mark-green.png" => Some(include_bytes!("../web/assets/engram-mark-green.png")),
-        "/threadline/assets/engram-icon-purple.png" => Some(include_bytes!("../web/assets/engram-icon-purple.png")),
-        "/threadline/assets/engram-icon-pink.png" => Some(include_bytes!("../web/assets/engram-icon-pink.png")),
-        "/threadline/assets/engram-icon-blue.png" => Some(include_bytes!("../web/assets/engram-icon-blue.png")),
-        "/threadline/assets/engram-icon-fire.png" => Some(include_bytes!("../web/assets/engram-icon-fire.png")),
-        "/threadline/assets/engram-icon-forest.png" => Some(include_bytes!("../web/assets/engram-icon-forest.png")),
-        "/threadline/assets/engram-icon-ice.png" => Some(include_bytes!("../web/assets/engram-icon-ice.png")),
+        "/threadline/assets/engram-logo.png" => {
+            Some(include_bytes!("../web/assets/engram-logo.png"))
+        }
+        "/threadline/assets/engram-mark.png" => {
+            Some(include_bytes!("../web/assets/engram-mark.png"))
+        }
+        "/threadline/assets/engram-mark-green.png" => {
+            Some(include_bytes!("../web/assets/engram-mark-green.png"))
+        }
+        "/threadline/assets/engram-icon-purple.png" => {
+            Some(include_bytes!("../web/assets/engram-icon-purple.png"))
+        }
+        "/threadline/assets/engram-icon-pink.png" => {
+            Some(include_bytes!("../web/assets/engram-icon-pink.png"))
+        }
+        "/threadline/assets/engram-icon-blue.png" => {
+            Some(include_bytes!("../web/assets/engram-icon-blue.png"))
+        }
+        "/threadline/assets/engram-icon-fire.png" => {
+            Some(include_bytes!("../web/assets/engram-icon-fire.png"))
+        }
+        "/threadline/assets/engram-icon-forest.png" => {
+            Some(include_bytes!("../web/assets/engram-icon-forest.png"))
+        }
+        "/threadline/assets/engram-icon-ice.png" => {
+            Some(include_bytes!("../web/assets/engram-icon-ice.png"))
+        }
         _ => None,
     }
 }
@@ -893,7 +1479,11 @@ fn encode(input: &str) -> String {
 }
 
 fn escape(input: &str) -> String {
-    input.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn markdown_html(markdown: &str) -> String {
@@ -901,7 +1491,11 @@ fn markdown_html(markdown: &str) -> String {
     let mut in_code = false;
     for line in markdown.lines() {
         if line.trim_start().starts_with("```") {
-            if in_code { html.push_str("</code></pre>"); } else { html.push_str("<pre><code>"); }
+            if in_code {
+                html.push_str("</code></pre>");
+            } else {
+                html.push_str("<pre><code>");
+            }
             in_code = !in_code;
             continue;
         }
@@ -920,13 +1514,20 @@ fn markdown_html(markdown: &str) -> String {
             html.push_str(&format!("<p>{}</p>", escape(line)));
         }
     }
-    if in_code { html.push_str("</code></pre>"); }
+    if in_code {
+        html.push_str("</code></pre>");
+    }
     html
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{threadline_asset, validate_bind_host};
+    use super::{
+        has_hidden_component, host_is_local, is_markdown, origin_is_local, threadline_asset,
+        validate_bind_host,
+    };
+    use std::net::SocketAddr;
+    use std::path::Path;
 
     #[test]
     fn accepts_loopback_bind_hosts() {
@@ -943,6 +1544,44 @@ mod tests {
     }
 
     #[test]
+    fn accepts_only_the_loopback_hosts_it_was_bound_to() {
+        let address: SocketAddr = "127.0.0.1:8765".parse().unwrap();
+        for host in ["127.0.0.1:8765", "localhost:8765", "[::1]:8765"] {
+            assert!(host_is_local(host, address), "{host}");
+        }
+        for host in [
+            "evil.example",
+            "127.0.0.1:9999",
+            "localhost",
+            "127.0.0.1:8765.evil.example",
+        ] {
+            assert!(!host_is_local(host, address), "{host}");
+        }
+    }
+
+    #[test]
+    fn rejects_cross_origin_state_changes() {
+        assert!(origin_is_local("http://localhost:8765", "localhost:8765"));
+        assert!(origin_is_local("http://127.0.0.1:8765", "127.0.0.1:8765"));
+        assert!(!origin_is_local("http://evil.example", "localhost:8765"));
+        assert!(!origin_is_local("null", "localhost:8765"));
+    }
+
+    #[test]
+    fn hidden_and_non_markdown_note_paths_are_refused() {
+        for path in [".engram/config.toml", "notes/.hidden.md", ".git/config"] {
+            assert!(has_hidden_component(Path::new(path)), "{path}");
+        }
+        for path in ["note.md", "notes/visible.md"] {
+            assert!(!has_hidden_component(Path::new(path)), "{path}");
+        }
+        assert!(is_markdown(Path::new("note.md")));
+        assert!(is_markdown(Path::new("note.MD")));
+        assert!(!is_markdown(Path::new("note.toml")));
+        assert!(!is_markdown(Path::new("note")));
+    }
+
+    #[test]
     fn serves_every_threadline_module_imported_by_app() {
         for path in [
             "/threadline/src/core/evaluation-bench.js",
@@ -950,6 +1589,9 @@ mod tests {
             "/threadline/src/core/memory-manager.js",
             "/threadline/src/core/context-packer.js",
             "/threadline/src/core/app-actions.js",
+            "/threadline/src/core/agent-execution.js",
+            "/threadline/src/core/permission-gate.js",
+            "/threadline/src/core/tool-registry.js",
             "/threadline/src/core/privacy-policy.js",
             "/threadline/src/providers/openai-compatible.js",
             "/threadline/src/providers/engram-vault.js",

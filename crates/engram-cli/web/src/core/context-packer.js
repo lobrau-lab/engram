@@ -2,6 +2,19 @@ import { evidenceLabel, relevantConflicts } from './memory-manager.js';
 
 export function estimateTokens(text) { return Math.ceil((text || '').length / 3.7); }
 
+/**
+ * Keep vault-derived or provenance-unknown assistant turns out of remote
+ * prompts. User-authored turns remain eligible; assistant turns are eligible
+ * only when the app explicitly recorded that no vault sources were used.
+ */
+export function filterRemoteHistory(history = []) {
+  return history.filter(turn => {
+    if (turn.role === 'user') return true;
+    if (turn.role !== 'assistant' || turn.vaultProvenanceKnown !== true) return false;
+    return !(turn.vaultSourceNoteIds?.length || turn.sourceNoteIds?.length);
+  });
+}
+
 export function packContext({ message, history, memory, evidence, vaultNotes = [], vaultContextAllowed = false, settings }) {
   const system = settings.systemPrompt || 'You are a helpful assistant.';
   const instructionCost = estimateTokens(system);

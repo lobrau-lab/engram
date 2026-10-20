@@ -1,6 +1,6 @@
 import { getWorkspace, activeConversation, appendTurn, createConversation, setActiveConversation, updateActive, updateMemory, updateSettings, subscribe, clearWorkspace, removeAssertion, getSessionApiKey, setSessionApiKey } from './core/store.js';
 import { recordAndUpdate, retrieveEvidence, evaluateRules } from './core/memory-manager.js';
-import { packContext } from './core/context-packer.js';
+import { filterRemoteHistory, packContext } from './core/context-packer.js';
 import { listModels, setModelLoaded, streamChat } from './providers/openai-compatible.js';
 import { searchEngramVault } from './providers/engram-vault.js';
 import { applicationTools, executeApplicationAction, executeProjectAction } from './core/app-actions.js';
@@ -9,7 +9,7 @@ import { runMemoryBench } from './core/evaluation-bench.js';
 
 const $ = selector => document.querySelector(selector);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
-let currentView = 'chat'; let inspectorTab = 'assembly'; let sending = false; let aborter = null;
+let currentView = 'chat'; let inspectorTab = 'assembly'; let sending = false; let aborter = null; let embeddedModel = null; let appDigests = []; let appResult = ''; let appsLoaded = false;
 
 const accentOptions = {
   green: { label: 'Green', color: '#c8f169', image: 'engram-mark-green.png' },
@@ -97,7 +97,7 @@ function switchView(view) {
   document.querySelectorAll('.nav-item').forEach(item => item.classList.toggle('active', item.dataset.view === view));
   $('#chat-view').classList.toggle('hidden', view !== 'chat');
   $('#workspace-view').classList.toggle('hidden', view === 'chat');
-  const labels = { chat: current().title, memory: 'Memory ledger', bench: 'Memory bench', rules: 'Decision rules', settings: 'Connections & settings' };
+  const labels = { chat: current().title, memory: 'Memory ledger', bench: 'Memory bench', rules: 'Decision rules', apps: 'Application digests', settings: 'Connections & settings' };
   $('#top-title').textContent = labels[view]; if (view !== 'chat') renderWorkspaceView();
 }
 
@@ -108,11 +108,13 @@ function renderWorkspaceView() {
     host.innerHTML = `<div class="page-heading"><div class="eyebrow">OFFLINE REPLAY</div><h1>Memory bench</h1><p>Synthetic conversations only. This measures retrieval and packing behavior; it does not prove general memory accuracy.</p><div class="ledger-grid"><section class="ledger-card"><h2>Baseline results</h2><p>Evidence recall: ${(report.evidenceRecall * 100).toFixed(0)}%</p><p>Irrelevant selection rate: ${(report.irrelevantSelectionRate * 100).toFixed(0)}%</p><p>Budget compliance: ${(report.budgetCompliance * 100).toFixed(0)}%</p><p>Conflict cases: ${report.conflictCases.join(', ') || 'none detected'}</p></section>${report.results.map(result => `<section class="ledger-card"><div class="ledger-head"><span>${result.expectedFound ? '✓' : '!'}</span><h2>${result.id}</h2></div><p><b>Query:</b> ${esc(result.query)}</p><p><b>Expected evidence:</b> ${result.expectedEvidence.join(', ') || 'none'}</p><p><b>Selected:</b> ${result.selectedEvidence.join(', ') || 'none'}</p><p><b>Excluded-but-selected:</b> ${result.irrelevantSelected.join(', ') || 'none'}</p><p><b>Budget:</b> ~${result.estimatedInputTokens} / ${result.usableInput} estimated tokens</p></section>`).join('')}</div></div>`;
   } else if (currentView === 'memory') {
     host.innerHTML = `<div class="page-heading"><div class="eyebrow">CONVERSATION STATE</div><h1>Memory ledger</h1><p>A compact set of variables that points back to the original conversation. Nothing here replaces the transcript.</p></div><div class="ledger-grid">${[['Current goal', memory.currentGoal, '01'], ['Active topics', memory.activeTopics, '02'], ['Decisions', memory.decisions, '03'], ['Constraints', memory.constraints, '04'], ['Preferences', memory.preferences, '05'], ['Open questions', memory.openQuestions, '06']].map(([title, items, num]) => `<section class="ledger-card"><div class="ledger-head"><span>${num}</span><h2>${title}</h2><small>${items.length} variables</small></div>${items.length ? items.map(item => `<div class="ledger-item"><p>${esc(item.text)}</p><div><span class="direct-label">DIRECTLY DERIVED</span><span>Source ${item.sourceTurnIds?.map(id => id.slice(0, 8)).join(', ')}</span></div></div>`).join('') : '<div class="ledger-empty">New user messages can add a source-linked variable here.</div>'}</section>`).join('')}</div><div class="transcript-strip"><div><span class="eyebrow">SOURCE OF RECORD</span><h2>Conversation transcript</h2><p>${current().turns.length} immutable turns in this conversation.</p></div><button class="secondary-button" id="back-to-chat">Return to chat ↗</button></div>`;
+  } else if (currentView === 'apps') {
+    renderAppsView(host);
   } else if (currentView === 'rules') {
     host.innerHTML = `<div class="page-heading"><div class="eyebrow">POLICY ENGINE</div><h1>Decision rules</h1><p>The “growing if statement” is an inspectable set of small policies. Each module can be swapped without rewriting the chat flow.</p></div><div class="rule-catalog">${[['01','Memory gate','IF memory is disabled, skip extraction and retrieval.','Memory policy'],['02','Evidence gate','IF a response recalls the conversation, retrieve and attach source turns.','Evidence policy'],['03','Correction handling','IF a correction is explicit, supersede the derived assertion and retain both source turns.','Conflict policy'],['04','Ambiguity handling','IF incompatible statements lack a clear correction, preserve both and surface uncertainty.','Conflict policy'],['05','Budget gate','IF candidate context exceeds the usable budget, rank and omit optional items first.','Packing policy'],['06','Provider fallback','IF the endpoint fails, preserve the draft and show a retryable connection error.','Provider policy']].map(([n,title,rule,module]) => `<article class="rule-card"><span class="rule-index">${n}</span><div><span class="module-label">${module}</span><h2>${title}</h2><p>${rule}</p></div><span class="rule-enabled">ENABLED <i></i></span></article>`).join('')}</div><div class="rule-note"><span>i</span><p>These starter rules are deterministic and transparent. Language extraction is a lightweight heuristic in this prototype; it is not a truth detector.</p></div>`;
   } else {
     const settings = getWorkspace().settings;
-    host.innerHTML = `<div class="page-heading"><div class="eyebrow">PROVIDER & POLICIES</div><h1>Connections & settings</h1><p>Connect a compatible inference endpoint and tune how each prompt is assembled. Provider API keys stay in memory for this page session and are not saved with workspace settings.</p></div><form id="settings-form" class="settings-layout"><section class="settings-card wide-card"><div class="settings-card-heading"><span class="settings-icon">◈</span><div><h2>Threadline appearance &amp; accent</h2><p>Choose the app accent and matching icon treatment</p></div><span class="module-label">APPEARANCE</span></div><p class="brand-appearance-copy">The chosen accent is saved with this browser’s settings. Threadline is the chat and agent workspace; Engram remains a separate local project.</p><div class="accent-picker" role="group" aria-label="App accent and icon"><button class="accent-option" type="button" data-accent="green" aria-pressed="${(settings.accent || 'green') === 'green'}"><img src="./assets/engram-mark-green.png" alt="" /><span>Green</span></button><button class="accent-option" type="button" data-accent="purple" aria-pressed="${settings.accent === 'purple'}"><img src="./assets/engram-icon-purple.png" alt="" /><span>Purple</span></button><button class="accent-option" type="button" data-accent="pink" aria-pressed="${settings.accent === 'pink'}"><img src="./assets/engram-icon-pink.png" alt="" /><span>Pink</span></button><button class="accent-option" type="button" data-accent="blue" aria-pressed="${settings.accent === 'blue'}"><img src="./assets/engram-icon-blue.png" alt="" /><span>Blue</span></button><button class="accent-option" type="button" data-accent="fire" aria-pressed="${settings.accent === 'fire'}"><img src="./assets/engram-icon-fire.png" alt="" /><span>Ember</span></button><button class="accent-option" type="button" data-accent="forest" aria-pressed="${settings.accent === 'forest'}"><img src="./assets/engram-icon-forest.png" alt="" /><span>Forest</span></button><button class="accent-option" type="button" data-accent="ice" aria-pressed="${settings.accent === 'ice'}"><img src="./assets/engram-icon-ice.png" alt="" /><span>Ice</span></button></div></section><section class="settings-card"><div class="settings-card-heading"><span class="settings-icon">↔</span><div><h2>Inference server</h2><p>OpenAI-compatible chat completions API</p></div><span class="module-label">PROVIDER MODULE</span></div><label class="field-label" for="base-url">API base URL</label><input id="base-url" name="baseUrl" type="url" value="${esc(settings.baseUrl)}" placeholder="http://localhost:8000/v1" required /><div class="field-row"><div><label class="field-label" for="model-id">Model ID</label><input id="model-id" name="model" value="${esc(settings.model)}" placeholder="Select or type a model ID" /></div><button type="button" class="secondary-button discover-button" id="discover-models">Discover models</button></div><label class="field-label" for="api-key">API key <span>optional for local servers</span></label><input id="api-key" name="apiKey" type="password" value="${esc(settings.apiKey)}" autocomplete="off" placeholder="Re-enter for each page session" /><div class="settings-actions"><button class="primary-button" type="submit">Save connection</button><button class="secondary-button" id="test-connection" type="button">Test connection</button><span id="connection-feedback" role="status"></span></div><div class="endpoint-note"><span class="status-light"></span><span>Chat endpoint: <code id="endpoint-preview">${esc(settings.baseUrl.replace(/\/$/, ''))}/chat/completions</code></span></div></section><section class="settings-card wide-card" id="omlx-manager-card"><div class="settings-card-heading"><span class="settings-icon warm">◉</span><div><h2>Local oMLX service</h2><p>Manage the on-device inference server from Threadline</p></div><span class="module-label">LOCAL SERVICE MODULE</span></div><p class="brand-appearance-copy">Controls only the installed oMLX service on this Mac. Threadline runs fixed <code>omlx start</code>, <code>stop</code>, or <code>restart</code> actions without a shell. It does not install software or download models.</p><div class="omlx-status-row"><span class="status-light" id="omlx-status-light"></span><span id="omlx-status-text" role="status">Checking local service…</span></div><div class="settings-actions omlx-actions"><button class="primary-button" type="button" data-omlx-action="start">Start oMLX</button><button class="secondary-button" type="button" data-omlx-action="restart">Restart</button><button class="secondary-button" type="button" data-omlx-action="stop">Stop</button><button class="text-button" type="button" id="refresh-omlx">Refresh status</button></div><div class="settings-actions omlx-actions"><button class="secondary-button" type="button" id="load-model">Load selected model</button><button class="secondary-button" type="button" id="unload-model">Unload selected model</button><span id="model-load-feedback" role="status"></span></div><p class="local-service-note">Loading warms the selected local model into memory for immediate requests. oMLX’s idle policy may unload it later; use oMLX model settings to pin it permanently. Threadline leaves model residency and cache policy to oMLX. This manager is available only for the local oMLX service on port 8000.</p></section>
+    host.innerHTML = `<div class="page-heading"><div class="eyebrow">PROVIDER & POLICIES</div><h1>Connections & settings</h1><p>Connect a compatible inference endpoint and tune how each prompt is assembled. Provider API keys stay in memory for this page session and are not saved with workspace settings.</p></div><form id="settings-form" class="settings-layout"><section class="settings-card wide-card"><div class="settings-card-heading"><span class="settings-icon">◈</span><div><h2>Threadline appearance &amp; accent</h2><p>Choose the app accent and matching icon treatment</p></div><span class="module-label">APPEARANCE</span></div><p class="brand-appearance-copy">The chosen accent is saved with this browser’s settings. Threadline is the chat and agent workspace; Engram remains a separate local project.</p><div class="accent-picker" role="group" aria-label="App accent and icon"><button class="accent-option" type="button" data-accent="green" aria-pressed="${(settings.accent || 'green') === 'green'}"><img src="./assets/engram-mark-green.png" alt="" /><span>Green</span></button><button class="accent-option" type="button" data-accent="purple" aria-pressed="${settings.accent === 'purple'}"><img src="./assets/engram-icon-purple.png" alt="" /><span>Purple</span></button><button class="accent-option" type="button" data-accent="pink" aria-pressed="${settings.accent === 'pink'}"><img src="./assets/engram-icon-pink.png" alt="" /><span>Pink</span></button><button class="accent-option" type="button" data-accent="blue" aria-pressed="${settings.accent === 'blue'}"><img src="./assets/engram-icon-blue.png" alt="" /><span>Blue</span></button><button class="accent-option" type="button" data-accent="fire" aria-pressed="${settings.accent === 'fire'}"><img src="./assets/engram-icon-fire.png" alt="" /><span>Ember</span></button><button class="accent-option" type="button" data-accent="forest" aria-pressed="${settings.accent === 'forest'}"><img src="./assets/engram-icon-forest.png" alt="" /><span>Forest</span></button><button class="accent-option" type="button" data-accent="ice" aria-pressed="${settings.accent === 'ice'}"><img src="./assets/engram-icon-ice.png" alt="" /><span>Ice</span></button></div></section><section class="settings-card"><div class="settings-card-heading"><span class="settings-icon">↔</span><div><h2>Inference server</h2><p>OpenAI-compatible chat completions API</p></div><span class="module-label">PROVIDER MODULE</span></div><label class="field-label" for="base-url">API base URL</label><input id="base-url" name="baseUrl" type="url" value="${esc(settings.baseUrl)}" placeholder="http://localhost:8000/v1" required /><div class="field-row"><div><label class="field-label" for="model-id">Model ID</label><input id="model-id" name="model" value="${esc(settings.model)}" placeholder="Select or type a model ID" /></div><button type="button" class="secondary-button discover-button" id="discover-models">Discover models</button></div><label class="field-label" for="api-key">API key <span>optional for local servers</span></label><input id="api-key" name="apiKey" type="password" value="${esc(settings.apiKey)}" autocomplete="off" placeholder="Re-enter for each page session" /><div class="settings-actions"><button class="primary-button" type="submit">Save connection</button><button class="secondary-button" id="test-connection" type="button">Test connection</button><span id="connection-feedback" role="status"></span></div><div class="endpoint-note"><span class="status-light"></span><span>Chat endpoint: <code id="endpoint-preview">${esc(settings.baseUrl.replace(/\/$/, ''))}/chat/completions</code></span></div></section><section class="settings-card" id="embedded-model-card"><div class="settings-card-heading"><span class="settings-icon warm">◉</span><div><h2>Built-in on-device model</h2><p>Runs inside Engram with no model server</p></div><span class="module-label">EMBEDDED MODULE</span></div><div class="omlx-status-row"><span class="status-light" id="embedded-status-light"></span><span id="embedded-status-text" role="status">Checking the built-in model…</span></div><div class="settings-actions"><button class="primary-button" type="button" id="use-embedded">Use built-in model</button><button class="secondary-button" type="button" id="refresh-embedded">Refresh</button></div><p class="local-service-note">Apple Intelligence runs the model inside this process on macOS 26 or later. Nothing is sent to a model server or the network. Conversation context stays on this Mac.</p></section><section class="settings-card wide-card" id="omlx-manager-card"><div class="settings-card-heading"><span class="settings-icon warm">◉</span><div><h2>Local oMLX service</h2><p>Manage the on-device inference server from Threadline</p></div><span class="module-label">LOCAL SERVICE MODULE</span></div><p class="brand-appearance-copy">Controls only the installed oMLX service on this Mac. Threadline runs fixed <code>omlx start</code>, <code>stop</code>, or <code>restart</code> actions without a shell. It does not install software or download models.</p><div class="omlx-status-row"><span class="status-light" id="omlx-status-light"></span><span id="omlx-status-text" role="status">Checking local service…</span></div><div class="settings-actions omlx-actions"><button class="primary-button" type="button" data-omlx-action="start">Start oMLX</button><button class="secondary-button" type="button" data-omlx-action="restart">Restart</button><button class="secondary-button" type="button" data-omlx-action="stop">Stop</button><button class="text-button" type="button" id="refresh-omlx">Refresh status</button></div><div class="settings-actions omlx-actions"><button class="secondary-button" type="button" id="load-model">Load selected model</button><button class="secondary-button" type="button" id="unload-model">Unload selected model</button><span id="model-load-feedback" role="status"></span></div><p class="local-service-note">Loading warms the selected local model into memory for immediate requests. oMLX’s idle policy may unload it later; use oMLX model settings to pin it permanently. Threadline leaves model residency and cache policy to oMLX. This manager is available only for the local oMLX service on port 8000.</p></section>
       <section class="settings-card"><div class="settings-card-heading"><span class="settings-icon warm">⌘</span><div><h2>Context algorithm</h2><p>Budget, recency, and evidence packing</p></div><span class="module-label">PACKER MODULE</span></div><div class="field-row setting-numbers"><div><label class="field-label" for="context-limit">Model context limit</label><input id="context-limit" name="contextLimit" type="number" min="1024" step="512" value="${settings.contextLimit}" /></div><div><label class="field-label" for="output-reserve">Output reserve</label><input id="output-reserve" name="outputReserve" type="number" min="128" step="1" value="${settings.outputReserve}" /></div><div><label class="field-label" for="safety-margin">Safety margin</label><input id="safety-margin" name="safetyMargin" type="number" min="0" step="100" value="${settings.safetyMargin}" /></div></div><label class="field-label" for="recent-turns">Recent turns to retain <span id="recent-value">${settings.recentTurns}</span></label><input id="recent-turns" name="recentTurns" type="range" min="2" max="16" value="${settings.recentTurns}" /><label class="field-label" for="strategy">Memory strategy</label><select id="strategy" name="strategy"><option value="hybrid" ${settings.strategy === 'hybrid' ? 'selected' : ''}>Structured state + retrieved turns</option><option value="recent" ${settings.strategy === 'recent' ? 'selected' : ''}>Recent turns only</option><option value="state" ${settings.strategy === 'state' ? 'selected' : ''}>Structured state + recent turns</option></select><label class="check-row"><input type="checkbox" name="memoryEnabled" ${settings.memoryEnabled ? 'checked' : ''} /><span><b>Use conversation memory</b><small>Derive local variables and retrieve relevant turns.</small></span><i></i></label><label class="check-row"><input type="checkbox" name="showEvidence" ${settings.showEvidence ? 'checked' : ''} /><span><b>Show source references</b><small>Display turn IDs when history evidence was packed.</small></span><i></i></label></section>
       <section class="settings-card wide-card"><div class="settings-card-heading"><span class="settings-icon blue-icon">✳</span><div><h2>Assistant operating instructions</h2><p>Baseline prompt used for every request</p></div><span class="module-label">SYSTEM MODULE</span></div><textarea id="system-prompt" name="systemPrompt" rows="4">${esc(settings.systemPrompt)}</textarea><div class="settings-actions"><button class="primary-button" type="submit">Save all settings</button><button class="text-button" type="button" id="reset-data">Delete all local data</button></div></section><section class="settings-card wide-card"><div class="settings-card-heading"><span class="settings-icon blue-icon">⌘</span><div><h2>Threadline project tools</h2><p>Local file access and fixed offline checks</p></div><span class="module-label">CAPABILITY MODULE</span></div><p class="brand-appearance-copy" id="project-access-status">Checking whether a project folder was granted…</p><div class="project-tool-list"><span>Browse and read approved source files</span><span>Create directories and write files after review</span><span>Run git status and allowlisted Cargo checks (Cargo forced offline)</span></div><p class="brand-appearance-copy">Hidden credentials, the <code>.engram</code> vault data, build output, and dependency folders are excluded. Project source stays on device: project tools are withheld from remote models and require a local inference endpoint.</p></section></form>`;
     fetch('/api/v1/project/status').then(response => response.json()).then(status => {
@@ -121,6 +123,9 @@ function renderWorkspaceView() {
       else label.textContent = 'Project tools are off. Launch the local server with --project-root <directory> to grant a project folder.';
     }).catch(() => { $('#project-access-status').textContent = 'Project access status could not be checked.'; });
     refreshOmlxStatus();
+    refreshEmbeddedStatus();
+    $('#refresh-embedded').addEventListener('click', refreshEmbeddedStatus);
+    $('#use-embedded').addEventListener('click', useEmbeddedModel);
     $('#refresh-omlx').addEventListener('click', refreshOmlxStatus);
     document.querySelectorAll('[data-omlx-action]').forEach(button => button.addEventListener('click', () => manageOmlx(button.dataset.omlxAction)));
     $('#load-model').addEventListener('click', () => manageModelResidency(true));
@@ -140,6 +145,138 @@ function renderWorkspaceView() {
     $('#reset-data').addEventListener('click', () => { if (confirm('Delete all conversations, memory, and settings stored by this prototype in this browser?')) { clearWorkspace(); location.reload(); } });
   }
   $('#back-to-chat')?.addEventListener('click', () => switchView('chat'));
+}
+
+async function refreshEmbeddedStatus() {
+  const label = $('#embedded-status-text'); const light = $('#embedded-status-light'); const button = $('#use-embedded');
+  if (!label || !light || !button) return;
+  label.textContent = 'Checking the built-in model…'; light.classList.remove('is-on', 'is-error'); button.disabled = true;
+  try {
+    const response = await fetch('/api/v1/inference/embedded');
+    const status = await response.json();
+    embeddedModel = status.available ? status.model : null;
+    label.textContent = status.available ? `Ready · ${status.model}` : (status.reason || 'The built-in model is unavailable on this Mac.');
+    light.classList.toggle('is-on', Boolean(status.available));
+    light.classList.toggle('is-error', !status.available);
+    button.disabled = !status.available;
+  } catch {
+    embeddedModel = null;
+    label.textContent = 'Could not read the built-in model status.'; light.classList.add('is-error'); button.disabled = true;
+  }
+}
+
+function useEmbeddedModel() {
+  if (!embeddedModel) { toast('The built-in model is not available on this Mac.'); return; }
+  updateSettings({ baseUrl: `${location.origin}/v1`, model: embeddedModel, connectionStatus: 'on-device', connectionTestedAt: new Date().toISOString() });
+  renderAll();
+  toast('Threadline is using the built-in on-device model.');
+}
+
+async function configureEmbeddedDefault() {
+  try {
+    const response = await fetch('/api/v1/inference/embedded');
+    const status = await response.json();
+    const settings = getWorkspace().settings;
+    const untouched = !settings.model && (!settings.baseUrl || settings.baseUrl === 'http://localhost:8000/v1');
+    if (status.available && untouched) {
+      updateSettings({ baseUrl: `${location.origin}/v1`, model: status.model, connectionStatus: 'on-device', connectionTestedAt: new Date().toISOString() });
+      renderAll();
+      toast('Built-in on-device model is ready.');
+    }
+  } catch {}
+}
+
+async function inspectApplicationForTool(path) {
+  const response = await fetch('/api/v1/apps/inspect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path }) });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error?.message || 'Inspection failed.');
+  appsLoaded = false;
+  await loadApps();
+  return data;
+}
+
+async function listApplicationsForTool() {
+  const response = await fetch('/api/v1/apps');
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error?.message || 'Could not load application digests.');
+  return data.apps || [];
+}
+
+async function runApplicationForTool(id, action) {
+  const response = await fetch('/api/v1/apps/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, action }) });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error?.message || 'The application could not run.');
+  return data;
+}
+
+function renderAppsView(host) {
+  const cards = appDigests.length ? appDigests.map(app => {
+    const actionLabels = { help: 'Run --help', version: 'Run --version', open: 'Open application' };
+    const actions = app.actions.map(action => `<button class="secondary-button" type="button" data-app-run="${esc(app.id)}" data-app-action="${esc(action)}">${esc(actionLabels[action] || action)}</button>`).join('');
+    const details = [
+      `Path: ${app.path}`,
+      app.version ? `Version: ${app.version}` : null,
+      app.bundle_id ? `Bundle: ${app.bundle_id}` : null,
+      app.usage ? `Usage: ${app.usage}` : null,
+      app.flags.length ? `Flags: ${app.flags.slice(0, 12).join(' ')}${app.flags.length > 12 ? ` … +${app.flags.length - 12}` : ''}` : null
+    ].filter(Boolean).map(line => `<p>${esc(line)}</p>`).join('');
+    return `<section class="ledger-card"><div class="ledger-head"><span>${app.kind === 'app' ? '▣' : '›_'}</span><h2>${esc(app.name)}</h2><small>${esc(app.kind)} · ${esc(app.risk)} risk</small></div>${details}<div class="settings-actions">${actions}</div></section>`;
+  }).join('') : '<section class="ledger-card"><div class="ledger-empty">No applications digested yet. Inspect a local program to record its version, usage, and flags.</div></section>';
+
+  host.innerHTML = `<div class="page-heading"><div class="eyebrow">CAPABILITY DIGEST</div><h1>Applications</h1><p>Threadline can read a local program’s help and version output, record its capabilities, and later run only the reviewed actions. It runs the exact path without a shell and refuses if the program changed.</p></div><form id="inspect-app-form" class="settings-card wide-card"><div class="settings-card-heading"><span class="settings-icon warm">▣</span><div><h2>Teach Threadline an application</h2><p>Absolute path to an executable or a macOS .app bundle</p></div><span class="module-label">DIGEST MODULE</span></div><label class="field-label" for="app-path">Application path</label><input id="app-path" name="path" placeholder="/usr/bin/git or /Applications/Safari.app" autocomplete="off" required /><div class="settings-actions"><button class="primary-button" type="submit">Inspect application</button><span id="app-inspect-feedback" role="status"></span></div><p class="local-service-note">Inspection runs the program with only <code>--help</code> and <code>--version</code> (or reads the bundle metadata for an app). Each later action asks for confirmation. The digest is stored under <code>.engram/capabilities/</code> in this vault.</p></form><div class="ledger-grid">${cards}</div>${appResult ? `<pre class="app-result" aria-live="polite">${esc(appResult)}</pre>` : ''}`;
+
+  $('#inspect-app-form').addEventListener('submit', event => { event.preventDefault(); inspectApplication($('#app-path').value.trim()); });
+  host.querySelectorAll('[data-app-run]').forEach(button => button.addEventListener('click', () => runApplication(button.dataset.appRun, button.dataset.appAction)));
+  if (!appsLoaded) { appsLoaded = true; loadApps(); }
+}
+
+async function loadApps() {
+  try {
+    const response = await fetch('/api/v1/apps');
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error?.message || 'Could not load application digests.');
+    appDigests = data.apps || [];
+    renderWorkspaceView();
+  } catch (error) {
+    appResult = `Could not load application digests: ${error.message}`;
+    renderWorkspaceView();
+  }
+}
+
+async function inspectApplication(path) {
+  if (!path) return;
+  appResult = `Inspecting ${path}…\nThis runs --help and --version with a timeout.`;
+  renderWorkspaceView();
+  try {
+    const response = await fetch('/api/v1/apps/inspect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path }) });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error?.message || 'Inspection failed.');
+    appResult = `Digested ${data.name} (${data.kind}).\nPath: ${data.path}\nVersion: ${data.version || 'not reported'}\nActions: ${data.actions.join(', ')}\nFlags found: ${data.flags.length}\n\n${data.help_excerpt || ''}`;
+    await loadApps();
+    toast(`${data.name} was added to Threadline’s capability digest.`);
+  } catch (error) {
+    appResult = `Inspection failed: ${error.message}`;
+    renderWorkspaceView();
+  }
+}
+
+async function runApplication(id, action) {
+  const app = appDigests.find(item => item.id === id);
+  if (!app) return;
+  const approved = await confirmToolAction(`Run ${app.name}?\n\nAction: ${action}\nPath: ${app.path}\n\nThis runs the exact program without a shell. The digest refuses to run if the program changed since inspection.`);
+  if (!approved) return;
+  appResult = `Running ${app.name} · ${action}…`;
+  renderWorkspaceView();
+  try {
+    const response = await fetch('/api/v1/apps/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, action }) });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error?.message || 'The application could not run.');
+    appResult = `$ ${app.path} · ${action}\n\n${data.stdout || '(no standard output)'}${data.stderr ? `\n\n[stderr]\n${data.stderr}` : ''}\n\nExit: ${data.status ?? 'unknown'}`;
+    renderWorkspaceView();
+  } catch (error) {
+    appResult = `Run failed: ${error.message}`;
+    renderWorkspaceView();
+  }
 }
 
 async function refreshOmlxStatus() {
@@ -236,7 +373,8 @@ async function submitMessage(message) {
   const userTurn = appendTurn({ role: 'user', content: message.trim() });
   let convo = current();
   if (settings.memoryEnabled) { updateMemory(recordAndUpdate(convo.memory, userTurn)); convo = current(); }
-  const evidence = settings.memoryEnabled && settings.strategy !== 'recent' ? retrieveEvidence(convo.turns, message, convo.memory, 5) : [];
+  const historyForPrompt = endpoint.kind === 'remote' ? filterRemoteHistory(convo.turns) : convo.turns;
+  const evidence = settings.memoryEnabled && settings.strategy !== 'recent' ? retrieveEvidence(historyForPrompt, message, convo.memory, 5) : [];
   let vaultResult = { indexed: false, hits: [] }; let vaultSearchError = null;
   if (allowVaultContext) {
     try {
@@ -248,7 +386,7 @@ async function submitMessage(message) {
     }
   }
   const decision = evaluateRules({ message, memory: convo.memory, evidence, settings, vaultResult, vaultSearchError });
-  const pack = packContext({ message, history: convo.turns, memory: settings.memoryEnabled && settings.strategy !== 'recent' ? convo.memory : { ...convo.memory, currentGoal: [], activeTopics: [], decisions: [], constraints: [], preferences: [], openQuestions: [] }, evidence: settings.strategy === 'state' ? [] : evidence, vaultNotes: vaultResult.hits || [], vaultContextAllowed: allowVaultContext, settings });
+  const pack = packContext({ message, history: historyForPrompt, memory: settings.memoryEnabled && settings.strategy !== 'recent' ? convo.memory : { ...convo.memory, currentGoal: [], activeTopics: [], decisions: [], constraints: [], preferences: [], openQuestions: [] }, evidence: settings.strategy === 'state' ? [] : evidence, vaultNotes: vaultResult.hits || [], vaultContextAllowed: allowVaultContext, settings });
   if (endpoint.kind === 'remote') {
     const approved = await confirmDisclosure({ endpoint: endpoint.origin, apiKey: getSessionApiKey(), categories: requestCategories({ messages: pack.messages, tools: modelTools }), chars: JSON.stringify(pack.messages).length });
     if (!approved) { toast('Remote request cancelled. Your message remains in local history.'); sending = false; $('#send-button').textContent = '↑'; renderAll(); return; }
@@ -297,6 +435,9 @@ async function submitMessage(message) {
           getMemory: () => current().memory,
           newConversation: () => { createConversation(); switchView('chat'); renderAll(); },
           clearWorkspace: () => { clearWorkspace(); createConversation(); switchView('chat'); renderAll(); },
+          inspectApplication: inspectApplicationForTool,
+          listApplications: listApplicationsForTool,
+          runApplication: runApplicationForTool,
           confirm: message => confirmToolAction(message)
         };
         const isProjectTool = call.function.name.startsWith('project_') || call.function.name === 'run_project_check';
@@ -304,14 +445,15 @@ async function submitMessage(message) {
           ? { ok: false, code: 'local_inference_required', error: 'Project tools are disabled for remote inference. Connect a loopback on-device model to keep Engram source offline.' }
           : isProjectTool
             ? await executeProjectAction(call.function.name, call.function.arguments, actionCallbacks)
-            : executeApplicationAction(call.function.name, call.function.arguments, actionCallbacks);
+             : await executeApplicationAction(call.function.name, call.function.arguments, actionCallbacks);
         toolMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(result) });
       }
       requestMessages = [...requestMessages, { role: 'assistant', content: null, tool_calls: toolCalls }, ...toolMessages];
       renderStatus(); renderInspector();
     }
     placeholder.remove();
-    appendTurn({ role: 'assistant', content: answer || 'The model returned an empty response.', sourceTurnIds: settings.showEvidence ? pack.audit.selected.filter(item => item.kind.startsWith('source')).flatMap(item => item.sourceTurnIds) : [], sourceNoteIds: settings.showEvidence ? pack.audit.selected.flatMap(item => item.sourceNoteIds || []) : [], estimatedTokens: pack.audit.estimatedInputTokens });
+    const vaultSourceNoteIds = [...new Set(pack.audit.selected.flatMap(item => item.sourceNoteIds || []))];
+    appendTurn({ role: 'assistant', content: answer || 'The model returned an empty response.', sourceTurnIds: settings.showEvidence ? pack.audit.selected.filter(item => item.kind.startsWith('source')).flatMap(item => item.sourceTurnIds) : [], sourceNoteIds: settings.showEvidence ? vaultSourceNoteIds : [], vaultSourceNoteIds, vaultProvenanceKnown: true, estimatedTokens: pack.audit.estimatedInputTokens });
   } catch (error) {
     placeholder?.remove();
     if (error.name === 'AbortError') appendTurn({ role: 'assistant', content: 'Generation stopped.' });
@@ -354,3 +496,4 @@ subscribe(() => { renderThreads(); renderStatus(); renderInspector(); });
 applyAccent(getWorkspace().settings.accent || 'green');
 if (!getWorkspace().conversations.length) createConversation();
 renderAll();
+configureEmbeddedDefault();

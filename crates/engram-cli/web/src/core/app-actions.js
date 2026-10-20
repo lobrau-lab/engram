@@ -1,5 +1,6 @@
 import { applicationTools, getRegisteredTool, listRegisteredTools, validateToolArguments, validateToolManifest } from './tool-registry.js';
 import { authorizeToolInvocation, formatToolDisclosure } from './permission-gate.js';
+import { executeGuardedInvocation } from './agent-execution.js';
 
 export { applicationTools, listRegisteredTools };
 
@@ -14,7 +15,7 @@ function receipt(invocationId, tool, outcome, extra = {}) {
 export function listAuditReceipts() { return auditReceipts.map(item => ({ ...item })); }
 
 /** Dispatch only registered app actions after schema validation and policy checks. */
-export function executeApplicationAction(name, rawArguments, callbacks = {}) {
+export async function executeApplicationAction(name, rawArguments, callbacks = {}) {
   const invocationId = callbacks.actionId || crypto.randomUUID();
   if (completedInvocations.has(invocationId)) return completedInvocations.get(invocationId);
   let args;
@@ -34,48 +35,50 @@ export function executeApplicationAction(name, rawArguments, callbacks = {}) {
   const validationError = validateToolArguments(tool, args);
   if (validationError) { receipt(invocationId, tool, 'denied', { code: 'invalid_arguments' }); return { ok: false, code: 'invalid_arguments', error: validationError }; }
 
-  const authorization = authorizeToolInvocation(tool, args, callbacks);
-  if (!authorization.allowed) {
-    receipt(invocationId, tool, authorization.cancelled ? 'cancelled' : 'denied', { code: authorization.code });
-    return {
-      ok: false,
-      code: authorization.code,
-      cancelled: Boolean(authorization.cancelled),
-      error: authorization.message,
-      invocationId
-    };
-  }
-
-  switch (name) {
-    case 'open_workspace_view':
-      if (typeof callbacks.openView !== 'function') return unavailable('openView');
-      callbacks.openView(args.view);
-      return complete(invocationId, { ok: true, opened: args.view }, tool);
-
-    case 'update_workspace_settings':
-      if (!Object.keys(args).length) return { ok: false, code: 'invalid_arguments', error: 'Provide at least one supported setting.' };
-      if (typeof callbacks.updateSettings !== 'function') return unavailable('updateSettings');
-      callbacks.updateSettings(args);
-      return complete(invocationId, { ok: true, updated: args }, tool);
-
-    case 'inspect_conversation_memory':
-      if (typeof callbacks.getMemory !== 'function') return unavailable('getMemory');
-      return complete(invocationId, { ok: true, memory: callbacks.getMemory() }, tool);
-
-    case 'start_new_conversation':
-      if (typeof callbacks.newConversation !== 'function') return unavailable('newConversation');
-      callbacks.newConversation();
-      return complete(invocationId, { ok: true, action: 'new_conversation_created' }, tool);
-
-    case 'clear_local_workspace':
-      if (typeof callbacks.clearWorkspace !== 'function') return unavailable('clearWorkspace');
-      callbacks.clearWorkspace();
-      return complete(invocationId, { ok: true, action: 'workspace_cleared' }, tool);
-
-    default:
-      // The registry is the allowlist; fail closed if a handler is missing.
-      return { ok: false, code: 'unimplemented_tool', error: 'This registered action has no executor.' };
-  }
+  const authorization = await authorizeToolInvocation(tool, args, callbacks);
+  const execution = await executeGuardedInvocation({
+    proposal: { name, args },
+    connector: {
+      manifest: tool,
+      execute: async validatedArgs => {
+        switch (name) {
+          case 'open_workspace_view':
+            if (typeof callbacks.openView !== 'function') throw new Error('executor unavailable: openView');
+            callbacks.openView(validatedArgs.view); return { opened: validatedArgs.view };
+          case 'update_workspace_settings':
+            if (!Object.keys(validatedArgs).length) throw new Error('Provide at least one supported setting.');
+            if (typeof callbacks.updateSettings !== 'function') throw new Error('executor unavailable: updateSettings');
+            callbacks.updateSettings(validatedArgs); return { updated: validatedArgs };
+          case 'inspect_conversation_memory':
+            if (typeof callbacks.getMemory !== 'function') throw new Error('executor unavailable: getMemory');
+            return { memory: callbacks.getMemory() };
+          case 'start_new_conversation':
+            if (typeof callbacks.newConversation !== 'function') throw new Error('executor unavailable: newConversation');
+            callbacks.newConversation(); return { action: 'new_conversation_created' };
+          case 'clear_local_workspace':
+            if (typeof callbacks.clearWorkspace !== 'function') throw new Error('executor unavailable: clearWorkspace');
+            callbacks.clearWorkspace(); return { action: 'workspace_cleared' };
+          case 'inspect_local_application':
+            if (typeof callbacks.inspectApplication !== 'function') throw new Error('executor unavailable: inspectApplication');
+            return await callbacks.inspectApplication(validatedArgs.path);
+          case 'list_digested_applications':
+            if (typeof callbacks.listApplications !== 'function') throw new Error('executor unavailable: listApplications');
+            return { apps: await callbacks.listApplications() };
+          case 'run_digested_application':
+            if (typeof callbacks.runApplication !== 'function') throw new Error('executor unavailable: runApplication');
+            return await callbacks.runApplication(validatedArgs.id, validatedArgs.action);
+          default: throw new Error('unimplemented tool executor');
+        }
+      },
+      validateOutput: output => output && typeof output === 'object' ? null : 'connector result must be an object'
+    },
+    validateInput: () => null,
+    authorize: async () => authorization.allowed,
+    signal: callbacks.signal
+  });
+  if (!execution.ok && !authorization.allowed) return { ok: false, code: authorization.code, cancelled: Boolean(authorization.cancelled), error: authorization.message, invocationId, trace: execution.trace };
+  if (!execution.ok) return { ok: false, code: execution.error?.code || execution.state, error: execution.error?.message || execution.state, invocationId, trace: execution.trace };
+  return complete(invocationId, { ok: true, ...execution.output, trace: execution.trace }, tool);
 }
 
 function complete(invocationId, result, tool) {
@@ -108,7 +111,7 @@ export async function executeProjectAction(name, rawArguments, callbacks = {}) {
     receipt(invocationId, tool, 'cancelled', { code: 'approval_denied' });
     return { ok: false, code: 'approval_denied', cancelled: true, error: 'The user declined this action.', invocationId };
   }
-  const authorization = authorizeToolInvocation(tool, args, { confirm: () => true });
+  const authorization = await authorizeToolInvocation(tool, args, { confirm: () => true });
   if (!authorization.allowed) {
     receipt(invocationId, tool, 'denied', { code: authorization.code });
     return { ok: false, code: authorization.code, cancelled: Boolean(authorization.cancelled), error: authorization.message, invocationId };

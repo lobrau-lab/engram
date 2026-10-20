@@ -59,8 +59,8 @@ impl Index {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let conn = Connection::open(path)
-            .with_context(|| format!("opening index {}", path.display()))?;
+        let conn =
+            Connection::open(path).with_context(|| format!("opening index {}", path.display()))?;
         let idx = Self { conn };
         idx.init_schema()?;
         Ok(idx)
@@ -109,7 +109,8 @@ impl Index {
         for note in notes {
             let tags = note.tags.join(",");
             let links = note.links.join(",");
-            let embedding = f32s_to_bytes(&embedder.embed(&format!("{} {} {}", note.title, note.body, tags)));
+            let embedding =
+                f32s_to_bytes(&embedder.embed(&format!("{} {} {}", note.title, note.body, tags)));
             tx.execute(
                 "INSERT INTO notes(id, title, body, tags, links, mtime, embedding) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![note.id, note.title, note.body, tags, links, note.mtime, embedding],
@@ -134,6 +135,7 @@ impl Index {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![ts.to_string()],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -177,8 +179,7 @@ impl Index {
             params![note.id, note.title, note.body, tags, links, note.mtime, emb_bytes],
         )?;
 
-        tx.execute(
-            "DELETE FROM notes_fts WHERE id = ?1", params![note.id])?;
+        tx.execute("DELETE FROM notes_fts WHERE id = ?1", params![note.id])?;
         tx.execute(
             "INSERT INTO notes_fts(id, title, body, tags) VALUES(?1, ?2, ?3, ?4)",
             params![note.id, note.title, note.body, tags],
@@ -190,11 +191,9 @@ impl Index {
     pub fn get_note_body(&self, id: &str) -> Result<Option<String>> {
         let body: Option<String> = self
             .conn
-            .query_row(
-                "SELECT body FROM notes WHERE id = ?1",
-                params![id],
-                |r| r.get(0),
-            )
+            .query_row("SELECT body FROM notes WHERE id = ?1", params![id], |r| {
+                r.get(0)
+            })
             .optional()?;
         Ok(body)
     }
@@ -332,4 +331,32 @@ fn bytes_to_f32s(b: &[u8]) -> Vec<f32> {
         .iter()
         .map(|c| f32::from_le_bytes(*c))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Index;
+
+    #[test]
+    fn set_last_indexed_survives_reopening_the_index() {
+        let dir = std::env::temp_dir().join(format!(
+            "engram-index-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.sqlite");
+
+        {
+            let index = Index::open(&path).unwrap();
+            index.set_last_indexed(42).unwrap();
+        }
+        let reopened = Index::open(&path).unwrap();
+        assert_eq!(reopened.get_last_indexed().unwrap(), Some(42));
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
