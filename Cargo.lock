@@ -376,8 +376,10 @@ dependencies = [
  "anyhow",
  "clap",
  "engram-core",
+ "rand",
  "serde",
  "serde_json",
+ "sha2",
  "walkdir",
 ]
 

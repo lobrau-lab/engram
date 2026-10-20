@@ -6,8 +6,9 @@ These decisions prioritize the shortest path to a usable, private release.
 
 Engram ships first as a single Rust binary that opens a localhost browser
 workspace. This avoids a large native UI dependency and works on macOS, Linux,
-and Windows immediately. A native shell may wrap the same local service later
-without changing vault or inference behavior.
+and Windows immediately. There is no Tauri shell in the active path. A native
+shell may wrap the same local service later without changing vault, inference,
+or takeover behavior.
 
 ## Data model
 
@@ -24,9 +25,22 @@ binary parsing from becoming a launch blocker.
 
 ## Inference
 
-Engram uses standard OpenAI-compatible local endpoints. It discovers the first
-model advertised by `/v1/models` when no model is configured. No cloud endpoint
-is contacted by default, and no model is bundled with the application.
+On macOS 26+ with Apple Intelligence enabled, Threadline uses Apple Foundation
+Models in-process. There is no model server, API key, or model download. Other
+platforms and users who want a larger model can configure an OpenAI-compatible
+endpoint; no cloud endpoint is contacted by default.
+
+## Takeover
+
+macOS GUI takeover is implemented as an explicitly armed, time-boxed session.
+The human arms it; the model cannot. While armed, a local OpenAI-compatible
+endpoint with function-tool support may use `computer_use` without a prompt for
+every step. The built-in Apple model currently supports text chat only, and the
+tool is never offered to a remote endpoint. A persistent Stop control and
+`Escape` cancel the session and terminate in-flight local action processes.
+Actions are appended to `.engram/takeover/audit.jsonl`. This is intentionally
+broader than the hash-checked capability digest: the digest is safe intake,
+while takeover is real control with a visible boundary.
 
 ## Network policy
 

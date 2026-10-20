@@ -67,6 +67,9 @@ export async function executeApplicationAction(name, rawArguments, callbacks = {
           case 'run_digested_application':
             if (typeof callbacks.runApplication !== 'function') throw new Error('executor unavailable: runApplication');
             return await callbacks.runApplication(validatedArgs.id, validatedArgs.action);
+          case 'computer_use':
+            if (typeof callbacks.computerUse !== 'function') throw new Error('executor unavailable: computerUse');
+            return await callbacks.computerUse(validatedArgs);
           default: throw new Error('unimplemented tool executor');
         }
       },

@@ -26,6 +26,10 @@ This checklist is intentionally incomplete until each item has evidence.
 - [ ] Symlink, traversal, archive, and XSS testing
 - [ ] Local-only network behavior verified
 - [ ] API keys excluded from logs and release artifacts
+- [ ] Takeover permission prompts, session expiry, Stop cancellation, and audit
+      verified on a clean macOS account
+- [ ] Accessibility helper signed/notarized or explicitly documented as a
+      local-development build
 
 ## Legal and operations
 

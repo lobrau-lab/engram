@@ -24,31 +24,32 @@ text) and fails closed when consent or provenance is missing.
   around.
 - A capability cannot be granted by model output alone. The human approves the
   disclosure, and the server enforces the resulting allow-list.
+- GUI control is never armed by the model. Only the human can start a timed
+  takeover session, and the session is always stoppable.
 - Self-improvement never silently rewrites the running binary.
 
 ## Current Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ Tauri desktop shell (planned)                                │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │ Threadline WebView                                    │  │
-│  │  chat · memory · rules · applications · workshop      │  │
-│  └──────────────────────────┬─────────────────────────────┘  │
-│                             │ same-origin HTTP / IPC         │
-│  ┌──────────────────────────▼─────────────────────────────┐  │
-│  │ Engram process                                        │  │
-│  │  vault + index · HTTP API · capability digest         │  │
-│  │  embedded inference (Apple Foundation Models)         │  │
-│  │  sync/import · backup/restore · audit                  │  │
-│  └────────────────────────────────────────────────────────┘  │
+│ Threadline browser UI (local, same-origin)                   │
+│  chat · memory · rules · applications · takeover · workshop  │
+└──────────────────────────┬───────────────────────────────────┘
+                           │ HTTP on 127.0.0.1
+┌──────────────────────────▼───────────────────────────────────┐
+│ Engram process                                                │
+│  vault + index · HTTP API · capability digest                 │
+│  embedded inference (Apple Foundation Models)                 │
+│  takeover sessions + audit · Swift Accessibility helper       │
+│  sync/import · backup/restore                                 │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-The current shipped shell is the local `engram open` / `engram serve` process
-with a WebView-compatible browser UI. The same process boundaries carry over to
-the Tauri shell: UI, vault/index, inference, and capability execution stay
-separate modules, and sensitive actions remain server-side.
+The shipped shell is the local `engram open` / `engram serve` process with a
+WebView-compatible browser UI. There is no Tauri layer: the browser tab is the
+presentation, and the Rust process owns every privileged operation. If a native
+wrapper is added later, it must call the same server endpoints rather than
+creating a second architecture.
 
 ### Threadline-first routing
 
@@ -86,13 +87,48 @@ Threadline can learn a local program in four increasing levels:
 3. **Adapt** — (planned) run the program through a typed adapter with a small,
    reviewed argument schema, still without a shell, still with per-invocation
    consent. Adapters are code-reviewed data, not model-generated commands.
-4. **Take over** — (deliberately out of scope for now) GUI automation or
-   session takeover. It requires a separate threat model, per-app accessibility
-   permissions, and a visible stop control.
+4. **Take over** — implemented for macOS. A timed, human-armed session enables
+   real Accessibility and CoreGraphics control. This is a separate consent path
+   from the digest: inspecting a program never grants control, and the model
+   cannot arm a session.
 
 License compliance is part of step 1: the digest records where the program came
 from and never copies or redistributes its code. Absorbing an app means learning
 its interface, not relicensing its implementation.
+
+### Takeover (macOS)
+
+The `Takeover` view exposes a small Swift helper compiled at build time. It
+supports status, app focus, window and accessibility-tree inspection, key
+presses, typing, clicks, scroll, drag, named-control press, value setting,
+application launch, AppleScript, and screen capture. macOS Accessibility
+permission is required; screen capture also needs Screen Recording permission.
+
+The safety model is a session, not a per-step dialog:
+
+- The session is armed by the human in the UI for 1–120 minutes. The server
+  returns a random token to that browser tab; the status endpoint never returns
+  it. A session armed in another tab cannot be driven by this tab.
+- While armed, the `computer_use` tool is approved by the session instead of a
+  per-action confirmation. It is offered only to a local OpenAI-compatible
+  endpoint with function-tool support, never to a remote endpoint. The built-in
+  Apple Foundation Models provider currently supports text chat only.
+- The top bar shows a live countdown and a Stop control. `Escape` also stops the
+  session. Stopping increments a server-side epoch, clears the token, and
+  terminates in-flight helper actions or AppleScript.
+- Session arm, stop, expiry, and every action are appended to
+  `.engram/takeover/audit.jsonl` with the action, summary, success flag, and
+  timestamp. Typed text and field values are recorded by length, not content.
+- The local HTTP server handles each connection on its own thread so Stop,
+  status, and inference remain responsive while an action is running. On-device
+  inference is serialized separately.
+- The helper is extracted under `~/Library/Caches/Engram/bin` and is rebuilt if
+  its embedded bytes change. On non-macOS builds the feature reports
+  unavailable; the rest of Engram still works.
+
+AppleScript is intentionally unrestricted inside an armed session and can run
+shell commands. The session, audit, and kill switch are the boundaries. There is
+no per-app automation allow-list yet.
 
 ### Consent, audit, and privacy
 
@@ -103,8 +139,8 @@ its interface, not relicensing its implementation.
   open a disclosure with the exact path, action, and data classes involved.
 - Capability runs re-check the binary hash. A stale digest is not a permission
   grant.
-- Audit receipts are kept in memory for the session and written to the vault
-  only when a durable audit log is enabled.
+- Takeover actions require a live session token and are written durably to
+  `.engram/takeover/audit.jsonl`. Tool receipts stay in memory for the session.
 - Synced folders are untrusted. Import validates every manifest path, rejects
   hidden and non-Markdown entries, canonicalizes the source root, and refuses
   symlink escapes.
@@ -136,31 +172,41 @@ Until the sandbox and apply steps exist, code changes go through the normal
 project tools and the repository's tests. The workshop model cannot invoke
 tools, run commands, or write to the live tree.
 
-## Tauri Migration
+## Desktop shell
 
-The desktop shell is a delivery detail, not a second architecture. The migration
-keeps the tested server-side boundaries and replaces the browser tab with a
-Tauri window:
+The current desktop shell is deliberately boring: a local Rust process plus a
+browser UI. Tauri is not required and is not in the dependency tree or the active
+plan. The browser tab loads only same-origin assets served by Engram, and every
+sensitive operation still happens server-side. This keeps the presentation layer
+replaceable without rebuilding the security boundary.
 
-- Tauri commands call the same Rust modules; the HTTP server remains available
-  only as a locked-down headless fallback.
-- The WebView loads Threadline first.
-- Secrets move to the OS keychain.
-- The workshop and capability adapters get native dialogs for consent.
-- Release builds are signed, notarized where applicable, and shipped with
-  checksums.
+If a native wrapper is ever justified, it should:
+
+- call the same HTTP endpoints and reuse the same session/token model;
+- keep the vault/index, inference, and capability execution in the existing
+  process boundaries;
+- move secrets to the OS keychain;
+- add signed, notarized distribution and native consent dialogs.
+
+Those are delivery improvements, not prerequisites for the personal
+installation.
 
 ## Presentation Checklist
 
 - [x] Threadline is the first screen.
 - [x] On-device model runs in-process without a model server.
 - [x] Capability digest works end to end for a local CLI and a macOS app.
-- [x] Every capability run is confirmed and hash-checked.
+- [x] Capability runs are confirmed and hash-checked; takeover actions require an
+      armed session.
 - [x] Host/Origin/CSRF, traversal, hidden-path, and symlink protections are
       covered by tests.
 - [x] JavaScript and Rust tests run in CI.
-- [ ] Tauri window and native keychain.
+- [x] Armed macOS takeover with Accessibility, audit, persistent Stop, and
+      immediate cancellation of in-flight action processes.
+- [x] No Tauri dependency; the browser UI is the shipped shell.
 - [x] Workshop proposal path with bounded source access (review-only).
 - [ ] Workshop sandbox tests and approved apply.
-- [ ] Durable audit log and one-click export/delete review screen.
+- [ ] Per-app takeover adapters or allow-lists.
+- [ ] Native keychain.
+- [ ] Durable general audit export and delete review (takeover audit is durable).
 - [ ] Accessibility pass on the Threadline shell.

@@ -19,6 +19,7 @@ The Application is designed to process user content on the device where it runs.
 - pending Dump/import files and extraction results;
 - Threadline conversations, derived memory, settings, and context-assembly records in the browser’s local storage;
 - provider configuration, with the API key held in page-session memory only;
+- takeover session tokens in browser and server memory, and takeover audit entries, temporary AppleScript output, and optional screen captures under `.engram/takeover/`;
 - encrypted backup files you choose to create and store.
 
 This is local storage by the Application, not collection by the Owner. The Application does not currently provide an owner-operated server that receives or stores your vault or conversation history. Data remains on your device until you or another program deletes, moves, or modifies it. Removing a conversation from Threadline does not necessarily remove notes, imported files, browser backups, or files in the vault.
@@ -29,11 +30,11 @@ Provider API keys are removed from legacy local-storage state on load and are no
 
 ### Local inference
 
-When configured to use an inference server on the same device, Threadline sends prompts to that local server over loopback HTTP. This is local network traffic, not literal zero-network operation. The local inference server may have its own logs, storage, or network behavior; review that software separately.
+On macOS 26+ with Apple Intelligence enabled, Threadline uses Apple Foundation Models inside the Engram process. No prompt is sent over a network for that path. If you instead configure an inference server on the same device, Threadline sends prompts to that local server over loopback HTTP. This is local network traffic, not literal zero-network operation. The local inference server may have its own logs, storage, or network behavior; review that software separately.
 
 ### User-configured remote inference
 
-Threadline can be configured with an OpenAI-compatible inference endpoint, including a server hosted by a third party. When you send a chat request to a remote endpoint, the request may contain your current message, system instructions, selected recent turns, derived conversation memory, retrieved conversation evidence, and—if enabled—retrieved Engram note excerpts. Follow-up requests may include model responses and results from local Threadline tools. If configured, the API key is sent in the authorization header.
+Threadline can be configured with an OpenAI-compatible inference endpoint, including a server hosted by a third party. When you send a chat request to a remote endpoint, the request may contain your current message, system instructions, selected recent turns, derived conversation memory, retrieved conversation evidence, and—if enabled—retrieved Engram note excerpts. Follow-up requests may include model responses and results from local Threadline tools. The macOS `computer_use` tool is never offered to a remote endpoint. If configured, the API key is sent in the authorization header.
 
 The remote provider receives and processes the request under its own terms and settings. The Owner does not control its retention, training, access, or deletion practices. Review that provider’s privacy and data-use terms before sending personal, confidential, or regulated information. The current prototype does not yet provide a complete per-request privacy review or data-redaction boundary for remote inference.
 
@@ -45,7 +46,7 @@ Threadline uses bundled assets and system font stacks; it does not load Google F
 
 ### No telemetry service
 
-The current repository does not configure an Engram-operated analytics or telemetry service. This statement does not cover the Google Fonts request above, user-configured inference endpoints, your operating system, browser, or tools you use to install and run the Application.
+The current repository does not configure an Engram-operated analytics or telemetry service. This statement does not cover user-configured inference endpoints, your operating system, browser, or tools you use to install and run the Application.
 
 ## 4. Information the Owner may receive directly
 
@@ -81,4 +82,4 @@ This policy describes information handling; it does not grant a software license
 
 ---
 
-**Publication checklist:** Verify runtime network requests, remove or intentionally retain the Google Fonts connection, implement remote-inference disclosure and safer credential storage, identify any payment processor before accepting payment, and obtain jurisdiction-specific legal review. Privacy and security claims should match observed product behavior; see the [FTC privacy and security guidance](https://www.ftc.gov/business-guidance/privacy-security).
+**Publication checklist:** Verify runtime network requests and third-party startup assets, implement remote-inference disclosure and safer credential storage, identify any payment processor before accepting payment, and obtain jurisdiction-specific legal review. Privacy and security claims should match observed product behavior; see the [FTC privacy and security guidance](https://www.ftc.gov/business-guidance/privacy-security).

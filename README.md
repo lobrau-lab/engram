@@ -35,6 +35,8 @@ Local-first, AI-native "second brain" MVP.
   no separate model server, API key, or model download.
 - **Optional OpenAI-compatible** endpoints (MLX-Serve / oMLX / vLLM / llama.cpp)
   for other platforms or larger models.
+- **Armed macOS takeover** through Accessibility and CoreGraphics, with a timed
+  session, a persistent stop control, and a local audit log.
 - **Folder-based** last-write-wins sync with conflict files.
 
 The local workspace runs on macOS, Linux, and Windows. It binds to localhost
@@ -46,13 +48,16 @@ Threadline is the front door. `engram open` opens the Threadline workspace at
 `/`; the Markdown vault remains available at `/vault`. Threadline is a
 local-first chat and agent workspace whose source snapshot lives under
 `crates/engram-cli/web/`. Engram embeds those assets in the binary, so there is
-no separate frontend build or model server.
+no separate frontend build or model server. The running app is the local Rust
+process plus the browser UI; there is no Tauri shell in the current path. A
+native wrapper can be added later without changing the server-side boundaries.
 
 On macOS 26+ with Apple Intelligence enabled, Threadline uses the operating
 system's Foundation Models model **inside the Engram process**. There is no
 API key, no model download, and no loopback model server. The app detects the
 built-in model on first launch and selects it automatically. **Connections &
 settings** shows its readiness and lets you switch back to it at any time.
+The built-in provider currently supports text chat, not function-tool calls.
 
 Threadline conversations, settings, and derived conversation memory remain in
 browser `localStorage`; Engram notes and the SQLite index remain in the vault.
@@ -80,8 +85,39 @@ The digest can run only the actions reviewed during inspection (`--help`,
 `--version`, or opening an app bundle). It never uses a shell, accepts no
 arbitrary arguments from the model, re-checks the hash before every run, and
 asks for confirmation each time. A replaced binary fails closed until it is
-inspected again. This is the safe foundation for teaching Threadline new
-applications; broader GUI takeover is intentionally not enabled.
+inspected again. This is the safe intake path; it does not grant control by
+itself.
+
+### Takeover (macOS)
+
+**Takeover** is Threadline's broader GUI-control surface. A small Swift helper,
+compiled at build time with `xcrun swiftc`, bridges macOS Accessibility and
+CoreGraphics. Threadline can inspect the accessibility tree, list windows,
+focus an application, press keys, type, click, scroll, drag, click a named
+control, set a field value, open an app, run AppleScript, and capture the
+screen.
+
+Control is off by default. Open **Takeover**, grant Accessibility (and Screen
+Recording if you want captures), choose a session length from 1 to 120 minutes,
+and press **Arm takeover**. While the session is armed, a local
+OpenAI-compatible endpoint that supports function tools may invoke the
+`computer_use` tool without a prompt for every step. The built-in Apple model is
+currently text-only, so use a compatible local endpoint for model-driven
+takeover. The top bar shows a live countdown and **Stop** button; pressing
+`Escape` also stops the session. Bounded request workers let Stop terminate an
+in-flight helper action or AppleScript. Session arm, stop, expiry, and every
+action are appended to `.engram/takeover/audit.jsonl`.
+
+The `computer_use` tool is only offered to a local inference endpoint that
+supports function tools. A remote endpoint never receives it. The helper is
+extracted under `~/Library/Caches/Engram/bin`; macOS may ask for Accessibility
+permission again after a rebuild. The rest of Engram keeps working if the helper
+cannot be built.
+
+This is real control: AppleScript can automate applications and can run shell
+commands. The session boundary, audit log, and kill switch are the safety model,
+not a claim that arbitrary automation is harmless. Only arm a session while you
+are present and intend to let the agent act.
 
 ### Workshop
 
@@ -103,9 +139,17 @@ engram/
 ├── Cargo.toml
 ├── .github/workflows/ci.yml
 └── crates/
-    ├── engram-core/   # config, vault, index, embed, ai, sync
+    ├── engram-core/   # config, vault, index, embed, ai, sync, embedded inference
     └── engram-cli/    # the `engram` binary
+        ├── native/control.swift  # macOS Accessibility / CoreGraphics helper
+        ├── src/serve.rs          # local-only HTTP API and Threadline routes
+        ├── src/takeover.rs       # armed sessions, audit, helper extraction
+        └── web/                  # Threadline UI embedded in the binary
 ```
+
+On macOS, the takeover helper is compiled during `cargo build` with
+`xcrun swiftc`. Install Xcode Command Line Tools if `xcrun` is missing; the rest
+of Engram still builds and reports takeover as unavailable.
 
 ## Build
 
@@ -142,6 +186,15 @@ $BIN --vault /tmp/brain export /tmp/sync
 
 ## Known gaps (v0.1)
 
+- GUI takeover is macOS-only. Linux and Windows report the feature unavailable.
+- Takeover needs Accessibility permission, and screen capture needs Screen
+  Recording permission. The helper is unsigned and may need to be re-approved
+  after a rebuild.
+- An armed takeover session lives in the server process. Closing or reloading
+  the tab sends a best-effort disarm; if that request is lost, the session
+  remains until it expires.
+- AppleScript is intentionally unrestricted inside an armed session. There is no
+  per-application AppleScript allow-list yet.
 - No deletion propagation (no tombstones yet).
 - Lamport counter is global, not per-entry/per-device.
 - Shared manifest can race if two devices export simultaneously.

@@ -1,3 +1,4 @@
+use crate::takeover::{Failure as TakeoverFailure, Takeover};
 use anyhow::{Context, Result};
 use engram_core::ai::ChatOpts;
 use engram_core::capability;
@@ -11,11 +12,58 @@ use engram_core::{
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 512 * 1024;
+const MAX_ACTIVE_CONNECTIONS: usize = 64;
+
+struct ConnectionLimiter {
+    active: AtomicUsize,
+}
+
+struct ConnectionPermit {
+    limiter: Arc<ConnectionLimiter>,
+}
+
+impl ConnectionLimiter {
+    fn new() -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<ConnectionPermit> {
+        let mut active = self.active.load(Ordering::Relaxed);
+        loop {
+            if active >= MAX_ACTIVE_CONNECTIONS {
+                return None;
+            }
+            match self.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(ConnectionPermit {
+                        limiter: Arc::clone(self),
+                    })
+                }
+                Err(current) => active = current,
+            }
+        }
+    }
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.limiter.active.fetch_sub(1, Ordering::Release);
+    }
+}
 
 pub fn run(vault: &Path, project_root: Option<&Path>, host: &str, port: u16) -> Result<()> {
     validate_bind_host(host)?;
@@ -55,6 +103,8 @@ fn run_listener(
         .transpose()?;
     let address = listener.local_addr()?;
     let url = format!("http://{address}");
+    let takeover = Arc::new(Takeover::new(vault.to_path_buf()));
+    let connections = Arc::new(ConnectionLimiter::new());
     println!("Engram workspace: {url}");
     println!("Local-only server; press Ctrl-C to stop.");
     if launch_browser {
@@ -74,8 +124,27 @@ fn run_listener(
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(error) = handle(vault, project_root.as_deref(), stream, address) {
-                    eprintln!("request failed: {error:#}");
+                let Some(permit) = connections.try_acquire() else {
+                    let mut stream = stream;
+                    let _ = stream.write_all(&response(
+                        503,
+                        "text/plain; charset=utf-8",
+                        "local workspace is busy",
+                    ));
+                    continue;
+                };
+                let vault = vault.to_path_buf();
+                let project_root = project_root.clone();
+                let takeover = Arc::clone(&takeover);
+                if let Err(error) = std::thread::Builder::new().spawn(move || {
+                    let _permit = permit;
+                    if let Err(error) =
+                        handle(&vault, project_root.as_deref(), &takeover, stream, address)
+                    {
+                        eprintln!("request failed: {error:#}");
+                    }
+                }) {
+                    eprintln!("could not start request worker: {error}");
                 }
             }
             Err(error) => eprintln!("connection failed: {error}"),
@@ -97,6 +166,7 @@ struct Request {
 fn handle(
     vault: &Path,
     project_root: Option<&Path>,
+    takeover: &Takeover,
     mut stream: TcpStream,
     address: SocketAddr,
 ) -> Result<()> {
@@ -104,7 +174,7 @@ fn handle(
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let response = match read_request(&mut stream) {
         Ok(request) => match validate_request(&request, address) {
-            Ok(()) => match dispatch(vault, project_root, &request) {
+            Ok(()) => match dispatch(vault, project_root, takeover, &request) {
                 Ok(response) => response,
                 Err(error) => {
                     eprintln!("request failed: {error:#}");
@@ -139,6 +209,10 @@ fn validate_request(request: &Request, address: SocketAddr) -> Result<()> {
     if request.method == "GET" || request.method == "HEAD" {
         return Ok(());
     }
+    anyhow::ensure!(
+        request.origin.is_some() || request.sec_fetch_site.is_some(),
+        "missing request origin metadata"
+    );
     if let Some(origin) = &request.origin {
         anyhow::ensure!(
             origin_is_local(origin, &request.host),
@@ -179,7 +253,12 @@ fn origin_is_local(origin: &str, host: &str) -> bool {
         .eq_ignore_ascii_case(&format!("http://{}", host.trim().to_ascii_lowercase()))
 }
 
-fn dispatch(vault: &Path, project_root: Option<&Path>, request: &Request) -> Result<Vec<u8>> {
+fn dispatch(
+    vault: &Path,
+    project_root: Option<&Path>,
+    takeover: &Takeover,
+    request: &Request,
+) -> Result<Vec<u8>> {
     let (path, query) = request
         .target
         .as_str()
@@ -235,6 +314,17 @@ fn dispatch(vault: &Path, project_root: Option<&Path>, request: &Request) -> Res
         ("POST", "/api/v1/apps/run") => run_app(vault, body),
         ("GET", "/api/v1/workshop") => list_workshop(vault),
         ("POST", "/api/v1/workshop/propose") => workshop_propose(project_root, vault, body),
+        ("GET", "/api/v1/takeover/status") => takeover_status(takeover),
+        ("POST", "/api/v1/takeover/arm") if local_control => takeover_arm(takeover, body),
+        ("POST", "/api/v1/takeover/disarm") if local_control => takeover_disarm(takeover),
+        ("POST", "/api/v1/takeover/action") if local_control => takeover_action(takeover, body),
+        ("POST", "/api/v1/takeover/permission") if local_control => takeover_permission(takeover),
+        ("GET", path) if path.starts_with("/api/v1/takeover/screenshot/") => {
+            takeover_screenshot(takeover, path)
+        }
+        ("POST", path) if path.starts_with("/api/v1/takeover/") => {
+            project_error(403, "local control header required")
+        }
         ("GET", "/v1/models") => embedded_models(),
         ("POST", "/v1/chat/completions") => chat_completions(body),
         ("GET", "/api/v1/inference/omlx") => omlx_status(),
@@ -279,6 +369,8 @@ fn dispatch(vault: &Path, project_root: Option<&Path>, request: &Request) -> Res
 struct ChatCompletionRequest {
     #[serde(default)]
     messages: Vec<ChatMessage>,
+    #[serde(default)]
+    tools: Vec<serde_json::Value>,
     #[serde(default)]
     stream: bool,
     #[serde(default)]
@@ -337,6 +429,9 @@ fn chat_completions(body: &str) -> Vec<u8> {
         Ok(request) => request,
         Err(error) => return inference_error(400, &format!("invalid chat request: {error}")),
     };
+    if !request.tools.is_empty() {
+        return inference_error(400, "the built-in provider does not support function tools");
+    }
     if request.messages.is_empty() {
         return inference_error(400, "messages must contain at least one entry");
     }
@@ -406,6 +501,81 @@ struct InspectAppRequest {
 struct RunAppRequest {
     id: String,
     action: String,
+}
+
+#[derive(serde::Deserialize)]
+struct TakeoverArmRequest {
+    #[serde(default = "default_takeover_minutes")]
+    minutes: u64,
+}
+
+fn default_takeover_minutes() -> u64 {
+    15
+}
+
+fn takeover_status(takeover: &Takeover) -> Vec<u8> {
+    response(
+        200,
+        "application/json; charset=utf-8",
+        &takeover.status().to_string(),
+    )
+}
+
+fn takeover_arm(takeover: &Takeover, body: &str) -> Vec<u8> {
+    let request: TakeoverArmRequest = match serde_json::from_str(body) {
+        Ok(request) => request,
+        Err(error) => {
+            return takeover_error(400, &format!("invalid takeover arm request: {error}"))
+        }
+    };
+    match takeover.arm(request.minutes) {
+        Ok(value) => response(200, "application/json; charset=utf-8", &value.to_string()),
+        Err(error) => takeover_failure(error),
+    }
+}
+
+fn takeover_disarm(takeover: &Takeover) -> Vec<u8> {
+    response(
+        200,
+        "application/json; charset=utf-8",
+        &takeover.disarm().to_string(),
+    )
+}
+
+fn takeover_action(takeover: &Takeover, body: &str) -> Vec<u8> {
+    match takeover.action(body) {
+        Ok(value) => response(200, "application/json; charset=utf-8", &value.to_string()),
+        Err(error) => takeover_failure(error),
+    }
+}
+
+fn takeover_permission(takeover: &Takeover) -> Vec<u8> {
+    match takeover.request_permission() {
+        Ok(value) => response(200, "application/json; charset=utf-8", &value.to_string()),
+        Err(error) => takeover_failure(error),
+    }
+}
+
+fn takeover_screenshot(takeover: &Takeover, path: &str) -> Vec<u8> {
+    let name = path
+        .strip_prefix("/api/v1/takeover/screenshot/")
+        .unwrap_or_default();
+    match takeover.screenshot_bytes(name) {
+        Ok(bytes) => response_bytes(200, "image/png", &bytes),
+        Err(error) => takeover_failure(error),
+    }
+}
+
+fn takeover_failure(error: TakeoverFailure) -> Vec<u8> {
+    takeover_error(error.status, &error.message)
+}
+
+fn takeover_error(status: u16, message: &str) -> Vec<u8> {
+    response(
+        status,
+        "application/json; charset=utf-8",
+        &serde_json::json!({ "ok": false, "error": message }).to_string(),
+    )
 }
 
 fn list_apps(vault: &Path) -> Vec<u8> {
@@ -1728,8 +1898,8 @@ fn markdown_html(markdown: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        has_hidden_component, host_is_local, is_markdown, origin_is_local, threadline_asset,
-        validate_bind_host,
+        chat_completions, has_hidden_component, host_is_local, is_markdown, origin_is_local,
+        threadline_asset, validate_bind_host, validate_request, ConnectionLimiter, Request,
     };
     use std::net::SocketAddr;
     use std::path::Path;
@@ -1770,6 +1940,45 @@ mod tests {
         assert!(origin_is_local("http://127.0.0.1:8765", "127.0.0.1:8765"));
         assert!(!origin_is_local("http://evil.example", "localhost:8765"));
         assert!(!origin_is_local("null", "localhost:8765"));
+    }
+
+    #[test]
+    fn rejects_state_changes_without_origin_metadata() {
+        let address: SocketAddr = "127.0.0.1:8765".parse().unwrap();
+        let request = Request {
+            method: "POST".into(),
+            target: "/api/v1/takeover/arm".into(),
+            body: "{}".into(),
+            local_control: true,
+            host: "127.0.0.1:8765".into(),
+            origin: None,
+            sec_fetch_site: None,
+        };
+
+        assert!(validate_request(&request, address).is_err());
+    }
+
+    #[test]
+    fn embedded_chat_reports_unsupported_tool_calls() {
+        let response = chat_completions(
+            r#"{"messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"computer_use"}}]}"#,
+        );
+        let response = String::from_utf8_lossy(&response);
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(response.contains("does not support function tools"));
+    }
+
+    #[test]
+    fn connection_limiter_caps_active_requests_and_releases_slots() {
+        let limiter = std::sync::Arc::new(ConnectionLimiter::new());
+        let mut permits = (0..super::MAX_ACTIVE_CONNECTIONS)
+            .map(|_| limiter.try_acquire().expect("available slot"))
+            .collect::<Vec<_>>();
+
+        assert!(limiter.try_acquire().is_none());
+        drop(permits.pop());
+        assert!(limiter.try_acquire().is_some());
     }
 
     #[test]

@@ -40,6 +40,12 @@ export async function authorizeToolInvocation(tool, args = {}, callbacks = {}) {
   if (minimumApproval === 'confirm' && tool.approval !== 'confirm') {
     return denied('approval_policy_mismatch', 'This action requires confirmation under its capability policy.');
   }
+  // An explicitly armed, timed takeover session is the approval for computer
+  // control. The session is created by the user in the Takeover view, is
+  // bounded, audited, and can be stopped with Escape or the persistent pill.
+  if (tool.name === 'computer_use' && callbacks.trustedTakeover === true) {
+    return { allowed: true, trusted: true };
+  }
 
   const mustConfirm = minimumApproval === 'confirm' || tool.destination === 'remote' || ['medium', 'high', 'critical'].includes(tool.risk);
   if (!mustConfirm) return { allowed: true };

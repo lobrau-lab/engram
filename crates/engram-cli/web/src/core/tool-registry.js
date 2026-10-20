@@ -69,6 +69,43 @@ const registeredTools = [
     parameters: { type: 'object', properties: { id: { type: 'string', minLength: 1, maxLength: 120 }, action: { type: 'string', enum: ['help', 'version', 'open'] } }, required: ['id', 'action'], additionalProperties: false }
   },
   {
+    name: 'computer_use',
+    description: 'Control local macOS applications through the Accessibility and CoreGraphics bridge: focus apps, press keys, type, click, scroll, drag, click UI elements, set field values, open apps, run AppleScript, inspect windows or the accessibility tree, and capture the screen. Requires an armed takeover session in the Takeover view.',
+    effect: 'application_control',
+    scope: 'threadline:computer:control',
+    capability: 'Control local applications and the macOS desktop',
+    risk: 'critical',
+    destination: 'local',
+    dataClasses: ['Application names and UI labels', 'Keystrokes, typed text, and pointer coordinates', 'Screen captures', 'AppleScript source', 'Accessibility tree contents'],
+    approval: 'confirm',
+    confirmation: 'Threadline will control this Mac. This is only allowed while a timed takeover session is armed in the Takeover view.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['focus', 'windows', 'tree', 'key', 'type', 'click', 'move', 'scroll', 'drag', 'click_ui', 'set_value', 'open', 'applescript', 'screenshot'] },
+        app: { type: 'string', maxLength: 500 },
+        key: { type: 'string', maxLength: 80 },
+        text: { type: 'string', maxLength: 16000 },
+        role: { type: 'string', maxLength: 300 },
+        title: { type: 'string', maxLength: 300 },
+        value: { type: 'string', maxLength: 16000 },
+        source: { type: 'string', maxLength: 20000 },
+        button: { type: 'string', enum: ['left', 'right', 'middle'] },
+        x: { type: 'integer', minimum: -100000, maximum: 100000 },
+        y: { type: 'integer', minimum: -100000, maximum: 100000 },
+        x1: { type: 'integer', minimum: -100000, maximum: 100000 },
+        y1: { type: 'integer', minimum: -100000, maximum: 100000 },
+        x2: { type: 'integer', minimum: -100000, maximum: 100000 },
+        y2: { type: 'integer', minimum: -100000, maximum: 100000 },
+        dx: { type: 'integer', minimum: -200, maximum: 200 },
+        dy: { type: 'integer', minimum: -200, maximum: 200 },
+        depth: { type: 'integer', minimum: 1, maximum: 12 }
+      },
+      required: ['action'],
+      additionalProperties: false
+    }
+  },
+  {
     name: 'open_workspace_view',
     description: 'Open a view in the chat application.',
     effect: 'ui_navigation',
@@ -80,7 +117,7 @@ const registeredTools = [
     approval: 'none',
     parameters: {
       type: 'object',
-      properties: { view: { type: 'string', enum: ['chat', 'memory', 'rules', 'apps', 'settings'] } },
+      properties: { view: { type: 'string', enum: ['chat', 'memory', 'rules', 'apps', 'takeover', 'settings'] } },
       required: ['view'],
       additionalProperties: false
     }

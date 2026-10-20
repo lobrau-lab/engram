@@ -58,10 +58,10 @@ new desktop application crate provides the cross-platform shell and exposes a
 narrow command/query API to a web-based UI. The CLI remains a supported
 headless interface and shares the same core services.
 
-The desktop shell should use a Rust-native cross-platform WebView approach
-(Tauri or an equivalent reviewed option), but the first implementation task
-must validate packaging and local-only behavior before committing to a large UI
-framework dependency set.
+The current shell is the local `engram open` / `engram serve` process plus its
+same-origin browser UI. Tauri is not part of the active path. A future native
+wrapper should reuse the same narrow server API; packaging and local-only
+behavior must be validated before adding a large UI framework dependency set.
 
 ## Phases
 

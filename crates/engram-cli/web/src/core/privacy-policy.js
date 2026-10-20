@@ -14,6 +14,10 @@ export function canSendVaultContext(endpointValue, enabled) {
   return Boolean(enabled && endpoint.allowed && endpoint.kind === 'local');
 }
 
+export function supportsFunctionTools({ model, endpointOrigin, appOrigin }) {
+  return !(model === 'apple-on-device' && endpointOrigin === appOrigin);
+}
+
 export function requestCategories({ messages = [], tools = [] } = {}) {
   const categories = [];
   if (messages.some(item => item.role === 'user')) categories.push('current message');

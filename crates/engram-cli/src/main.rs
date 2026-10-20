@@ -11,6 +11,7 @@ use engram_core::{
 };
 
 mod serve;
+mod takeover;
 
 #[derive(Parser, Debug)]
 #[command(

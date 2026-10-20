@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { canSendVaultContext, classifyEndpoint, requestCategories } from '../src/core/privacy-policy.js';
+import { canSendVaultContext, classifyEndpoint, requestCategories, supportsFunctionTools } from '../src/core/privacy-policy.js';
 
 assert.equal(classifyEndpoint('http://localhost:8000/v1').kind, 'local');
 assert.equal(classifyEndpoint('http://127.0.0.1:8080/v1').kind, 'local');
@@ -10,6 +10,8 @@ assert.equal(classifyEndpoint('http://localhost.example/v1').allowed, false);
 assert.equal(classifyEndpoint('not a URL').allowed, false);
 assert.equal(canSendVaultContext('http://localhost:8000/v1', true), true);
 assert.equal(canSendVaultContext('https://provider.example/v1', true), false);
+assert.equal(supportsFunctionTools({ model: 'apple-on-device', endpointOrigin: 'http://127.0.0.1:8000', appOrigin: 'http://127.0.0.1:8000' }), false);
+assert.equal(supportsFunctionTools({ model: 'qwen-local', endpointOrigin: 'http://127.0.0.1:8000', appOrigin: 'http://127.0.0.1:8000' }), true);
 
 const categories = requestCategories({
   messages: [

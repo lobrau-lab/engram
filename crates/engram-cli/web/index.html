@@ -20,6 +20,7 @@
           <button class="nav-item" data-view="bench"><span class="nav-icon">▦</span> Memory bench</button>
           <button class="nav-item" data-view="rules"><span class="nav-icon">⎇</span> Decision rules</button>
           <button class="nav-item" data-view="apps"><span class="nav-icon">▣</span> Applications</button>
+          <button class="nav-item" data-view="takeover" aria-label="Takeover"><span class="nav-icon">◉</span> Takeover</button>
           <button class="nav-item" data-view="workshop"><span class="nav-icon">✦</span> Workshop</button>
           <button class="nav-item" data-view="settings"><span class="nav-icon">⚙</span> Connections & settings</button>
           <a class="nav-item" href="/vault"><span class="nav-icon">⌂</span> Engram vault</a>
@@ -37,6 +38,7 @@
         <header class="topbar">
           <div class="breadcrumb"><span>Workspace</span><span class="slash">/</span><strong id="top-title">New conversation</strong></div>
           <div class="top-actions">
+            <button class="takeover-pill hidden" id="takeover-pill" aria-label="Stop takeover session"><span class="status-light"></span><span id="takeover-pill-label">Takeover armed</span><span class="takeover-stop">Stop</span></button>
             <button class="connection-pill" id="connection-pill"><span class="status-light"></span><span id="connection-label">Connect a model</span><span class="chevron">⌄</span></button>
             <button class="icon-button" id="open-inspector" aria-label="Open context inspector" title="Context inspector">☷</button>
           </div>

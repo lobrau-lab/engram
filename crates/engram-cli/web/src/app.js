@@ -4,12 +4,12 @@ import { filterRemoteHistory, packContext } from './core/context-packer.js';
 import { listModels, setModelLoaded, streamChat } from './providers/openai-compatible.js';
 import { searchEngramVault } from './providers/engram-vault.js';
 import { applicationTools, executeApplicationAction, executeProjectAction } from './core/app-actions.js';
-import { classifyEndpoint, canSendVaultContext, requestCategories, confirmDisclosure } from './core/privacy-policy.js';
+import { classifyEndpoint, canSendVaultContext, requestCategories, confirmDisclosure, supportsFunctionTools } from './core/privacy-policy.js';
 import { runMemoryBench } from './core/evaluation-bench.js';
 
 const $ = selector => document.querySelector(selector);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
-let currentView = 'chat'; let inspectorTab = 'assembly'; let sending = false; let aborter = null; let embeddedModel = null; let appDigests = []; let appResult = ''; let appsLoaded = false; let workshopProposals = []; let workshopResult = ''; let workshopLoaded = false;
+let currentView = 'chat'; let inspectorTab = 'assembly'; let sending = false; let aborter = null; let embeddedModel = null; let appDigests = []; let appResult = ''; let appsLoaded = false; let workshopProposals = []; let workshopResult = ''; let workshopLoaded = false; let takeoverStatus = null; let takeoverSession = null; let takeoverResult = ''; let takeoverTree = ''; let takeoverShot = ''; let takeoverBusy = false; let takeoverTimer = null; let takeoverRequest = 0; let takeoverMinutes = 15;
 
 const accentOptions = {
   green: { label: 'Green', color: '#c8f169', image: 'engram-mark-green.png' },
@@ -59,6 +59,7 @@ function renderStatus() {
   $('#vault-toggle').classList.toggle('active', Boolean(settings.vaultSearchEnabled));
   $('#vault-toggle').setAttribute('aria-pressed', String(Boolean(settings.vaultSearchEnabled)));
   $('#memory-count').textContent = memoryCount(); $('#inspector-memory-count').textContent = memoryCount();
+  updateTakeoverPill();
 }
 
 function variableSection(title, items, icon = '·') {
@@ -97,8 +98,9 @@ function switchView(view) {
   document.querySelectorAll('.nav-item').forEach(item => item.classList.toggle('active', item.dataset.view === view));
   $('#chat-view').classList.toggle('hidden', view !== 'chat');
   $('#workspace-view').classList.toggle('hidden', view === 'chat');
-  const labels = { chat: current().title, memory: 'Memory ledger', bench: 'Memory bench', rules: 'Decision rules', apps: 'Application digests', workshop: 'Workshop', settings: 'Connections & settings' };
+  const labels = { chat: current().title, memory: 'Memory ledger', bench: 'Memory bench', rules: 'Decision rules', apps: 'Application digests', takeover: 'Takeover', workshop: 'Workshop', settings: 'Connections & settings' };
   $('#top-title').textContent = labels[view]; if (view !== 'chat') renderWorkspaceView();
+  if (view === 'takeover') loadTakeover(true);
 }
 
 function renderWorkspaceView() {
@@ -110,6 +112,8 @@ function renderWorkspaceView() {
     host.innerHTML = `<div class="page-heading"><div class="eyebrow">CONVERSATION STATE</div><h1>Memory ledger</h1><p>A compact set of variables that points back to the original conversation. Nothing here replaces the transcript.</p></div><div class="ledger-grid">${[['Current goal', memory.currentGoal, '01'], ['Active topics', memory.activeTopics, '02'], ['Decisions', memory.decisions, '03'], ['Constraints', memory.constraints, '04'], ['Preferences', memory.preferences, '05'], ['Open questions', memory.openQuestions, '06']].map(([title, items, num]) => `<section class="ledger-card"><div class="ledger-head"><span>${num}</span><h2>${title}</h2><small>${items.length} variables</small></div>${items.length ? items.map(item => `<div class="ledger-item"><p>${esc(item.text)}</p><div><span class="direct-label">DIRECTLY DERIVED</span><span>Source ${item.sourceTurnIds?.map(id => id.slice(0, 8)).join(', ')}</span></div></div>`).join('') : '<div class="ledger-empty">New user messages can add a source-linked variable here.</div>'}</section>`).join('')}</div><div class="transcript-strip"><div><span class="eyebrow">SOURCE OF RECORD</span><h2>Conversation transcript</h2><p>${current().turns.length} immutable turns in this conversation.</p></div><button class="secondary-button" id="back-to-chat">Return to chat ↗</button></div>`;
   } else if (currentView === 'apps') {
     renderAppsView(host);
+  } else if (currentView === 'takeover') {
+    renderTakeoverView(host);
   } else if (currentView === 'workshop') {
     renderWorkshopView(host);
   } else if (currentView === 'rules') {
@@ -328,6 +332,228 @@ async function runApplication(id, action) {
   }
 }
 
+function takeoverHeaders() { return { 'Content-Type': 'application/json', 'X-Threadline-Local-Control': '1' }; }
+function takeoverRemainingSeconds() { return takeoverSession ? Math.max(0, takeoverSession.expiresAt - Math.floor(Date.now() / 1000)) : 0; }
+function isTakeoverArmed() { return Boolean(takeoverSession && takeoverRemainingSeconds() > 0); }
+function formatTakeoverTime(seconds) { const safe = Math.max(0, Number(seconds) || 0); return `${Math.floor(safe / 60)}:${String(safe % 60).padStart(2, '0')}`; }
+
+function updateTakeoverPill() {
+  const pill = $('#takeover-pill'); if (!pill) return;
+  const local = isTakeoverArmed();
+  const serverArmed = Boolean(takeoverStatus?.session?.armed);
+  pill.classList.toggle('hidden', !(local || serverArmed));
+  const label = $('#takeover-pill-label');
+  if (label) label.textContent = local ? `Takeover · ${formatTakeoverTime(takeoverRemainingSeconds())}` : 'Takeover armed elsewhere';
+}
+
+function clearTakeoverSession() {
+  takeoverSession = null;
+  if (takeoverTimer) { clearInterval(takeoverTimer); takeoverTimer = null; }
+  updateTakeoverPill();
+}
+
+function startTakeoverTimer() {
+  if (takeoverTimer) clearInterval(takeoverTimer);
+  takeoverTimer = setInterval(() => {
+    if (!takeoverSession) { clearInterval(takeoverTimer); takeoverTimer = null; updateTakeoverPill(); return; }
+    if (!isTakeoverArmed()) { stopTakeover(true); toast('The takeover session expired and was stopped.'); return; }
+    updateTakeoverPill();
+    const countdown = $('#takeover-countdown');
+    if (countdown) countdown.textContent = formatTakeoverTime(takeoverRemainingSeconds());
+  }, 1000);
+}
+
+async function loadTakeover(render = true) {
+  const request = ++takeoverRequest;
+  try {
+    const response = await fetch('/api/v1/takeover/status');
+    const data = await response.json();
+    if (request !== takeoverRequest) return;
+    if (!response.ok) throw new Error(data.error || 'Could not read takeover status.');
+    takeoverStatus = data;
+    if (takeoverSession && !data.session?.armed) clearTakeoverSession();
+    if (takeoverSession) startTakeoverTimer(); else updateTakeoverPill();
+  } catch (error) {
+    if (request !== takeoverRequest) return;
+    takeoverStatus = { supported: false, helper: { available: false, error: error.message }, accessibility: false, frontmost: '', apps: [], screens: [], session: null, audit: [] };
+    updateTakeoverPill();
+  }
+  if (render && currentView === 'takeover') renderTakeoverView($('#workspace-view'));
+}
+
+async function armTakeover(minutes) {
+  if (takeoverBusy) return;
+  takeoverBusy = true;
+  takeoverResult = `Arming a ${minutes}-minute takeover session…`;
+  renderTakeoverView($('#workspace-view'));
+  try {
+    const response = await fetch('/api/v1/takeover/arm', { method: 'POST', headers: takeoverHeaders(), body: JSON.stringify({ minutes }) });
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || 'Could not arm takeover.');
+    takeoverSession = { token: data.token, expiresAt: data.expiresAt, minutes: data.minutes };
+    startTakeoverTimer();
+    updateTakeoverPill();
+    await loadTakeover(false);
+    toast(`Takeover armed for ${minutes} minutes. Press Escape or Stop to end it immediately.`);
+  } catch (error) {
+    takeoverResult = `Could not arm takeover: ${error.message}`;
+  } finally {
+    takeoverBusy = false;
+    if (currentView === 'takeover') renderTakeoverView($('#workspace-view'));
+  }
+}
+
+async function stopTakeover(quiet = false) {
+  clearTakeoverSession();
+  try {
+    await fetch('/api/v1/takeover/disarm', { method: 'POST', headers: takeoverHeaders(), body: '{}' });
+  } catch {}
+  await loadTakeover(false);
+  if (currentView === 'takeover') renderTakeoverView($('#workspace-view'));
+  if (!quiet) toast('Takeover stopped. Threadline can no longer control this Mac.');
+}
+
+async function requestTakeoverPermission() {
+  try {
+    const response = await fetch('/api/v1/takeover/permission', { method: 'POST', headers: takeoverHeaders(), body: '{}' });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Could not request Accessibility permission.');
+    toast('Accessibility request opened. Enable Engram in System Settings, then refresh this view.');
+    setTimeout(() => loadTakeover(true), 1800);
+  } catch (error) {
+    toast(`Accessibility request failed: ${error.message}`);
+  }
+}
+
+async function takeoverAction(payload) {
+  if (!isTakeoverArmed()) throw new Error('Arm a takeover session first.');
+  const response = await fetch('/api/v1/takeover/action', { method: 'POST', headers: takeoverHeaders(), body: JSON.stringify({ ...payload, token: takeoverSession.token }) });
+  const data = await response.json();
+  if (!response.ok || !data.ok) throw new Error(data.error || 'The takeover action failed.');
+  return data;
+}
+
+async function performTakeoverAction(payload, label) {
+  if (takeoverBusy) return;
+  if (!isTakeoverArmed()) { toast('Arm a takeover session first.'); return; }
+  takeoverBusy = true;
+  takeoverResult = `${label}…`;
+  renderTakeoverView($('#workspace-view'));
+  try {
+    const data = await takeoverAction(payload);
+    takeoverResult = JSON.stringify(data.result, null, 2);
+    if (payload.action === 'tree') takeoverTree = JSON.stringify(data.result.tree || [], null, 2);
+    if (payload.action === 'windows') takeoverTree = JSON.stringify(data.result.windows || [], null, 2);
+    if (payload.action === 'screenshot' && data.result?.url) takeoverShot = data.result.url;
+    await loadTakeover(false);
+  } catch (error) {
+    takeoverResult = `${label} failed: ${error.message}`;
+  } finally {
+    takeoverBusy = false;
+    if (currentView === 'takeover') renderTakeoverView($('#workspace-view'));
+  }
+}
+
+async function computerUseForTool(args) {
+  try {
+    const data = await takeoverAction(args);
+    loadTakeover(false);
+    return { ok: true, action: data.action, result: data.result };
+  } catch (error) {
+    return { ok: false, code: 'takeover_failed', error: error.message };
+  }
+}
+
+function renderTakeoverView(host) {
+  if (!takeoverStatus) {
+    host.innerHTML = '<div class="page-heading"><div class="eyebrow">GUI CONTROL</div><h1>Takeover</h1><p>Reading accessibility and screen state…</p></div>';
+    return;
+  }
+  const helper = takeoverStatus.helper || {};
+  const supported = takeoverStatus.supported !== false;
+  const ready = supported && helper.available !== false;
+  const activeLocal = isTakeoverArmed();
+  const serverArmed = Boolean(takeoverStatus.session?.armed);
+  const remaining = activeLocal ? takeoverRemainingSeconds() : (takeoverStatus.session?.remainingSeconds || 0);
+  const accessibility = Boolean(takeoverStatus.accessibility);
+  const apps = takeoverStatus.apps || [];
+  const audit = takeoverStatus.audit || [];
+  const screen = (takeoverStatus.screens || [])[0];
+  const target = takeoverStatus.frontmost || apps[0]?.name || 'Safari';
+  const appOptions = apps.map(app => `<option value="${esc(app.name)}"></option>`).join('');
+  const appRows = apps.length ? apps.map(app => `<div class="takeover-app ${app.active ? 'is-frontmost' : ''}"><div><b>${esc(app.name)}</b><small>${esc(app.bundleId || 'no bundle id')}</small></div><div><button class="mini-button" type="button" data-takeover-focus="${esc(app.name)}">Focus</button><button class="mini-button" type="button" data-takeover-tree="${esc(app.name)}">Inspect UI</button></div></div>`).join('') : '<div class="ledger-empty">No regular applications are running.</div>';
+  const auditRows = audit.length ? audit.slice().reverse().map(item => `<div class="takeover-audit-row ${item.ok ? 'ok' : 'fail'}"><time>${new Date(item.at * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' })}</time><b>${esc(item.action)}</b><span>${esc(item.summary)}</span></div>`).join('') : '<div class="ledger-empty">No takeover actions yet.</div>';
+
+  host.innerHTML = `<div class="page-heading"><div class="eyebrow">ARMED GUI CONTROL · macOS</div><h1>Takeover</h1><p>See what is on screen, focus an application, press keys, type, click controls, run AppleScript, and capture the screen. Arm a timed session to let the local model act without a prompt for every step. Stop is always immediate.</p></div>
+    <section class="takeover-hero ${activeLocal ? 'armed' : ''}">
+      <div class="takeover-hero-copy"><span class="eyebrow">${ready ? (activeLocal ? 'SESSION ARMED' : serverArmed ? 'ARMED IN ANOTHER TAB' : 'SESSION DISARMED') : 'UNAVAILABLE'}</span><h2>${ready ? (activeLocal ? `Threadline can control this Mac for ${formatTakeoverTime(remaining)}` : serverArmed ? 'A takeover session is active, but this tab does not hold its token' : 'No application is currently under Threadline control') : 'GUI takeover is not available in this build'}</h2><p>${ready ? (activeLocal ? 'Every action is written to a local audit log. Press Escape or Stop to release control immediately.' : 'Arm a bounded session to enable the model and the controls below. Nothing runs while disarmed.') : 'Threadline still runs locally. On macOS, install Xcode Command Line Tools and rebuild Engram to enable the control helper.'}</p></div>
+      <div class="takeover-hero-actions">${ready ? (serverArmed ? '<button class="danger-button" type="button" id="takeover-stop">Stop takeover</button>' : `<form id="takeover-arm-form" class="takeover-arm"><label for="takeover-minutes">Session</label><select id="takeover-minutes"><option value="5">5 min</option><option value="15" selected>15 min</option><option value="30">30 min</option><option value="60">60 min</option><option value="120">120 min</option></select><button class="danger-button" type="submit" ${takeoverBusy ? 'disabled' : ''}>Arm takeover</button></form>`) : ''}<button class="mini-button" type="button" id="takeover-refresh">Refresh state</button></div>
+    </section>
+    <div class="takeover-stats">
+      <section class="takeover-stat ${supported ? (accessibility ? 'ok' : 'warn') : 'warn'}"><span>ACCESSIBILITY</span><b>${supported ? (accessibility ? 'Granted' : 'Not granted') : 'Unavailable'}</b><p>${supported ? (accessibility ? 'Engram can inspect and operate other applications.' : 'macOS blocks UI control until Engram is enabled in Privacy & Security → Accessibility.') : 'Accessibility control is only available on macOS.'}</p>${supported && helper.available && !accessibility ? '<button class="mini-button" type="button" id="takeover-permission">Grant accessibility</button>' : ''}</section>
+      <section class="takeover-stat ${helper.available ? 'ok' : 'warn'}"><span>CONTROL HELPER</span><b>${helper.available ? 'Ready' : 'Unavailable'}</b><p>${helper.error ? esc(helper.error) : 'The local Accessibility and CoreGraphics bridge is installed.'}</p></section>
+      <section class="takeover-stat"><span>FRONTMOST APP</span><b>${esc(takeoverStatus.frontmost || 'Unknown')}</b><p>${esc(takeoverStatus.frontmostBundleId || 'No active application reported.')}</p></section>
+      <section class="takeover-stat"><span>SCREEN</span><b>${screen ? `${screen.width} × ${screen.height}` : 'Unknown'}</b><p>${screen ? `Origin ${screen.x}, ${screen.y}. Click coordinates are global screen points.` : 'Screen dimensions are unavailable.'}</p></section>
+    </div>
+    ${!ready ? '<div class="takeover-locked">GUI takeover is not available in this build. On macOS, install Xcode Command Line Tools and rebuild Engram.</div>' : !activeLocal ? '<div class="takeover-locked">Arm a takeover session to enable the app controls below. Arming and permissions are always available.</div>' : ''}
+    <div class="takeover-grid">
+      <section class="settings-card takeover-card"><div class="settings-card-heading"><span class="settings-icon">▣</span><div><h2>Running applications</h2><p>Focus a window or inspect its accessibility tree</p></div><span class="module-label">LIVE</span></div><div class="takeover-app-list">${appRows}</div></section>
+      <section class="settings-card takeover-card"><div class="settings-card-heading"><span class="settings-icon warm">⌘</span><div><h2>Direct controls</h2><p>These run immediately while armed</p></div><span class="module-label">TRUSTED SESSION</span></div>
+        <label class="field-label" for="takeover-app">Target application</label><input id="takeover-app" list="takeover-app-list" value="${esc(target)}" placeholder="Safari or com.apple.Safari" /><datalist id="takeover-app-list">${appOptions}</datalist>
+        <div class="takeover-inline"><button class="secondary-button" type="button" data-takeover-focus-target>Focus</button><button class="secondary-button" type="button" data-takeover-windows>Windows</button><button class="secondary-button" type="button" data-takeover-tree-target>Inspect UI</button></div>
+        <label class="field-label" for="takeover-key">Key or shortcut</label><div class="takeover-inline"><input id="takeover-key" placeholder="cmd+s, return, cmd+shift+4" /><button class="secondary-button" type="button" data-takeover-key>Press</button></div>
+        <label class="field-label" for="takeover-text">Type into the frontmost application (focus a target above first)</label><textarea id="takeover-text" rows="3" placeholder="Text to type. Newlines press Return."></textarea><div class="takeover-inline"><button class="secondary-button" type="button" data-takeover-type>Type text</button></div>
+        <label class="field-label" for="takeover-x">Click at global screen coordinates</label><div class="takeover-inline"><input id="takeover-x" type="number" value="500" aria-label="X coordinate" /><input id="takeover-y" type="number" value="500" aria-label="Y coordinate" /><button class="secondary-button" type="button" data-takeover-click>Click</button></div>
+        <label class="field-label" for="takeover-dy">Scroll the frontmost application</label><div class="takeover-inline"><input id="takeover-dy" type="number" value="3" aria-label="Scroll amount" /><button class="secondary-button" type="button" data-takeover-scroll>Scroll</button><span class="local-service-note">Positive scrolls down.</span></div>
+        <label class="field-label" for="takeover-ui-title">UI element by role and title</label><div class="takeover-inline"><input id="takeover-ui-role" value="AXButton" aria-label="UI role" /><input id="takeover-ui-title" placeholder="Button title or description" /><button class="secondary-button" type="button" data-takeover-ui-click>Click element</button></div><div class="takeover-inline"><input id="takeover-ui-value" placeholder="Value for a text field" aria-label="New value for the UI element" /><button class="secondary-button" type="button" data-takeover-ui-set>Set value</button></div>
+        <label class="field-label" for="takeover-open-app">Open an application</label><div class="takeover-inline"><input id="takeover-open-app" placeholder="Calculator or /Applications/Safari.app" /><button class="secondary-button" type="button" data-takeover-open>Open</button></div>
+        <div class="takeover-inline"><button class="secondary-button" type="button" data-takeover-screenshot>Capture screen</button><button class="secondary-button" type="button" data-takeover-pause>Stop takeover</button></div>
+      </section>
+      <section class="settings-card takeover-card wide-card"><div class="settings-card-heading"><span class="settings-icon blue-icon">✳</span><div><h2>AppleScript</h2><p>Arbitrary app automation through osascript</p></div><span class="module-label">FULL POWER</span></div><textarea id="takeover-script" rows="5" placeholder='tell application "Safari" to activate' aria-label="AppleScript source"></textarea><div class="takeover-inline"><button class="secondary-button" type="button" data-takeover-script>Run AppleScript</button><span class="local-service-note">AppleScript can ask macOS for Automation permission per app. It can also run shell scripts. Only run code you intend.</span></div></section>
+      <section class="settings-card takeover-card wide-card"><div class="settings-card-heading"><span class="settings-icon">↗</span><div><h2>Ask Threadline to act</h2><p>Place an armed-session instruction in the chat composer</p></div><span class="module-label">AGENT</span></div><form id="takeover-ask-form" class="takeover-inline"><input id="takeover-ask" placeholder="e.g. Open Calculator and compute 7 + 3" aria-label="Takeover goal" /><button class="secondary-button" type="submit">Put in chat</button></form><p class="local-service-note">This fills the composer; it never sends automatically. Review the instruction before pressing Enter.</p></section>
+    </div>
+    ${takeoverResult ? `<pre class="app-result takeover-result" aria-live="polite">${esc(takeoverResult)}</pre>` : ''}
+    ${takeoverTree ? `<details class="takeover-tree"><summary>Accessibility / window output</summary><pre class="app-result">${esc(takeoverTree)}</pre></details>` : ''}
+    ${takeoverShot ? `<section class="takeover-shot"><div class="section-title">SCREEN CAPTURE <a href="${esc(takeoverShot)}" target="_blank" rel="noreferrer">open full size ↗</a></div><img src="${esc(takeoverShot)}" alt="Most recent screen capture" /></section>` : ''}
+    <section class="settings-card takeover-card wide-card takeover-audit-card"><div class="settings-card-heading"><span class="settings-icon warm">◷</span><div><h2>Action audit</h2><p>Stored locally under <code>.engram/takeover/audit.jsonl</code></p></div><span class="module-label">${audit.length} EVENTS</span></div><div class="takeover-audit">${auditRows}</div></section>`;
+
+  if (!activeLocal) {
+    host.querySelectorAll('.takeover-grid button, .takeover-grid input, .takeover-grid textarea, .takeover-grid select').forEach(element => { element.disabled = true; });
+  }
+  $('#takeover-arm-form')?.addEventListener('submit', event => { event.preventDefault(); takeoverMinutes = Number($('#takeover-minutes').value) || 15; armTakeover(takeoverMinutes); });
+  const minutesSelect = $('#takeover-minutes');
+  if (minutesSelect) { minutesSelect.value = String(takeoverMinutes); minutesSelect.addEventListener('change', () => { takeoverMinutes = Number(minutesSelect.value) || 15; }); }
+  $('#takeover-stop')?.addEventListener('click', () => stopTakeover());
+  $('[data-takeover-pause]')?.addEventListener('click', () => stopTakeover());
+  $('#takeover-refresh')?.addEventListener('click', () => loadTakeover(true));
+  $('#takeover-permission')?.addEventListener('click', requestTakeoverPermission);
+  host.querySelectorAll('[data-takeover-focus]').forEach(button => button.addEventListener('click', () => performTakeoverAction({ action: 'focus', app: button.dataset.takeoverFocus }, `Focusing ${button.dataset.takeoverFocus}`)));
+  host.querySelectorAll('[data-takeover-tree]').forEach(button => button.addEventListener('click', () => performTakeoverAction({ action: 'tree', app: button.dataset.takeoverTree, depth: 6 }, `Reading the UI tree for ${button.dataset.takeoverTree}`)));
+  $('[data-takeover-focus-target]')?.addEventListener('click', () => performTakeoverAction({ action: 'focus', app: $('#takeover-app').value.trim() }, 'Focusing application'));
+  $('[data-takeover-windows]')?.addEventListener('click', () => performTakeoverAction({ action: 'windows', app: $('#takeover-app').value.trim() }, 'Reading windows'));
+  $('[data-takeover-tree-target]')?.addEventListener('click', () => performTakeoverAction({ action: 'tree', app: $('#takeover-app').value.trim(), depth: 6 }, 'Reading the UI tree'));
+  $('[data-takeover-key]')?.addEventListener('click', () => performTakeoverAction({ action: 'key', key: $('#takeover-key').value.trim() }, 'Pressing key'));
+  $('[data-takeover-type]')?.addEventListener('click', () => performTakeoverAction({ action: 'type', text: $('#takeover-text').value }, 'Typing text'));
+  $('[data-takeover-click]')?.addEventListener('click', () => performTakeoverAction({ action: 'click', x: Number($('#takeover-x').value), y: Number($('#takeover-y').value), button: 'left' }, 'Clicking'));
+  $('[data-takeover-scroll]')?.addEventListener('click', () => performTakeoverAction({ action: 'scroll', dy: Number($('#takeover-dy').value), dx: 0 }, 'Scrolling'));
+  $('[data-takeover-ui-click]')?.addEventListener('click', () => performTakeoverAction({ action: 'click_ui', app: $('#takeover-app').value.trim(), role: $('#takeover-ui-role').value.trim(), title: $('#takeover-ui-title').value.trim() }, 'Clicking UI element'));
+  $('[data-takeover-ui-set]')?.addEventListener('click', () => performTakeoverAction({ action: 'set_value', app: $('#takeover-app').value.trim(), role: $('#takeover-ui-role').value.trim(), title: $('#takeover-ui-title').value.trim(), value: $('#takeover-ui-value').value }, 'Setting UI value'));
+  $('[data-takeover-open]')?.addEventListener('click', () => performTakeoverAction({ action: 'open', app: $('#takeover-open-app').value.trim() }, 'Opening application'));
+  $('[data-takeover-screenshot]')?.addEventListener('click', () => performTakeoverAction({ action: 'screenshot' }, 'Capturing the screen'));
+  $('[data-takeover-script]')?.addEventListener('click', () => performTakeoverAction({ action: 'applescript', source: $('#takeover-script').value }, 'Running AppleScript'));
+  $('#takeover-ask-form')?.addEventListener('submit', event => {
+    event.preventDefault();
+    const goal = $('#takeover-ask').value.trim();
+    if (!goal) { toast('Describe what you want Threadline to do.'); return; }
+    const instruction = `Use the armed takeover session to ${goal}. Inspect the current screen or accessibility tree first, work step by step, and stop if the UI does not match.`;
+    $('#message-input').value = instruction;
+    switchView('chat');
+    $('#message-input').focus();
+    $('#message-input').dispatchEvent(new Event('input'));
+    toast('Instruction placed in the chat composer. Review it, then send.');
+  });
+}
+
 async function refreshOmlxStatus() {
   const label = $('#omlx-status-text'); const light = $('#omlx-status-light');
   if (!label || !light) return;
@@ -412,9 +638,10 @@ async function submitMessage(message) {
   if (!settings.model) { switchView('settings'); toast('Connect a model before sending.'); return; }
   const endpoint = classifyEndpoint(settings.baseUrl);
   if (!endpoint.allowed) { toast(`Request blocked: ${endpoint.reason}`); return; }
-  const modelTools = endpoint.kind === 'local'
+  const toolsSupported = supportsFunctionTools({ model: settings.model, endpointOrigin: endpoint.origin, appOrigin: location.origin });
+  const modelTools = !toolsSupported ? [] : endpoint.kind === 'local'
     ? applicationTools
-    : applicationTools.filter(tool => !tool.function.name.startsWith('project_') && tool.function.name !== 'run_project_check');
+    : applicationTools.filter(tool => !tool.function.name.startsWith('project_') && tool.function.name !== 'run_project_check' && tool.function.name !== 'computer_use');
   const allowVaultContext = canSendVaultContext(settings.baseUrl, settings.vaultSearchEnabled);
   if (settings.vaultSearchEnabled && !allowVaultContext) toast('Vault context is disabled for remote inference.');
   sending = true; $('#send-button').textContent = '■'; $('#send-button').setAttribute('aria-label', 'Stop generation');
@@ -487,8 +714,14 @@ async function submitMessage(message) {
           inspectApplication: inspectApplicationForTool,
           listApplications: listApplicationsForTool,
           runApplication: runApplicationForTool,
+          computerUse: computerUseForTool,
+          trustedTakeover: isTakeoverArmed(),
           confirm: message => confirmToolAction(message)
         };
+        if (call.function.name === 'computer_use' && !isTakeoverArmed()) {
+          toolMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ ok: false, code: 'takeover_not_armed', error: 'Arm a takeover session in the Takeover view before using computer control.' }) });
+          continue;
+        }
         const isProjectTool = call.function.name.startsWith('project_') || call.function.name === 'run_project_check';
         const result = isProjectTool && endpoint.kind !== 'local'
           ? { ok: false, code: 'local_inference_required', error: 'Project tools are disabled for remote inference. Connect a loopback on-device model to keep Engram source offline.' }
@@ -541,8 +774,22 @@ $('#connection-pill').addEventListener('click', () => switchView('settings'));
 $('#open-inspector').addEventListener('dblclick', () => { inspectorTab = 'memory'; renderInspector(); });
 document.querySelectorAll('[data-prompt]').forEach(card => card.addEventListener('click', () => { $('#message-input').value = card.dataset.prompt; $('#message-input').focus(); $('#message-input').dispatchEvent(new Event('input')); }));
 $('#profile-button').addEventListener('click', () => { switchView('settings'); });
+$('#takeover-pill')?.addEventListener('click', () => stopTakeover());
+window.addEventListener('pagehide', () => {
+  if (!takeoverSession) return;
+  try {
+    fetch('/api/v1/takeover/disarm', { method: 'POST', headers: takeoverHeaders(), body: '{}', keepalive: true });
+  } catch {}
+});
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && isTakeoverArmed() && !document.querySelector('dialog[open]')) {
+    event.preventDefault();
+    stopTakeover();
+  }
+});
 subscribe(() => { renderThreads(); renderStatus(); renderInspector(); });
 applyAccent(getWorkspace().settings.accent || 'green');
 if (!getWorkspace().conversations.length) createConversation();
 renderAll();
 configureEmbeddedDefault();
+loadTakeover(false);

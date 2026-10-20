@@ -77,6 +77,14 @@ pub fn complete(messages: &[ChatMessage], max_tokens: Option<u32>) -> Result<Str
         use chat_core::types::options::ChatOptions;
         use std::sync::OnceLock;
 
+        // The on-device provider is a shared system resource. Serialize
+        // completions while still allowing status, takeover, and file
+        // requests to run on other connection threads.
+        static INFERENCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = INFERENCE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
         static CLIENT: OnceLock<chat_applefm::AppleFMClient> = OnceLock::new();
 
