@@ -43,7 +43,11 @@ pub fn validate_relative_path(path: &Path) -> Result<PathBuf> {
 
 impl Vault {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
-        Ok(Self { root: root.into() })
+        let root = root.into();
+        // Canonicalize the root so ids stay vault-relative on platforms where
+        // the configured path and the filesystem path differ (e.g. /var on macOS).
+        let root = root.canonicalize().unwrap_or(root);
+        Ok(Self { root })
     }
 
     pub fn scan(&self) -> Result<Vec<Note>> {

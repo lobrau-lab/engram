@@ -358,6 +358,11 @@ fn dispatch(
         ("POST", "/new") => create_note(vault, body)?,
         ("GET", "/graph") => render_graph(vault)?,
         ("POST", "/save") => save_note(vault, body)?,
+        ("GET", "/trash") => render_trash(vault)?,
+        ("POST", "/index") => rebuild_index(vault)?,
+        ("POST", "/rename") => rename_note(vault, body)?,
+        ("POST", "/delete") => delete_note(vault, body)?,
+        ("POST", "/restore") => restore_note(vault, body)?,
         ("GET", "/ask") => render_ask()?,
         ("POST", "/ask") => ask(vault, body)?,
         _ => response(404, "text/plain; charset=utf-8", "Not found"),
@@ -1333,7 +1338,7 @@ fn render_index(vault: &Path, query: &str) -> Result<Vec<u8>> {
     let notes = Vault::open(vault.to_path_buf())?.scan()?;
     let mut body = String::from("<header style=\"display:flex;align-items:center;gap:16px\"><img src=\"/threadline/assets/engram-logo.png\" alt=\"Engram\" width=\"112\" height=\"112\" style=\"object-fit:contain\"><h1>Engram</h1></header><form><input name=\"q\" placeholder=\"Search\" value=\"");
     body.push_str(&escape(&search));
-    body.push_str("\"><button>Search</button></form><p><a href=\"/new\">New note</a> · <a href=\"/ask\">Ask the local assistant</a> · <a href=\"/graph\">Open graph</a> · <a href=\"/threadline/\">Open Threadline chat</a></p><ul>");
+    body.push_str("\"><button>Search</button></form><p><a href=\"/new\">New note</a> · <a href=\"/ask\">Ask the local assistant</a> · <a href=\"/graph\">Open graph</a> · <a href=\"/trash\">Trash</a> · <a href=\"/threadline/\">Open Threadline chat</a></p><form method=\"post\" action=\"/index\"><button>Rebuild index</button></form><ul>");
     for note in notes {
         let haystack = format!("{} {}", note.title, note.body).to_lowercase();
         if !search.is_empty() && !haystack.contains(&search.to_lowercase()) {
@@ -1505,18 +1510,20 @@ fn render_note(vault: &Path, query: &str) -> Result<Vec<u8>> {
     let path = safe_path(vault, &relative, false)?;
     let note = std::fs::read_to_string(&path)
         .with_context(|| format!("reading note {}", relative.display()))?;
-    let notes = Vault::open(vault.to_path_buf())?.scan()?;
+    let vault_handle = Vault::open(vault.to_path_buf())?;
+    let notes = vault_handle.scan()?;
+    let note_meta = vault_handle.read_note(&relative.to_string_lossy())?;
     let target = relative.to_string_lossy();
     let stem = relative
         .file_stem()
         .and_then(|x| x.to_str())
         .unwrap_or_default();
     let mut backlinks = String::from("<h2>Backlinks</h2><ul>");
-    for candidate in notes {
+    for candidate in &notes {
         if candidate
             .links
             .iter()
-            .any(|link| link == target.as_ref() || link == stem)
+            .any(|link| link.as_str() == target.as_ref() || link.as_str() == stem)
         {
             backlinks.push_str(&format!(
                 "<li><a href=\"/note?path={}\">{}</a></li>",
@@ -1526,15 +1533,65 @@ fn render_note(vault: &Path, query: &str) -> Result<Vec<u8>> {
         }
     }
     backlinks.push_str("</ul>");
+    let mut broken = String::new();
+    for link in &note_meta.links {
+        if !notes.iter().any(|candidate| {
+            candidate.id == *link
+                || candidate.path.file_stem().and_then(|s| s.to_str()) == Some(link.as_str())
+        }) {
+            broken.push_str(&format!("<li>{}</li>", escape(link)));
+        }
+    }
+    let broken = if broken.is_empty() {
+        String::new()
+    } else {
+        format!("<h2>Broken links</h2><ul>{broken}</ul>")
+    };
+    let relative_text = relative.to_string_lossy();
     let body = format!(
-        "<a href=\"/vault\">← Vault</a><h1>{}</h1><form method=\"post\" action=\"/save\"><input type=\"hidden\" name=\"path\" value=\"{}\"><textarea name=\"body\" autofocus>{}</textarea><button>Save</button></form><h2>Preview</h2><article class=\"preview\">{}</article>{}",
-        escape(relative.to_string_lossy().as_ref()),
-        encode(relative.to_string_lossy().as_ref()),
+        "<a href=\"/vault\">← Vault</a> · <a href=\"/trash\">Trash</a><h1>{}</h1><form method=\"post\" action=\"/save\"><input type=\"hidden\" name=\"path\" value=\"{}\"><textarea name=\"body\" autofocus>{}</textarea><button>Save</button></form><h2>Preview</h2><article class=\"preview\">{}</article>{}{}<h2>Rename note</h2><form method=\"post\" action=\"/rename\" onsubmit=\"return confirm('Rename ' + this.elements.path.value + ' to ' + this.elements.new_path.value + '?')\"><input type=\"hidden\" name=\"path\" value=\"{}\"><input name=\"new_path\" value=\"{}\" required><button>Rename note</button></form><h2>Move to trash</h2><form method=\"post\" action=\"/delete\" onsubmit=\"return confirm('Move ' + this.elements.path.value + ' to trash?')\"><input type=\"hidden\" name=\"path\" value=\"{}\"><button>Move to trash</button></form>",
+        escape(relative_text.as_ref()),
+        encode(relative_text.as_ref()),
         escape(&note),
         markdown_html(&note),
-        backlinks
+        backlinks,
+        broken,
+        escape(relative_text.as_ref()),
+        escape(relative_text.as_ref()),
+        escape(relative_text.as_ref())
     );
     Ok(page("Edit note", &body))
+}
+
+fn vault_index(vault: &Path) -> Result<(Index, usize)> {
+    let config_path = vault.join(".engram").join("config.toml");
+    let config = if config_path.exists() {
+        Config::load(&config_path)?
+    } else {
+        Config::new(vault)
+    };
+    Ok((Index::open(&config.db)?, config.embed_dim))
+}
+
+fn rebuild_index(vault: &Path) -> Result<Vec<u8>> {
+    let (index, embed_dim) = vault_index(vault)?;
+    let notes = Vault::open(vault.to_path_buf())?.scan()?;
+    index.rebuild(&notes, &HashingEmbedder::new(embed_dim), unix_secs())?;
+    audit_mutation(vault, "index", "vault", "ok");
+    Ok(redirect("/vault"))
+}
+
+fn upsert_note_index(vault: &Path, relative: &Path) -> Result<()> {
+    let id = relative.to_string_lossy().replace('\\', "/");
+    let (index, embed_dim) = vault_index(vault)?;
+    let note = Vault::open(vault.to_path_buf())?.read_note(&id)?;
+    index.upsert(&note, &HashingEmbedder::new(embed_dim))
+}
+
+fn remove_note_index(vault: &Path, relative: &Path) -> Result<()> {
+    let id = relative.to_string_lossy().replace('\\', "/");
+    let (index, _) = vault_index(vault)?;
+    index.remove(&id)
 }
 
 fn save_note(vault: &Path, body: &str) -> Result<Vec<u8>> {
@@ -1545,15 +1602,7 @@ fn save_note(vault: &Path, body: &str) -> Result<Vec<u8>> {
     let path = safe_path(vault, &relative, true)?;
     atomic_write::replace(&path, content.as_bytes())
         .with_context(|| format!("writing note {}", relative.display()))?;
-    let config_path = vault.join(".engram").join("config.toml");
-    let config = if config_path.exists() {
-        Config::load(&config_path)?
-    } else {
-        Config::new(vault)
-    };
-    let index = Index::open(&config.db)?;
-    let note = Vault::open(vault.to_path_buf())?.read_note(&relative.to_string_lossy())?;
-    index.upsert(&note, &HashingEmbedder::new(config.embed_dim))?;
+    upsert_note_index(vault, &relative)?;
     Ok(redirect("/"))
 }
 
@@ -1576,6 +1625,263 @@ fn create_note(vault: &Path, body: &str) -> Result<Vec<u8>> {
         &path,
         parameter(body, "body").unwrap_or_default().as_bytes(),
     )?;
+    upsert_note_index(vault, &relative)?;
+    Ok(redirect(&format!(
+        "/note?path={}",
+        encode(relative.to_string_lossy().as_ref())
+    )))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TrashManifest {
+    original_path: String,
+    deleted_at: i64,
+}
+
+struct TrashEntry {
+    id: String,
+    original_path: String,
+    deleted_at: i64,
+}
+
+fn valid_trash_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+}
+
+fn unix_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(unix)]
+fn restrict(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+
+#[cfg(not(unix))]
+fn restrict(_path: &Path, _mode: u32) {}
+
+fn audit_mutation(vault: &Path, action: &str, path: &str, result: &str) {
+    let directory = vault.join(".engram").join("audit");
+    if std::fs::create_dir_all(&directory).is_err() {
+        return;
+    }
+    restrict(&directory, 0o700);
+    let entry = serde_json::json!({
+        "at": unix_secs(),
+        "action": action,
+        "path": path,
+        "result": result,
+    });
+    let audit_path = directory.join("vault.jsonl");
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    if let Ok(mut file) = options.open(&audit_path) {
+        let _ = writeln!(file, "{entry}");
+    }
+    restrict(&audit_path, 0o600);
+}
+
+fn trash_note(vault: &Path, relative: &Path) -> Result<String> {
+    let source = safe_path(vault, relative, false)?;
+    let root = vault.join(".engram").join("trash");
+    std::fs::create_dir_all(&root)?;
+    restrict(&root, 0o700);
+    let stamp = unix_secs();
+    let mut trash_dir = None;
+    for sequence in 0..1000 {
+        let candidate = root.join(format!("{stamp}-{sequence}"));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => {
+                trash_dir = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let directory = trash_dir.context("could not allocate a trash entry")?;
+    restrict(&directory, 0o700);
+    let destination = directory.join(relative);
+    std::fs::create_dir_all(destination.parent().context("trash path has no parent")?)?;
+    let manifest = TrashManifest {
+        original_path: relative.to_string_lossy().replace('\\', "/"),
+        deleted_at: stamp,
+    };
+    let manifest_path = directory.join("manifest.json");
+    atomic_write::replace(&manifest_path, &serde_json::to_vec_pretty(&manifest)?)?;
+    restrict(&manifest_path, 0o600);
+    if let Err(error) = std::fs::rename(&source, &destination) {
+        let _ = std::fs::remove_dir_all(&directory);
+        return Err(error.into());
+    }
+    directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .context("trash entry has no id")
+}
+
+fn trash_entries(vault: &Path) -> Result<Vec<TrashEntry>> {
+    let root = vault.join(".engram").join("trash");
+    let mut entries = Vec::new();
+    let Ok(read_dir) = std::fs::read_dir(&root) else {
+        return Ok(entries);
+    };
+    for entry in read_dir {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let id = entry.file_name().to_string_lossy().into_owned();
+        if !valid_trash_id(&id) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path().join("manifest.json")) else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_str::<TrashManifest>(&text) else {
+            continue;
+        };
+        entries.push(TrashEntry {
+            id,
+            original_path: manifest.original_path,
+            deleted_at: manifest.deleted_at,
+        });
+    }
+    entries.sort_by(|left, right| {
+        right
+            .deleted_at
+            .cmp(&left.deleted_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    Ok(entries)
+}
+
+fn render_trash(vault: &Path) -> Result<Vec<u8>> {
+    let mut rows = String::new();
+    for entry in trash_entries(vault)? {
+        rows.push_str(&format!(
+            "<li><strong>{}</strong><br><small>Deleted {}</small><form method=\"post\" action=\"/restore\" onsubmit=\"return confirm('Restore ' + this.elements.original.value + '?')\"><input type=\"hidden\" name=\"id\" value=\"{}\"><input type=\"hidden\" name=\"original\" value=\"{}\"><button>Restore</button></form></li>",
+            escape(&entry.original_path),
+            entry.deleted_at,
+            encode(&entry.id),
+            escape(&entry.original_path)
+        ));
+    }
+    if rows.is_empty() {
+        rows.push_str("<li>Trash is empty.</li>");
+    }
+    Ok(page(
+        "Trash",
+        &format!("<a href=\"/vault\">← Vault</a><h1>Trash</h1><p>Deleted notes stay under <code>.engram/trash</code> until restored.</p><ul>{rows}</ul>"),
+    ))
+}
+
+fn rename_note(vault: &Path, body: &str) -> Result<Vec<u8>> {
+    let from = parameter(body, "path").context("missing note path")?;
+    let to = parameter(body, "new_path").context("missing new note path")?;
+    let from_relative = validate_relative_path(Path::new(&from))?;
+    let to_relative = validate_relative_path(Path::new(&to))?;
+    anyhow::ensure!(
+        is_markdown(&from_relative) && is_markdown(&to_relative),
+        "notes must use the .md extension"
+    );
+    let from_path = safe_path(vault, &from_relative, false)?;
+    let to_path = safe_path(vault, &to_relative, true)?;
+    if from_path == to_path {
+        return Ok(redirect(&format!(
+            "/note?path={}",
+            encode(to_relative.to_string_lossy().as_ref())
+        )));
+    }
+    anyhow::ensure!(
+        !to_path.exists(),
+        "destination already exists: {}",
+        to_relative.display()
+    );
+    std::fs::hard_link(&from_path, &to_path)
+        .with_context(|| format!("renaming note {}", from_relative.display()))?;
+    if let Err(error) = std::fs::remove_file(&from_path) {
+        let _ = std::fs::remove_file(&to_path);
+        return Err(error.into());
+    }
+    remove_note_index(vault, &from_relative)?;
+    upsert_note_index(vault, &to_relative)?;
+    audit_mutation(
+        vault,
+        "rename",
+        &format!(
+            "{} -> {}",
+            from_relative.to_string_lossy(),
+            to_relative.to_string_lossy()
+        ),
+        "ok",
+    );
+    Ok(redirect(&format!(
+        "/note?path={}",
+        encode(to_relative.to_string_lossy().as_ref())
+    )))
+}
+
+fn delete_note(vault: &Path, body: &str) -> Result<Vec<u8>> {
+    let relative = parameter(body, "path").context("missing note path")?;
+    let relative = validate_relative_path(Path::new(&relative))?;
+    anyhow::ensure!(is_markdown(&relative), "notes must use the .md extension");
+    let id = trash_note(vault, &relative)?;
+    remove_note_index(vault, &relative)?;
+    audit_mutation(
+        vault,
+        "delete",
+        &format!("{} -> trash/{id}", relative.to_string_lossy()),
+        "ok",
+    );
+    Ok(redirect("/vault"))
+}
+
+fn restore_note(vault: &Path, body: &str) -> Result<Vec<u8>> {
+    let id = parameter(body, "id").context("missing trash entry")?;
+    anyhow::ensure!(valid_trash_id(&id), "invalid trash entry");
+    let directory = vault.join(".engram").join("trash").join(&id);
+    let manifest: TrashManifest = serde_json::from_str(
+        &std::fs::read_to_string(directory.join("manifest.json"))
+            .context("reading trash manifest")?,
+    )
+    .context("parsing trash manifest")?;
+    let relative = validate_relative_path(Path::new(&manifest.original_path))?;
+    anyhow::ensure!(is_markdown(&relative), "notes must use the .md extension");
+    let source = directory.join(&relative);
+    let metadata = std::fs::symlink_metadata(&source).context("trashed note is missing")?;
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "invalid trashed note"
+    );
+    let target = safe_path(vault, &relative, true)?;
+    anyhow::ensure!(
+        !target.exists(),
+        "restore destination already exists: {}",
+        relative.display()
+    );
+    std::fs::hard_link(&source, &target).context("restoring note")?;
+    if let Err(error) = std::fs::remove_file(&source) {
+        let _ = std::fs::remove_file(&target);
+        return Err(error.into());
+    }
+    let _ = std::fs::remove_dir_all(&directory);
+    upsert_note_index(vault, &relative)?;
+    audit_mutation(
+        vault,
+        "restore",
+        &format!("trash/{id} -> {}", relative.to_string_lossy()),
+        "ok",
+    );
     Ok(redirect(&format!(
         "/note?path={}",
         encode(relative.to_string_lossy().as_ref())
@@ -1898,8 +2204,10 @@ fn markdown_html(markdown: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        chat_completions, has_hidden_component, host_is_local, is_markdown, origin_is_local,
-        threadline_asset, validate_bind_host, validate_request, ConnectionLimiter, Request,
+        chat_completions, create_note, delete_note, encode, has_hidden_component, host_is_local,
+        is_markdown, origin_is_local, rename_note, restore_note, save_note, search_vault_api,
+        threadline_asset, trash_entries, validate_bind_host, validate_request, ConnectionLimiter,
+        Request,
     };
     use std::net::SocketAddr;
     use std::path::Path;
@@ -1979,6 +2287,105 @@ mod tests {
         assert!(limiter.try_acquire().is_none());
         drop(permits.pop());
         assert!(limiter.try_acquire().is_some());
+    }
+
+    #[test]
+    fn note_lifecycle_keeps_the_index_and_trash_consistent() {
+        let vault = std::env::temp_dir().join(format!(
+            "engram-note-lifecycle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&vault).unwrap();
+
+        create_note(
+            &vault,
+            &format!(
+                "path={}&body={}",
+                encode("notes/one.md"),
+                encode("# Quasar\n\nunique alpha")
+            ),
+        )
+        .unwrap();
+        save_note(
+            &vault,
+            &format!(
+                "path={}&body={}",
+                encode("notes/one.md"),
+                encode("# Quasar\n\nunique beta")
+            ),
+        )
+        .unwrap();
+        rename_note(
+            &vault,
+            &format!(
+                "path={}&new_path={}",
+                encode("notes/one.md"),
+                encode("notes/two.md")
+            ),
+        )
+        .unwrap();
+        assert!(!vault.join("notes/one.md").exists());
+        assert!(vault.join("notes/two.md").exists());
+
+        let search: serde_json::Value =
+            serde_json::from_str(&search_vault_api(&vault, "unique").unwrap()).unwrap();
+        assert_eq!(search["hits"][0]["id"], "notes/two.md");
+
+        delete_note(&vault, &format!("path={}", encode("notes/two.md"))).unwrap();
+        assert!(!vault.join("notes/two.md").exists());
+        let search: serde_json::Value =
+            serde_json::from_str(&search_vault_api(&vault, "unique").unwrap()).unwrap();
+        assert!(search["hits"].as_array().unwrap().is_empty());
+        let entries = trash_entries(&vault).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].original_path, "notes/two.md");
+
+        restore_note(&vault, &format!("id={}", encode(&entries[0].id))).unwrap();
+        assert!(vault.join("notes/two.md").exists());
+        let search: serde_json::Value =
+            serde_json::from_str(&search_vault_api(&vault, "unique").unwrap()).unwrap();
+        assert_eq!(search["hits"][0]["id"], "notes/two.md");
+
+        create_note(
+            &vault,
+            &format!(
+                "path={}&body={}",
+                encode("notes/three.md"),
+                encode("# Three")
+            ),
+        )
+        .unwrap();
+        assert!(rename_note(
+            &vault,
+            &format!(
+                "path={}&new_path={}",
+                encode("notes/two.md"),
+                encode("notes/three.md")
+            ),
+        )
+        .is_err());
+        assert!(vault.join("notes/two.md").exists());
+        assert!(rename_note(
+            &vault,
+            &format!(
+                "path={}&new_path={}",
+                encode("notes/two.md"),
+                encode("../escape.md")
+            ),
+        )
+        .is_err());
+        assert!(delete_note(&vault, &format!("path={}", encode(".engram/config.toml")),).is_err());
+
+        let audit = std::fs::read_to_string(vault.join(".engram/audit/vault.jsonl")).unwrap();
+        assert!(audit.contains("\"rename\""));
+        assert!(audit.contains("\"delete\""));
+        assert!(audit.contains("\"restore\""));
+
+        let _ = std::fs::remove_dir_all(vault);
     }
 
     #[test]

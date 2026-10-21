@@ -188,6 +188,14 @@ impl Index {
         Ok(())
     }
 
+    pub fn remove(&self, id: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
+        tx.execute("DELETE FROM notes_fts WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn get_note_body(&self, id: &str) -> Result<Option<String>> {
         let body: Option<String> = self
             .conn
@@ -336,6 +344,41 @@ fn bytes_to_f32s(b: &[u8]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::Index;
+    use crate::embed::HashingEmbedder;
+    use crate::vault::Note;
+
+    #[test]
+    fn remove_drops_a_note_from_search() {
+        let dir = std::env::temp_dir().join(format!(
+            "engram-index-remove-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.sqlite");
+        let note = Note {
+            id: "note.md".into(),
+            path: dir.join("note.md"),
+            title: "Quasar".into(),
+            body: "unique searchable text".into(),
+            tags: Vec::new(),
+            links: Vec::new(),
+            mtime: 1,
+        };
+
+        let index = Index::open(&path).unwrap();
+        let embedder = HashingEmbedder::new(64);
+        index.upsert(&note, &embedder).unwrap();
+        assert_eq!(index.search("quasar", false, 5).unwrap().len(), 1);
+
+        index.remove("note.md").unwrap();
+        assert!(index.search("quasar", false, 5).unwrap().is_empty());
+        drop(index);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn set_last_indexed_survives_reopening_the_index() {

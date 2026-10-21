@@ -54,10 +54,10 @@ formatting, and release builds pass. Real macOS control has been exercised.
 
 The important gaps are not "does the chat work?" They are:
 
-- **Notes cannot be renamed or deleted** in the web vault; only created and
-  edited. There is no trash/restore.
-- **The index is manual.** `engram index` must be run after note changes; the UI
-  does not keep it fresh.
+- **Note lifecycle is now implemented, but external edits still need a rebuild.**
+  The web vault can create, edit, rename, trash, and restore notes. The index is
+  updated for web writes; files changed outside the UI still require
+  `engram index`, and there is no stale-index warning yet.
 - **Threadline conversations/settings/memory live in browser `localStorage`.**
   Clearing site data loses them, and they do not follow the vault to another
   browser. This conflicts with the stated "metadata under `.engram/`" model.
@@ -127,8 +127,8 @@ Status vocabulary:
 
 | Area | What it can do now | Status | Important limit |
 |---|---|---|---|
-| CLI / vault | `init`, `index`, `search` (OR/AND), `lexical`, `ask`, sync `export`/`import` with dry-run, `serve`, `open` (auto-inits empty/hidden-only vaults; `serve` is explicit), encrypted `backup`/`restore`, `import-files` | **Verified** | No note delete/rename; index is manual; `ask` uses an OpenAI-compatible endpoint, not the embedded model; `import-files` copies only `.md`/`.markdown`/`.txt` |
-| Web vault | `/vault` search, note view with backlinks, new note, edit/save, simple SVG graph, `/ask`, dump inbox/review | **Verified** | No rename/delete/trash; index is manual; `/ask` requires a configured endpoint |
+| CLI / vault | `init`, `index`, `search` (OR/AND), `lexical`, `ask`, sync `export`/`import` with dry-run, `serve`, `open` (auto-inits empty/hidden-only vaults; `serve` is explicit), encrypted `backup`/`restore`, `import-files` | **Verified** | Index is manual for external edits; `ask` uses an OpenAI-compatible endpoint, not the embedded model; `import-files` copies only `.md`/`.markdown`/`.txt` |
+| Web vault | `/vault` search, note view with backlinks/broken links, new note, edit/save, rename, trash/restore, simple SVG graph, `/ask`, dump inbox/review | **Verified** | No stale-index warning; `/ask` requires a configured endpoint |
 | Threadline chat | Streaming chat, multiple conversations, context inspector, vault-context toggle, provider settings, accent themes | **Verified** | Conversations/settings/memory are browser-local; no cross-browser history; no server-side export |
 | Memory | Per-conversation ledger, source-linked assertions, conflict preservation, deterministic decision-rule view, synthetic replay bench | **Implemented, prototype** | Lightweight heuristics, not truth detection; cross-chat recall is off; token counts are estimates |
 | Embedded inference | Apple Foundation Models in-process on macOS 26+, auto-detection, `/api/v1/inference/embedded`, `/v1/models`, same-origin `/v1/chat/completions`, serialized inference | **Verified** | macOS 26+ and Apple Intelligence required; text only; cannot call `computer_use` |
@@ -285,6 +285,10 @@ state without relying on a browser profile.
 
 #### G1.1 Note lifecycle
 
+**Status:** implemented and verified in the web vault (create, edit, rename,
+trash, restore, audit, index updates, broken-link display). External-file edits
+still rely on `engram index`.
+
 Implement in the web vault and HTTP layer:
 
 - Rename a note (`.md` only) with path validation; no overwrite; no hidden path;
@@ -308,6 +312,10 @@ Acceptance:
 - The index reflects each operation without a manual full rebuild.
 
 #### G1.2 Index freshness
+
+**Status:** partial. Web create/save/rename/delete/restore and dump apply update
+the index; the Vault view has a one-click rebuild. Stale detection for files
+changed outside the UI is still missing.
 
 - Add incremental index/update/remove operations after web note writes and dump
   applies.

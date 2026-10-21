@@ -64,8 +64,14 @@ browser `localStorage`; Engram notes and the SQLite index remain in the vault.
 The **Vault** composer toggle queries Engram's same-origin read-only search API
 and packs selected note snippets into the request alongside conversation
 context. The context inspector shows which notes were packed and links back to
-their source. Run `engram index` after changing notes. Context token counts
-remain estimates.
+their source. Edits made in the web vault update the index immediately; run
+`engram index` after changing Markdown files outside the web UI. Context token
+counts remain estimates.
+
+The Vault view supports creating and editing notes, renaming them, and moving
+them to a recoverable trash at `.engram/trash/`. Restore is available from the
+Trash view. Renames leave wiki links untouched and show broken links on the note
+instead of silently rewriting them.
 
 Optional OpenAI-compatible endpoints remain supported. The browser calls the
 configured endpoint directly, so a loopback endpoint is preferred; remote
