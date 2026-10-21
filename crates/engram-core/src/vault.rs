@@ -20,6 +20,12 @@ pub struct Note {
     pub mtime: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultMetadata {
+    pub note_count: usize,
+    pub digest: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Vault {
     pub root: PathBuf,
@@ -66,6 +72,43 @@ impl Vault {
     where
         F: FnMut(Note) -> Result<()>,
     {
+        self.for_each_note_path(|path| {
+            let note = self.load_note(path)?;
+            callback(note)
+        })
+    }
+
+    /// Stat-only snapshot of the vault's Markdown files. The digest changes
+    /// when a note is added, removed, resized, or gets a new mtime.
+    pub fn metadata(&self) -> Result<VaultMetadata> {
+        let mut hasher = Sha256::new();
+        let mut count = 0usize;
+        self.for_each_note_path(|path| {
+            let meta =
+                std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+            let mtime = meta
+                .modified()
+                .with_context(|| format!("mtime {}", path.display()))?
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let id = rel_id(&self.root, path);
+            hasher.update(id.as_bytes());
+            hasher.update(mtime.to_le_bytes());
+            hasher.update(meta.len().to_le_bytes());
+            count += 1;
+            Ok(())
+        })?;
+        Ok(VaultMetadata {
+            note_count: count,
+            digest: hex(&hasher.finalize()),
+        })
+    }
+
+    fn for_each_note_path<F>(&self, mut callback: F) -> Result<usize>
+    where
+        F: FnMut(&Path) -> Result<()>,
+    {
         if !self.root.exists() {
             return Ok(0);
         }
@@ -91,8 +134,7 @@ impl Vault {
             if is_hidden_child(&self.root, path) {
                 continue;
             }
-            let note = self.load_note(path)?;
-            callback(note)?;
+            callback(path)?;
             count += 1;
         }
         Ok(count)

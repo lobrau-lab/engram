@@ -279,7 +279,7 @@ fn cmd_index(vault: &Path, config_path: &Path) -> Result<()> {
 fn cmd_search(vault: &Path, config_path: &Path, query: &str, all: bool) -> Result<()> {
     let cfg = load_config(vault, config_path)?;
     let idx = Index::open(&cfg.db)?;
-    stale_warning(&idx, vault)?;
+    refresh_index_if_stale(&idx, vault, cfg.embed_dim)?;
 
     let filter = sanitize_fts(query);
     if filter.all_stopwords {
@@ -310,7 +310,7 @@ fn cmd_search(vault: &Path, config_path: &Path, query: &str, all: bool) -> Resul
 fn cmd_lexical(vault: &Path, config_path: &Path, query: &str) -> Result<()> {
     let cfg = load_config(vault, config_path)?;
     let idx = Index::open(&cfg.db)?;
-    stale_warning(&idx, vault)?;
+    refresh_index_if_stale(&idx, vault, cfg.embed_dim)?;
 
     let embedder = HashingEmbedder::new(cfg.embed_dim);
     let query_vec = embedder.embed(query);
@@ -339,7 +339,7 @@ fn cmd_lexical(vault: &Path, config_path: &Path, query: &str) -> Result<()> {
 fn cmd_ask(vault: &Path, config_path: &Path, question: &str) -> Result<()> {
     let cfg = load_config(vault, config_path)?;
     let idx = Index::open(&cfg.db)?;
-    stale_warning(&idx, vault)?;
+    refresh_index_if_stale(&idx, vault, cfg.embed_dim)?;
 
     let hits = idx.search(question, false, 6)?;
     let mut notes: Vec<(String, String)> = Vec::with_capacity(hits.len());
@@ -389,25 +389,9 @@ fn cmd_import(vault: &Path, config_path: &Path, src: &Path, dry_run: bool) -> Re
     Ok(())
 }
 
-fn stale_warning(idx: &Index, vault: &Path) -> Result<()> {
-    match idx.get_last_indexed()? {
-        None => eprintln!("warning: this vault has never been indexed (run `engram index`)"),
-        Some(ts) => {
-            let v = Vault::open(vault.to_path_buf())?;
-            let mut newest = 0i64;
-            v.scan_each(|n| {
-                if n.mtime > newest {
-                    newest = n.mtime;
-                }
-                Ok(())
-            })?;
-            if newest > ts {
-                eprintln!(
-                    "warning: index may be stale (vault changed after last index; run `engram index`)"
-                );
-            }
-        }
-    }
+fn refresh_index_if_stale(idx: &Index, vault: &Path, embed_dim: usize) -> Result<()> {
+    let opened = Vault::open(vault.to_path_buf())?;
+    idx.refresh_if_stale(&opened, &HashingEmbedder::new(embed_dim), unix_now())?;
     Ok(())
 }
 

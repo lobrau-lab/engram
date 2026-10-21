@@ -727,7 +727,7 @@ async function submitMessage(message) {
   if (allowVaultContext) {
     try {
       vaultResult = await searchEngramVault(message, { signal: aborter.signal });
-      if (!vaultResult.indexed && !vaultResult.hits?.length) toast('Engram has no indexed vault yet. Open Vault → Rebuild index, then retry.');
+      if (!vaultResult.indexed && !vaultResult.hits?.length) toast('Engram has no notes to search yet. Add Markdown notes, then retry.');
     } catch (error) {
       vaultSearchError = error;
       if (error.name !== 'AbortError') toast(`Vault search unavailable: ${error.message}`);

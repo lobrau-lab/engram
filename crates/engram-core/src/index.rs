@@ -105,7 +105,7 @@ impl Index {
     /// previous searchable index remains available.
     pub fn rebuild(&self, notes: &[Note], embedder: &dyn Embedder, indexed_at: i64) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute_batch("DELETE FROM notes; DELETE FROM notes_fts; DELETE FROM meta WHERE key = 'last_indexed';")?;
+        tx.execute_batch("DELETE FROM notes; DELETE FROM notes_fts; DELETE FROM meta WHERE key IN ('last_indexed', 'vault_fingerprint');")?;
         for note in notes {
             let tags = note.tags.join(",");
             let links = note.links.join(",");
@@ -136,8 +136,9 @@ impl Index {
         embedder: &dyn Embedder,
         indexed_at: i64,
     ) -> Result<usize> {
+        let fingerprint = vault.metadata()?.digest;
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute_batch("DELETE FROM notes; DELETE FROM notes_fts; DELETE FROM meta WHERE key = 'last_indexed';")?;
+        tx.execute_batch("DELETE FROM notes; DELETE FROM notes_fts; DELETE FROM meta WHERE key IN ('last_indexed', 'vault_fingerprint');")?;
         let mut count = 0usize;
         vault.scan_each(|note| {
             let tags = note.tags.join(",");
@@ -159,8 +160,49 @@ impl Index {
             "INSERT INTO meta(key, value) VALUES('last_indexed', ?1)",
             params![indexed_at.to_string()],
         )?;
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES('vault_fingerprint', ?1)",
+            params![fingerprint],
+        )?;
         tx.commit()?;
         Ok(count)
+    }
+
+    /// True when the vault's Markdown files no longer match the index.
+    pub fn is_stale(&self, vault: &Vault) -> Result<bool> {
+        let metadata = vault.metadata()?;
+        if metadata.note_count == 0 {
+            return self.has_state_notes();
+        }
+        if self.get_last_indexed()?.is_none() {
+            return Ok(true);
+        }
+        Ok(self.meta_value("vault_fingerprint")?.as_deref() != Some(metadata.digest.as_str()))
+    }
+
+    /// Rebuild once if the vault changed, then report whether a rebuild ran.
+    pub fn refresh_if_stale(
+        &self,
+        vault: &Vault,
+        embedder: &dyn Embedder,
+        indexed_at: i64,
+    ) -> Result<bool> {
+        if !self.is_stale(vault)? {
+            return Ok(false);
+        }
+        self.rebuild_from_vault(vault, embedder, indexed_at)?;
+        Ok(true)
+    }
+
+    fn meta_value(&self, key: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn set_last_indexed(&self, ts: i64) -> Result<()> {
@@ -466,6 +508,114 @@ mod tests {
 
         let hits = index.search("streamed", false, 20).unwrap();
         assert_eq!(hits.len(), 10);
+        drop(index);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn external_edit_is_detected_and_refreshed() {
+        let dir = std::env::temp_dir().join(format!(
+            "engram-index-stale-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let note = dir.join("note.md");
+        std::fs::write(&note, "# Note\noriginal phrase\n").unwrap();
+
+        let vault = Vault::open(&dir).unwrap();
+        let index = Index::open(&dir.join("index.sqlite")).unwrap();
+        let embedder = HashingEmbedder::new(64);
+        index.rebuild_from_vault(&vault, &embedder, 100).unwrap();
+        assert!(!index.is_stale(&vault).unwrap());
+
+        let file = std::fs::OpenOptions::new().write(true).open(&note).unwrap();
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(12_345)),
+        )
+        .unwrap();
+        assert!(index.is_stale(&vault).unwrap());
+        assert!(index.refresh_if_stale(&vault, &embedder, 101).unwrap());
+        assert!(!index.is_stale(&vault).unwrap());
+
+        std::fs::write(&note, "# Note\nexternally changed phrase with more text\n").unwrap();
+        assert!(index.is_stale(&vault).unwrap());
+        assert!(index.refresh_if_stale(&vault, &embedder, 101).unwrap());
+        assert!(!index.is_stale(&vault).unwrap());
+
+        assert!(index.search("original", false, 5).unwrap().is_empty());
+        assert_eq!(index.search("externally", false, 5).unwrap().len(), 1);
+        drop(index);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn external_additions_and_removals_are_detected() {
+        let dir = std::env::temp_dir().join(format!(
+            "engram-index-add-remove-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let vault = Vault::open(&dir).unwrap();
+        let index = Index::open(&dir.join("index.sqlite")).unwrap();
+        let embedder = HashingEmbedder::new(64);
+
+        assert!(!index.is_stale(&vault).unwrap());
+        let note = dir.join("added.md");
+        std::fs::write(&note, "# Added\nfreshly added phrase\n").unwrap();
+        assert!(index.is_stale(&vault).unwrap());
+        assert!(index.refresh_if_stale(&vault, &embedder, 100).unwrap());
+        assert_eq!(index.search("freshly", false, 5).unwrap().len(), 1);
+
+        std::fs::remove_file(&note).unwrap();
+        assert!(index.is_stale(&vault).unwrap());
+        assert!(index.refresh_if_stale(&vault, &embedder, 101).unwrap());
+        assert!(index.search("freshly", false, 5).unwrap().is_empty());
+        drop(index);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn large_vault_external_change_is_detected() {
+        let dir = std::env::temp_dir().join(format!(
+            "engram-index-large-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..250 {
+            std::fs::write(
+                dir.join(format!("note_{i:03}.md")),
+                format!("# Note {i}\ncommon body text number {i}\n"),
+            )
+            .unwrap();
+        }
+
+        let vault = Vault::open(&dir).unwrap();
+        let index = Index::open(&dir.join("index.sqlite")).unwrap();
+        let embedder = HashingEmbedder::new(64);
+        index.rebuild_from_vault(&vault, &embedder, 100).unwrap();
+        assert!(!index.is_stale(&vault).unwrap());
+
+        std::fs::write(
+            dir.join("note_249.md"),
+            "# Note 249\nlarge fixture external replacement\n",
+        )
+        .unwrap();
+        assert!(index.is_stale(&vault).unwrap());
+        assert!(index.refresh_if_stale(&vault, &embedder, 101).unwrap());
+        assert_eq!(index.search("replacement", false, 5).unwrap().len(), 1);
         drop(index);
         let _ = std::fs::remove_dir_all(dir);
     }

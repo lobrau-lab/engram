@@ -13,13 +13,15 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ACTIVE_CONNECTIONS: usize = 64;
+
+static INDEX_REFRESH_LOCK: Mutex<()> = Mutex::new(());
 
 struct ConnectionLimiter {
     active: AtomicUsize,
@@ -1433,6 +1435,7 @@ fn search_vault_api(vault: &Path, query: &str) -> Result<String> {
         Config::new(vault.to_path_buf())
     };
     let index = Index::open(&config.db)?;
+    let rebuilt = refresh_index_if_stale(&index, vault, config.embed_dim)?;
     let indexed = index.get_last_indexed()?.is_some();
     let hits = index.search(query, false, 6)?;
     let hits: Vec<_> = hits
@@ -1448,7 +1451,21 @@ fn search_vault_api(vault: &Path, query: &str) -> Result<String> {
             })
         })
         .collect();
-    Ok(serde_json::json!({ "query": query, "indexed": indexed, "hits": hits }).to_string())
+    Ok(serde_json::json!({
+        "query": query,
+        "indexed": indexed,
+        "rebuilt": rebuilt,
+        "hits": hits
+    })
+    .to_string())
+}
+
+fn refresh_index_if_stale(index: &Index, vault: &Path, embed_dim: usize) -> Result<bool> {
+    let _guard = INDEX_REFRESH_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("index refresh lock is poisoned"))?;
+    let opened = Vault::open(vault.to_path_buf())?;
+    index.refresh_if_stale(&opened, &HashingEmbedder::new(embed_dim), unix_secs())
 }
 
 fn render_dump(vault: &Path) -> Result<Vec<u8>> {
@@ -1644,6 +1661,9 @@ fn vault_index(vault: &Path) -> Result<(Index, usize)> {
 }
 
 fn rebuild_index(vault: &Path) -> Result<Vec<u8>> {
+    let _guard = INDEX_REFRESH_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("index refresh lock is poisoned"))?;
     let (index, embed_dim) = vault_index(vault)?;
     let opened = Vault::open(vault.to_path_buf())?;
     index.rebuild_from_vault(&opened, &HashingEmbedder::new(embed_dim), unix_secs())?;
@@ -2493,5 +2513,42 @@ mod tests {
                 "missing module route: {path}"
             );
         }
+    }
+
+    #[test]
+    fn vault_search_reindexes_external_markdown_edits() {
+        let vault = std::env::temp_dir().join(format!(
+            "engram-search-refresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(vault.join("notes")).unwrap();
+        let note = vault.join("notes/external.md");
+        std::fs::write(&note, "# External\noriginal phrase\n").unwrap();
+
+        let first: serde_json::Value =
+            serde_json::from_str(&search_vault_api(&vault, "original").unwrap()).unwrap();
+        assert_eq!(first["indexed"], true);
+        assert_eq!(first["rebuilt"], true);
+        assert_eq!(first["hits"][0]["id"], "notes/external.md");
+
+        std::fs::write(&note, "# External\nreplaced phrase with more text\n").unwrap();
+        let second: serde_json::Value =
+            serde_json::from_str(&search_vault_api(&vault, "replaced").unwrap()).unwrap();
+        assert_eq!(second["rebuilt"], true);
+        assert_eq!(second["hits"][0]["id"], "notes/external.md");
+        let old: serde_json::Value =
+            serde_json::from_str(&search_vault_api(&vault, "original").unwrap()).unwrap();
+        assert!(old["hits"].as_array().unwrap().is_empty());
+
+        std::fs::remove_file(&note).unwrap();
+        let removed: serde_json::Value =
+            serde_json::from_str(&search_vault_api(&vault, "replaced").unwrap()).unwrap();
+        assert_eq!(removed["rebuilt"], true);
+        assert!(removed["hits"].as_array().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(vault);
     }
 }
