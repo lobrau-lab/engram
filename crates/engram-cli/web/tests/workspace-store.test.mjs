@@ -16,11 +16,14 @@ globalThis.localStorage = {
 };
 
 let putBody = null;
+let putCount = 0;
+let serverWorkspace = null;
 let conflict = false;
 globalThis.fetch = async (_url, options = {}) => {
   if (!options.method || options.method === 'GET') {
-    return new Response(JSON.stringify({ workspace: null, revision: null }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ workspace: serverWorkspace, revision: serverWorkspace ? 'r1' : null }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   }
+  putCount += 1;
   putBody = JSON.parse(options.body);
   if (conflict) {
     return new Response(JSON.stringify({ error: 'workspace changed in another tab', revision: 'r2' }), { status: 409, headers: { 'Content-Type': 'application/json' } });
@@ -40,6 +43,13 @@ assert.equal(Object.hasOwn(putBody.workspace.settings, 'apiKey'), false);
 assert.equal(JSON.stringify(putBody).includes('legacy-session-key'), false);
 assert.equal(getSessionApiKey(), 'legacy-session-key');
 assert.equal(localStorage.getItem(PENDING_KEY), null);
+assert.equal(putCount, 1);
+
+serverWorkspace = putBody.workspace;
+const second = await hydrateWorkspace();
+assert.equal(second.mode, 'ready');
+assert.equal(putCount, 1);
+assert.equal(getWorkspaceStatus().pending, false);
 
 conflict = true;
 updateSettings({ model: 'second-model' });
