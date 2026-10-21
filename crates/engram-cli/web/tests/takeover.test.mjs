@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { executeApplicationAction } from '../src/core/app-actions.js';
-import { authorizeToolInvocation } from '../src/core/permission-gate.js';
+import { authorizeToolInvocation, toolCallRejection } from '../src/core/permission-gate.js';
 import { getRegisteredTool, listRegisteredTools, validateToolArguments } from '../src/core/tool-registry.js';
 
 const tool = getRegisteredTool('computer_use');
@@ -44,5 +44,11 @@ const unavailable = await executeApplicationAction('computer_use', JSON.stringif
 });
 assert.equal(unavailable.ok, false);
 assert.equal(unavailable.code, 'connector_failed');
+
+const offered = new Set(['computer_use', 'open_workspace_view']);
+assert.equal(toolCallRejection('computer_use', offered, 'local'), null);
+assert.equal(toolCallRejection('computer_use', offered, 'remote').code, 'local_inference_required');
+assert.equal(toolCallRejection('project_read_file', offered, 'local').code, 'tool_not_offered');
+assert.equal(toolCallRejection('open_workspace_view', offered, 'remote'), null);
 
 console.log('takeover tool tests passed');

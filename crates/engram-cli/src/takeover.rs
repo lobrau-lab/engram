@@ -25,6 +25,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const HELPER_BYTES: &[u8] = include_bytes!(env!("ENGRAM_CONTROL_BIN"));
 const AUDIT_LIMIT: usize = 80;
+const AUDIT_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const AUDIT_FILE_KEEP: usize = 2_000;
+const SCREENSHOT_LIMIT: usize = 50;
 const MAX_TEXT: usize = 16_000;
 const MAX_APPLESCRIPT: usize = 20_000;
 const MAX_APP: usize = 500;
@@ -138,6 +141,9 @@ impl From<std::io::Error> for Failure {
 
 impl Takeover {
     pub fn new(vault: PathBuf) -> Self {
+        let audit_path = takeover_dir(&vault).join("audit.jsonl");
+        trim_audit_file(&audit_path, AUDIT_FILE_BYTES);
+        prune_screenshots(&screenshots_dir(&vault), SCREENSHOT_LIMIT);
         let audit = load_audit(&vault);
         Self {
             vault,
@@ -190,6 +196,11 @@ impl Takeover {
             "apps": apps,
             "session": session,
             "audit": audit,
+            "retention": {
+                "auditFileBytes": AUDIT_FILE_BYTES,
+                "auditKeepEntries": AUDIT_FILE_KEEP,
+                "screenshots": SCREENSHOT_LIMIT,
+            },
         })
     }
 
@@ -300,13 +311,52 @@ impl Takeover {
         {
             return Err(Failure::new(404, "screenshot not found"));
         }
-        let path = self
-            .vault
-            .join(".engram")
-            .join("takeover")
-            .join("screenshots")
-            .join(name);
+        let path = screenshots_dir(&self.vault).join(name);
         fs::read(path).map_err(|_| Failure::new(404, "screenshot not found"))
+    }
+
+    /// Return the durable audit as JSON Lines for the user to save.
+    pub fn audit_export(&self) -> Result<Vec<u8>, Failure> {
+        let path = takeover_dir(&self.vault).join("audit.jsonl");
+        match fs::read(path) {
+            Ok(bytes) => Ok(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(Failure::internal(format!(
+                "could not read the takeover audit: {error}"
+            ))),
+        }
+    }
+
+    /// Delete the local takeover audit and every screenshot. This stops any
+    /// armed session first so a running action cannot write during the purge.
+    pub fn purge(&self) -> Result<Value, Failure> {
+        self.disarm();
+        {
+            let mut state = self.lock();
+            state.audit.clear();
+        }
+        let dir = takeover_dir(&self.vault);
+        let screenshots = screenshots_dir(&self.vault);
+        let screenshot_count = fs::read_dir(&screenshots)
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0);
+        let audit = dir.join("audit.jsonl");
+        if audit.exists() {
+            fs::remove_file(audit)?;
+        }
+        if screenshots.exists() {
+            fs::remove_dir_all(&screenshots)?;
+        }
+        let _ = fs::remove_dir_all(dir.join("tmp"));
+        self.record(
+            "audit_purged",
+            "takeover audit and screenshots deleted",
+            true,
+        );
+        Ok(json!({
+            "ok": true,
+            "screenshotsDeleted": screenshot_count,
+        }))
     }
 
     fn dispatch(&self, request: &ActionRequest, epoch: u64) -> Result<Value, Failure> {
@@ -494,7 +544,7 @@ impl Takeover {
                 state.audit.remove(0);
             }
         }
-        let dir = self.vault.join(".engram").join("takeover");
+        let dir = takeover_dir(&self.vault);
         if fs::create_dir_all(&dir).is_err() {
             return;
         }
@@ -511,6 +561,7 @@ impl Takeover {
         if let Ok(line) = serde_json::to_string(&entry) {
             let _ = writeln!(file, "{line}");
         }
+        trim_audit_file(&audit_path, AUDIT_FILE_BYTES);
     }
 
     fn run_helper(&self, args: &[&str]) -> Result<Value, Failure> {
@@ -649,11 +700,7 @@ impl Takeover {
     }
 
     fn screenshot(&self, epoch: u64) -> Result<Value, Failure> {
-        let dir = self
-            .vault
-            .join(".engram")
-            .join("takeover")
-            .join("screenshots");
+        let dir = screenshots_dir(&self.vault);
         fs::create_dir_all(&dir)?;
         restrict_dir(&dir);
         let name = format!("{}-{}.png", now(), random_hex(4));
@@ -669,6 +716,7 @@ impl Takeover {
             )));
         }
         restrict_file(&path);
+        prune_screenshots(&dir, SCREENSHOT_LIMIT);
         Ok(json!({
             "file": name,
             "url": format!("/api/v1/takeover/screenshot/{name}"),
@@ -773,8 +821,68 @@ impl Takeover {
     }
 }
 
+fn takeover_dir(vault: &Path) -> PathBuf {
+    vault.join(".engram").join("takeover")
+}
+
+fn screenshots_dir(vault: &Path) -> PathBuf {
+    takeover_dir(vault).join("screenshots")
+}
+
+/// Keep the durable audit bounded without dropping newer entries. The file is
+/// trimmed only after it grows past the cap, so normal appends stay cheap.
+fn trim_audit_file(path: &Path, max_bytes: u64) {
+    let Ok(metadata) = fs::metadata(path) else {
+        return;
+    };
+    if metadata.len() <= max_bytes {
+        return;
+    }
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if lines.len() <= AUDIT_FILE_KEEP {
+        return;
+    }
+    let kept = &lines[lines.len() - AUDIT_FILE_KEEP..];
+    let contents = format!("{}\n", kept.join("\n"));
+    let temporary = path.with_extension(format!("tmp-{}", random_hex(4)));
+    if fs::write(&temporary, contents).is_ok() {
+        restrict_file(&temporary);
+        if fs::rename(&temporary, path).is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+    }
+}
+
+fn prune_screenshots(dir: &Path, limit: usize) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "png"))
+        .collect();
+    if files.len() <= limit {
+        return;
+    }
+    files.sort_by_key(|path| {
+        fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH)
+    });
+    for path in files.iter().take(files.len() - limit) {
+        let _ = fs::remove_file(path);
+    }
+}
+
 fn load_audit(vault: &Path) -> Vec<AuditEntry> {
-    let path = vault.join(".engram").join("takeover").join("audit.jsonl");
+    let path = takeover_dir(vault).join("audit.jsonl");
     let Ok(text) = fs::read_to_string(path) else {
         return Vec::new();
     };
@@ -1131,6 +1239,68 @@ mod tests {
         let summary = summarize(&request);
         assert_eq!(summary, "AppleScript action");
         assert!(!summary.contains("private-token"));
+    }
+
+    #[test]
+    fn audit_file_keeps_the_newest_entries() {
+        let vault = test_vault("audit-trim");
+        let path = takeover_dir(&vault).join("audit.jsonl");
+        fs::create_dir_all(path.parent().expect("audit directory")).expect("create audit dir");
+        let total = AUDIT_FILE_KEEP + 5;
+        let contents: String = (0..total)
+            .map(|index| {
+                format!("{{\"at\":{index},\"action\":\"x\",\"summary\":\"s\",\"ok\":true}}\n")
+            })
+            .collect();
+        fs::write(&path, contents).expect("write audit");
+        trim_audit_file(&path, 1);
+        let text = fs::read_to_string(&path).expect("read audit");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), AUDIT_FILE_KEEP);
+        assert!(lines[0].contains("\"at\":5"));
+        assert!(lines
+            .last()
+            .expect("last line")
+            .contains(&format!("\"at\":{}", total - 1)));
+        let _ = fs::remove_dir_all(vault);
+    }
+
+    #[test]
+    fn screenshots_are_pruned_to_the_newest_files() {
+        let vault = test_vault("screenshots");
+        let dir = screenshots_dir(&vault);
+        fs::create_dir_all(&dir).expect("create screenshots dir");
+        for index in 0..4 {
+            fs::write(dir.join(format!("{index}.png")), b"png").expect("write screenshot");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        prune_screenshots(&dir, 2);
+        let mut remaining: Vec<String> = fs::read_dir(&dir)
+            .expect("read screenshots")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        remaining.sort();
+        assert_eq!(remaining, vec!["2.png".to_string(), "3.png".to_string()]);
+        let _ = fs::remove_dir_all(vault);
+    }
+
+    #[test]
+    fn purge_removes_the_audit_and_screenshots() {
+        let vault = test_vault("purge");
+        let takeover = Takeover::new(vault.clone());
+        takeover.arm(15).expect("arm session");
+        let dir = screenshots_dir(&vault);
+        fs::create_dir_all(&dir).expect("create screenshots dir");
+        fs::write(dir.join("one.png"), b"png").expect("write screenshot");
+        let result = takeover.purge().expect("purge");
+        assert_eq!(result["screenshotsDeleted"], 1);
+        assert!(!vault.join(".engram/takeover/screenshots").exists());
+        let audit = fs::read_to_string(vault.join(".engram/takeover/audit.jsonl"))
+            .expect("recreated audit");
+        assert!(audit.contains("audit_purged"));
+        assert!(!audit.contains("session_armed"));
+        let _ = fs::remove_dir_all(vault);
     }
 
     #[test]

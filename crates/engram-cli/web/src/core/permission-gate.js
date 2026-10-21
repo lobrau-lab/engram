@@ -20,6 +20,21 @@ const EFFECT_POLICIES = new Map([
 
 const RISK_LEVELS = new Set(['low', 'medium', 'high', 'critical']);
 
+/**
+ * Reject a model-requested tool that was never offered on this request.
+ * This also enforces the local-only computer control boundary even if a
+ * remote model hallucinates the tool name.
+ */
+export function toolCallRejection(name, offeredNames, endpointKind) {
+  if (!offeredNames.has(name)) {
+    return { code: 'tool_not_offered', error: 'The model requested a tool that was not offered for this request.' };
+  }
+  if (name === 'computer_use' && endpointKind !== 'local') {
+    return { code: 'local_inference_required', error: 'Computer control requires a loopback on-device model.' };
+  }
+  return null;
+}
+
 export async function authorizeToolInvocation(tool, args = {}, callbacks = {}) {
   if (!tool) return denied('unknown_tool', 'This tool is not registered.');
   const minimumApproval = EFFECT_POLICIES.get(tool.effect);

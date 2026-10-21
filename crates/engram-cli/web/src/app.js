@@ -5,6 +5,7 @@ import { listModels, setModelLoaded, streamChat } from './providers/openai-compa
 import { searchEngramVault } from './providers/engram-vault.js';
 import { applicationTools, executeApplicationAction, executeProjectAction } from './core/app-actions.js';
 import { classifyEndpoint, canSendVaultContext, requestCategories, confirmDisclosure, supportsFunctionTools } from './core/privacy-policy.js';
+import { toolCallRejection } from './core/permission-gate.js';
 import { runMemoryBench } from './core/evaluation-bench.js';
 
 const $ = selector => document.querySelector(selector);
@@ -466,6 +467,36 @@ async function computerUseForTool(args) {
   }
 }
 
+async function exportTakeoverAudit() {
+  try {
+    const response = await fetch('/api/v1/takeover/audit/export', { headers: { 'X-Threadline-Local-Control': '1' } });
+    if (!response.ok) throw new Error('Could not read the takeover audit.');
+    const blob = await response.blob();
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = `engram-takeover-audit-${new Date().toISOString().slice(0, 10)}.jsonl`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+    toast('Takeover audit exported.');
+  } catch (error) {
+    toast(`Export failed: ${error.message}`);
+  }
+}
+
+async function purgeTakeoverData() {
+  if (!confirm('Delete the local takeover audit and every screenshot? This cannot be undone.')) return;
+  try {
+    const response = await fetch('/api/v1/takeover/purge', { method: 'POST', headers: takeoverHeaders(), body: '{}' });
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || 'Could not delete takeover data.');
+    takeoverResult = ''; takeoverTree = ''; takeoverShot = '';
+    await loadTakeover(true);
+    toast(`Takeover data deleted (${data.screenshotsDeleted} screenshot(s)).`);
+  } catch (error) {
+    toast(`Delete failed: ${error.message}`);
+  }
+}
+
 function renderTakeoverView(host) {
   if (!takeoverStatus) {
     host.innerHTML = '<div class="page-heading"><div class="eyebrow">GUI CONTROL</div><h1>Takeover</h1><p>Reading accessibility and screen state…</p></div>';
@@ -517,7 +548,7 @@ function renderTakeoverView(host) {
     ${takeoverResult ? `<pre class="app-result takeover-result" aria-live="polite">${esc(takeoverResult)}</pre>` : ''}
     ${takeoverTree ? `<details class="takeover-tree"><summary>Accessibility / window output</summary><pre class="app-result">${esc(takeoverTree)}</pre></details>` : ''}
     ${takeoverShot ? `<section class="takeover-shot"><div class="section-title">SCREEN CAPTURE <a href="${esc(takeoverShot)}" target="_blank" rel="noreferrer">open full size ↗</a></div><img src="${esc(takeoverShot)}" alt="Most recent screen capture" /></section>` : ''}
-    <section class="settings-card takeover-card wide-card takeover-audit-card"><div class="settings-card-heading"><span class="settings-icon warm">◷</span><div><h2>Action audit</h2><p>Stored locally under <code>.engram/takeover/audit.jsonl</code></p></div><span class="module-label">${audit.length} EVENTS</span></div><div class="takeover-audit">${auditRows}</div></section>`;
+    <section class="settings-card takeover-card wide-card takeover-audit-card"><div class="settings-card-heading"><span class="settings-icon warm">◷</span><div><h2>Action audit</h2><p>Stored locally under <code>.engram/takeover/audit.jsonl</code> · newest ${takeoverStatus.retention?.auditKeepEntries ?? 2000} entries and ${takeoverStatus.retention?.screenshots ?? 50} screenshots are kept</p></div><div class="takeover-inline"><button class="mini-button" type="button" id="takeover-export">Export JSONL</button><button class="mini-button" type="button" id="takeover-purge">Delete data</button></div><span class="module-label">${audit.length} EVENTS</span></div><div class="takeover-audit">${auditRows}</div></section>`;
 
   if (!activeLocal) {
     host.querySelectorAll('.takeover-grid button, .takeover-grid input, .takeover-grid textarea, .takeover-grid select').forEach(element => { element.disabled = true; });
@@ -529,6 +560,8 @@ function renderTakeoverView(host) {
   $('[data-takeover-pause]')?.addEventListener('click', () => stopTakeover());
   $('#takeover-refresh')?.addEventListener('click', () => loadTakeover(true));
   $('#takeover-permission')?.addEventListener('click', requestTakeoverPermission);
+  $('#takeover-export')?.addEventListener('click', exportTakeoverAudit);
+  $('#takeover-purge')?.addEventListener('click', purgeTakeoverData);
   host.querySelectorAll('[data-takeover-focus]').forEach(button => button.addEventListener('click', () => performTakeoverAction({ action: 'focus', app: button.dataset.takeoverFocus }, `Focusing ${button.dataset.takeoverFocus}`)));
   host.querySelectorAll('[data-takeover-tree]').forEach(button => button.addEventListener('click', () => performTakeoverAction({ action: 'tree', app: button.dataset.takeoverTree, depth: 6 }, `Reading the UI tree for ${button.dataset.takeoverTree}`)));
   $('[data-takeover-focus-target]')?.addEventListener('click', () => performTakeoverAction({ action: 'focus', app: $('#takeover-app').value.trim() }, 'Focusing application'));
@@ -644,6 +677,7 @@ async function submitMessage(message) {
   const modelTools = !toolsSupported ? [] : endpoint.kind === 'local'
     ? applicationTools
     : applicationTools.filter(tool => !tool.function.name.startsWith('project_') && tool.function.name !== 'run_project_check' && tool.function.name !== 'computer_use');
+  const offeredToolNames = new Set(modelTools.map(tool => tool.function.name));
   const allowVaultContext = canSendVaultContext(settings.baseUrl, settings.vaultSearchEnabled);
   if (settings.vaultSearchEnabled && !allowVaultContext) toast('Vault context is disabled for remote inference.');
   sending = true; $('#send-button').textContent = '■'; $('#send-button').setAttribute('aria-label', 'Stop generation');
@@ -720,6 +754,11 @@ async function submitMessage(message) {
           trustedTakeover: isTakeoverArmed(),
           confirm: message => confirmToolAction(message)
         };
+        const rejection = toolCallRejection(call.function.name, offeredToolNames, endpoint.kind);
+        if (rejection) {
+          toolMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ ok: false, ...rejection }) });
+          continue;
+        }
         if (call.function.name === 'computer_use' && !isTakeoverArmed()) {
           toolMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ ok: false, code: 'takeover_not_armed', error: 'Arm a takeover session in the Takeover view before using computer control.' }) });
           continue;

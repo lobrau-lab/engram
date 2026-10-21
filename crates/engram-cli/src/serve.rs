@@ -319,6 +319,13 @@ fn dispatch(
         ("POST", "/api/v1/takeover/disarm") if local_control => takeover_disarm(takeover),
         ("POST", "/api/v1/takeover/action") if local_control => takeover_action(takeover, body),
         ("POST", "/api/v1/takeover/permission") if local_control => takeover_permission(takeover),
+        ("GET", "/api/v1/takeover/audit/export") if local_control => {
+            takeover_audit_export(takeover)
+        }
+        ("GET", "/api/v1/takeover/audit/export") => {
+            project_error(403, "local control header required")
+        }
+        ("POST", "/api/v1/takeover/purge") if local_control => takeover_purge(takeover),
         ("GET", path) if path.starts_with("/api/v1/takeover/screenshot/") => {
             takeover_screenshot(takeover, path)
         }
@@ -556,6 +563,20 @@ fn takeover_action(takeover: &Takeover, body: &str) -> Vec<u8> {
 
 fn takeover_permission(takeover: &Takeover) -> Vec<u8> {
     match takeover.request_permission() {
+        Ok(value) => response(200, "application/json; charset=utf-8", &value.to_string()),
+        Err(error) => takeover_failure(error),
+    }
+}
+
+fn takeover_audit_export(takeover: &Takeover) -> Vec<u8> {
+    match takeover.audit_export() {
+        Ok(bytes) => response_bytes(200, "application/x-ndjson; charset=utf-8", &bytes),
+        Err(error) => takeover_failure(error),
+    }
+}
+
+fn takeover_purge(takeover: &Takeover) -> Vec<u8> {
+    match takeover.purge() {
         Ok(value) => response(200, "application/json; charset=utf-8", &value.to_string()),
         Err(error) => takeover_failure(error),
     }
