@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
-const MAX_BODY_BYTES: usize = 512 * 1024;
+const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ACTIVE_CONNECTIONS: usize = 64;
 
 struct ConnectionLimiter {
@@ -302,6 +302,8 @@ fn dispatch(
                 None => response(404, "text/plain; charset=utf-8", "Not found"),
             }
         }
+        ("GET", "/api/v1/workspace") => workspace_get(vault),
+        ("PUT", "/api/v1/workspace") => workspace_put(vault, body),
         ("GET", "/api/v1/project/status") => project_status(project_root),
         ("GET", "/api/v1/project/files") => project_files(project_root, query),
         ("GET", "/api/v1/project/read") => project_read(project_root, query),
@@ -940,6 +942,53 @@ fn omlx_action(action: &str) -> Vec<u8> {
             response(500, "application/json; charset=utf-8", &serde_json::json!({"ok": false, "error": detail}).to_string())
         }
         Err(error) => response(500, "application/json; charset=utf-8", &serde_json::json!({"ok": false, "error": format!("Could not run the oMLX CLI: {error}")}).to_string()),
+    }
+}
+
+fn workspace_get(vault: &Path) -> Vec<u8> {
+    match crate::threadline_store::load(vault) {
+        Ok(Some(loaded)) => response(
+            200,
+            "application/json; charset=utf-8",
+            &serde_json::json!({
+                "workspace": loaded.workspace,
+                "revision": loaded.revision,
+            })
+            .to_string(),
+        ),
+        Ok(None) => response(
+            200,
+            "application/json; charset=utf-8",
+            r#"{"workspace":null,"revision":null}"#,
+        ),
+        Err(error) => response(
+            500,
+            "application/json; charset=utf-8",
+            &serde_json::json!({"error": format!("workspace is unavailable: {error}")}).to_string(),
+        ),
+    }
+}
+
+fn workspace_put(vault: &Path, body: &str) -> Vec<u8> {
+    use crate::threadline_store::SaveError;
+
+    match crate::threadline_store::save(vault, body) {
+        Ok(revision) => response(
+            200,
+            "application/json; charset=utf-8",
+            &serde_json::json!({"ok": true, "revision": revision}).to_string(),
+        ),
+        Err(SaveError::Conflict(revision)) => response(
+            409,
+            "application/json; charset=utf-8",
+            &serde_json::json!({
+                "error": "workspace changed in another tab",
+                "revision": revision,
+            })
+            .to_string(),
+        ),
+        Err(SaveError::BadRequest(error)) => project_error(400, &error),
+        Err(SaveError::Internal(error)) => project_error(500, &error),
     }
 }
 
@@ -2032,6 +2081,7 @@ fn response_bytes(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
+        409 => "Conflict",
         413 => "Payload Too Large",
         415 => "Unsupported Media Type",
         501 => "Not Implemented",

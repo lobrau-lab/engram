@@ -70,3 +70,10 @@
 .takeover-audit-card code{font:8px var(--mono);color:#b7c5a6}
 @media(max-width:1050px){.takeover-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.takeover-grid{grid-template-columns:1fr}.takeover-card.wide-card{grid-column:auto}}
 @media(max-width:700px){.takeover-hero{flex-direction:column;align-items:flex-start}.takeover-hero-actions{justify-content:flex-start}.takeover-stats{grid-template-columns:1fr}.takeover-audit-row{grid-template-columns:55px 1fr}.takeover-audit-row span{grid-column:2}.takeover-pill #takeover-pill-label{display:none}.takeover-pill{padding:5px 7px}.takeover-pill .takeover-stop{font-size:7px}}
+
+/* Vault-backed workspace status */
+.workspace-banner{position:fixed;top:0;left:0;right:0;z-index:60;display:flex;align-items:center;justify-content:space-between;gap:14px;padding:10px 18px;border-bottom:1px solid #6a4d32;background:#2a2118;color:#e7d4b4;font-size:10px;line-height:1.5;box-shadow:0 8px 30px #00000030}
+.workspace-banner-actions{display:flex;align-items:center;gap:7px;flex:0 0 auto}
+.workspace-banner .primary-button,.workspace-banner .secondary-button{padding:6px 9px;font-size:8px}
+@media(max-width:700px){.workspace-banner{align-items:flex-start;flex-direction:column;gap:8px;padding:9px 13px}.workspace-banner-actions{width:100%}.workspace-banner-actions button{flex:1}}
+.workspace-import{display:inline-flex;align-items:center;justify-content:center;cursor:pointer;line-height:1.2}

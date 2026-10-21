@@ -12,6 +12,7 @@ use engram_core::{
 
 mod serve;
 mod takeover;
+mod threadline_store;
 
 #[derive(Parser, Debug)]
 #[command(

@@ -9,6 +9,13 @@
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
+    <div class="workspace-banner hidden" id="workspace-banner" role="alert">
+      <span id="workspace-banner-text"></span>
+      <div class="workspace-banner-actions">
+        <button class="primary-button" type="button" id="workspace-reload">Reload vault copy</button>
+        <button class="secondary-button" type="button" id="workspace-export">Export my copy</button>
+      </div>
+    </div>
     <div class="app-shell">
       <aside class="sidebar">
         <a class="brand" href="#" aria-label="Threadline home"><span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span><span>Threadline</span></a>
@@ -29,7 +36,7 @@
         <div class="side-label history-label">RECENT THREADS <button id="clear-history" title="Clear local history">···</button></div>
         <div class="thread-list" id="thread-list"></div>
         <div class="sidebar-bottom">
-          <div class="local-status"><span class="status-light"></span><div><strong>Local workspace</strong><small>Your data stays in this browser</small></div></div>
+          <div class="local-status"><span class="status-light"></span><div><strong>Local workspace</strong><small>Saved in this vault</small></div></div>
           <button class="profile" id="profile-button"><span class="avatar">T</span><span><b>Personal workspace</b><small>Prototype · v0.1</small></span><span class="chevron">⌄</span></button>
         </div>
       </aside>
@@ -77,7 +84,7 @@
         <div class="inspector-head"><div><div class="eyebrow">LIVE SYSTEM</div><h2>Context inspector</h2></div><button class="icon-button" id="close-inspector" aria-label="Close inspector">×</button></div>
         <div class="inspector-tabs"><button class="inspector-tab active" data-tab="assembly">Assembly</button><button class="inspector-tab" data-tab="memory">Memory <span id="inspector-memory-count">0</span></button><button class="inspector-tab" data-tab="rules">Rules</button></div>
         <div id="inspector-content" class="inspector-content"></div>
-        <div class="inspector-footer"><span class="tiny-ring"></span><span>Incremental updates · local storage</span><button id="refresh-inspector" title="Refresh">↻</button></div>
+        <div class="inspector-footer"><span class="tiny-ring"></span><span>Incremental updates · vault workspace</span><button id="refresh-inspector" title="Refresh">↻</button></div>
       </aside>
     </div>
     <dialog id="remote-consent" aria-labelledby="remote-consent-title"><form method="dialog"><h2 id="remote-consent-title">Review remote data sharing</h2><div id="remote-consent-body"></div><div class="dialog-actions"><button value="cancel">Cancel</button><button id="remote-consent-allow" value="allow">Allow this request</button></div></form></dialog>
