@@ -6,8 +6,10 @@ provider code. Engram serves these source assets from `/threadline/` and embeds
 them into the CLI binary with `include_str!`; keep the relative module paths
 intact when editing them.
 
-Browser conversation state remains in `localStorage`, while Engram's Markdown
-vault and SQLite index remain on disk. When the Vault toggle is enabled,
+Conversation state is saved through the same-origin workspace API to
+`.engram/threadline/workspace.json`; the browser keeps `localStorage` only as a
+fallback and migration source. Engram's Markdown vault and SQLite index remain
+on disk. When the Vault toggle is enabled,
 Threadline retrieves matching snippets from Engram's same-origin
 `/api/v1/vault/search` endpoint and packs selected snippets under its existing
 estimated context budget. The inspector and assistant source list link each

@@ -28,6 +28,15 @@ been removed.
 - **Removed unused incremental sync.** `Index::sync_vault` and
   `IndexSyncStats` had no production caller. Incremental refresh can return
   when a real stale-index path exists.
+- **Vault-backed Threadline workspace (G1.3).** Conversations, non-secret
+  settings, and derived memory now live in
+  `.engram/threadline/workspace.json`. The file is schema-versioned, bounded,
+  written atomically with `0600` permissions, and protected by a revision
+  check. Legacy `localStorage` data migrates on first load; a local fallback
+  remains when the server is unavailable. Unsynced local changes stay visible
+  rather than being silently replaced. Settings expose explicit JSON
+  export/import. Encrypted note backups exclude `.engram`, so the workspace is
+  exported separately and that limitation is documented.
 
 ## Verification
 
@@ -37,8 +46,9 @@ Run from `/Users/tk/engram` on macOS:
 |---|---|
 | `cargo fmt --all -- --check` | pass |
 | `cargo clippy --workspace --all-targets -- -D warnings` | pass |
-| `cargo test --workspace` | 73 passed, 0 failed |
-| `node crates/engram-cli/web/tests/*.test.mjs` (all seven files) | pass |
+| `cargo test --workspace` | 78 passed, 0 failed |
+| `node crates/engram-cli/web/tests/*.test.mjs` (all eight files) | pass |
+| Localhost workspace API walkthrough | GET empty, PUT/GET round-trip, stale `409`, credential `400`, `0600`/`0700` modes |
 
 The takeover retention and tool-call guard are covered by the previous commit
 `ff6e00f` plus the JavaScript tests.
@@ -55,8 +65,8 @@ The takeover retention and tool-call guard are covered by the previous commit
 - Restore publication is atomic on Unix. On non-Unix targets the existing
   check-then-rename path remains; Windows `rename` refuses to replace an
   existing directory.
-- G1.2 (automatic stale-index detection) and G1.3 (vault-backed workspace)
-  remain open. Personal v1 is not tagged.
+- G1.2 (automatic stale-index detection) remains open. Personal v1 is not
+  tagged.
 
 ## Personal-use boundary
 

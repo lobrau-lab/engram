@@ -58,9 +58,6 @@ The important gaps are not "does the chat work?" They are:
   The web vault can create, edit, rename, trash, and restore notes. The index is
   updated for web writes; files changed outside the UI still require
   `engram index`, and there is no stale-index warning yet.
-- **Threadline conversations/settings/memory live in browser `localStorage`.**
-  Clearing site data loses them, and they do not follow the vault to another
-  browser. This conflicts with the stated "metadata under `.engram/`" model.
 - **There is no guided no-model first-run state.** The available-model path is
   verified; the unavailable/malformed/endpoint-setup paths are not.
 - **The capability digest is shallow.** It records a CLI/app's version/help/flags
@@ -164,10 +161,6 @@ Status vocabulary:
 
 ### 1.3 What is partial or misleading if left as-is
 
-- **"Conversation history under `.engram/`" is not true yet.** `DECISIONS.md`
-  says metadata is disposable derived state under `.engram/`; the README says
-  Threadline uses `localStorage`. That must be reconciled. A browser profile
-  reset currently loses conversations and memory.
 - **"Import supports HTML" is core-only.** The extractor and tests exist, but a
   user cannot invoke `import_file` from the CLI or UI. `import-files` only copies
   Markdown/text.
@@ -328,6 +321,12 @@ the server mid-write; reopen; the index is either correct or visibly stale, not
 silently wrong.
 
 #### G1.3 Vault-backed Threadline workspace
+
+**Status:** implemented. Workspace is stored at
+`.engram/threadline/workspace.json` with schema versioning, size/structure
+limits, atomic private writes, migration from `localStorage`, local fallback,
+revision conflicts, and explicit export/import. Encrypted note backups still
+exclude `.engram`; the README and settings UI call out the separate export.
 
 Move conversations, non-secret settings, and derived memory to an atomic
 workspace file under `.engram/threadline/` (for example `workspace.json`).

@@ -18,6 +18,17 @@ state under `.engram/`. Index rebuilds stream notes from disk instead of
 buffering every body. Incremental sync stays out of the codebase until a real
 stale-index refresh path exists.
 
+## Threadline workspace
+
+Threadline conversations, non-secret settings, and derived memory live in
+`.engram/threadline/workspace.json`. The document is schema-versioned, size-
+and structure-bounded, written atomically with `0600` permissions, and saved
+through a revisioned same-origin API. A stale revision returns `409` and the
+UI shows a conflict; it never silently interleaves two tabs. `localStorage` is
+only a fallback and migration source. API keys, session tokens, and screenshot
+data are excluded. Encrypted backups exclude `.engram`, so the workspace has
+its own explicit JSON export/import rather than being silently omitted.
+
 ## Import scope
 
 The first import path accepts Markdown, Markdown-like text, and plain text.

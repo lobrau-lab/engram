@@ -59,8 +59,16 @@ built-in model on first launch and selects it automatically. **Connections &
 settings** shows its readiness and lets you switch back to it at any time.
 The built-in provider currently supports text chat, not function-tool calls.
 
-Threadline conversations, settings, and derived conversation memory remain in
-browser `localStorage`; Engram notes and the SQLite index remain in the vault.
+Threadline conversations, settings, and derived conversation memory are saved
+in the vault at `.engram/threadline/workspace.json` through a versioned,
+same-origin API. The file is written atomically with private permissions. The
+browser keeps a `localStorage` copy as a fallback and migrates legacy browser
+data into the vault on first load. Provider API keys stay in page memory and
+are never written to the workspace. A second tab that saves first is reported
+as a visible conflict instead of being silently overwritten. Use **Connections
+& settings → Export workspace** to keep an explicit JSON copy. Encrypted
+`.engram` backups exclude vault metadata, so export the workspace separately
+before restoring elsewhere.
 The **Vault** composer toggle queries Engram's same-origin read-only search API
 and packs selected note snippets into the request alongside conversation
 context. The context inspector shows which notes were packed and links back to
@@ -172,7 +180,9 @@ cargo build --workspace --release
 # Start and open the workspace automatically
 ./target/release/engram --vault /path/to/vault open
 
-# Encrypted portable backup (password is never passed on the command line)
+# Encrypted portable backup (password is never passed on the command line).
+# Backups include Markdown notes, not .engram metadata such as the Threadline
+# workspace; export that separately from Connections & settings.
 export ENGRAM_BACKUP_PASSWORD='use a strong password'
 ./target/release/engram --vault /path/to/vault backup /path/to/backup.engram
 ./target/release/engram --vault /path/to/restored restore /path/to/backup.engram
