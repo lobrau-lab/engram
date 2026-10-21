@@ -19,22 +19,23 @@
   `.engram/threadline/workspace.json`, with schema/size bounds, atomic private
   writes, localStorage migration/fallback, revision conflict handling, and
   explicit export/import.
+- G1.2: stat-only vault fingerprint with automatic refresh before CLI and
+  Threadline vault searches; external edits, additions, and removals are tested,
+  including a 250-note fixture.
 
 ## Still open
 
-1. G1.2: automatic stale-index detection. Reintroduce incremental sync only
-   with a real refresh path.
-2. Re-run the full macOS takeover walkthrough and update
+1. Re-run the full macOS takeover walkthrough and update
    `docs/QA_PERSONAL_V1.md`.
-3. Tag personal v1 only after the remaining milestones and checks pass.
-4. Public release remains blocked by owner, legal, credential, and independent
+2. Tag personal v1 only after the remaining milestones and checks pass.
+3. Public release remains blocked by owner, legal, credential, and independent
    review gates.
 
 ## Current evidence
 
 - `cargo fmt --all -- --check`: pass.
 - `cargo clippy --workspace --all-targets -- -D warnings`: pass.
-- `cargo test --workspace`: 78 passed, 0 failed.
+- `cargo test --workspace`: 82 passed, 0 failed.
 - All eight JavaScript test files: pass.
 - Manual localhost API walkthrough: GET empty, PUT, GET round-trip, stale `409`,
   credential `400`, and `0600`/`0700` file/directory modes.

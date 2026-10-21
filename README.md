@@ -72,8 +72,10 @@ before restoring elsewhere.
 The **Vault** composer toggle queries Engram's same-origin read-only search API
 and packs selected note snippets into the request alongside conversation
 context. The context inspector shows which notes were packed and links back to
-their source. Edits made in the web vault update the index immediately; run
-`engram index` after changing Markdown files outside the web UI. Context token
+their source. Edits made in the web vault update the index immediately. CLI
+search/ask and Threadline vault search compare a stat-only vault fingerprint and
+rebuild the index when Markdown files changed outside the UI; `engram index`
+remains available for an explicit rebuild. Context token
 counts remain estimates.
 
 The Vault view supports creating and editing notes, renaming them, and moving

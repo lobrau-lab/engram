@@ -50,12 +50,30 @@ audit entries present.
 
 ### G1.2 index freshness
 
-- Web note create/save/rename/delete/restore now update SQLite immediately.
+Implemented:
+
+- Web note create/save/rename/delete/restore update SQLite immediately.
 - `POST /index` and a visible **Rebuild index** button rebuild the whole vault.
-- The Threadline vault-search warning no longer claims the index is missing when
-  hits exist.
-- Still missing: automatic stale detection for Markdown files changed outside
-  the web UI.
+- `Index::is_stale` compares a stat-only fingerprint of note paths, mtimes, and
+  sizes with the fingerprint stored at the last rebuild.
+- CLI `search`, `lexical`, and `ask` refresh the index before querying.
+- Threadline's `/api/v1/vault/search` refreshes before querying and returns
+  `rebuilt` in its JSON response. A failed rebuild returns an error instead of
+  serving old hits as fresh.
+- A process-wide refresh lock prevents concurrent rebuilds from racing.
+
+Verification:
+
+```sh
+cargo test -p engram-core --lib index::tests
+cargo test -p engram-cli --bin engram vault_search_reindexes_external_markdown_edits
+```
+
+Coverage includes an external edit, external additions/removals, and a 250-note
+fixture. A live CLI run indexed a fresh vault on first search, then found
+replacement text immediately after an external edit and no longer returned the
+old text. A live web run showed the same behaviour, with `rebuilt: true` on the
+request after the external edit.
 
 ### G1.3 vault-backed workspace
 
@@ -86,4 +104,5 @@ A live localhost run also passed: empty `GET`, `PUT`, `GET` round-trip, stale
 
 ### Remaining in G1
 
-- G1.2: stale-index detection for external edits.
+No open G1 implementation items. The full macOS takeover walkthrough remains
+open.

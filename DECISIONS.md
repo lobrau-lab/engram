@@ -15,8 +15,10 @@ or takeover behavior.
 Markdown remains the canonical source of truth. The SQLite index, embeddings,
 graph data, conversation history, and other metadata are disposable derived
 state under `.engram/`. Index rebuilds stream notes from disk instead of
-buffering every body. Incremental sync stays out of the codebase until a real
-stale-index refresh path exists.
+buffering every body. Freshness is checked with a stat-only vault fingerprint
+(paths, mtimes, sizes); CLI search/ask and Threadline vault search rebuild on a
+mismatch, so external Markdown edits are searchable immediately. Incremental
+sync stays out until a cheaper refresh path is justified.
 
 ## Threadline workspace
 

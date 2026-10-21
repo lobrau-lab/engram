@@ -26,8 +26,13 @@ been removed.
   paths, restore destinations, and concurrent search during indexing are
   tested.
 - **Removed unused incremental sync.** `Index::sync_vault` and
-  `IndexSyncStats` had no production caller. Incremental refresh can return
-  when a real stale-index path exists.
+  `IndexSyncStats` had no production caller. A cheaper incremental refresh can
+  return if fingerprint-triggered full rebuilds prove too slow.
+- **Automatic index freshness (G1.2).** Each rebuild stores a stat-only
+  fingerprint of note paths, mtimes, and sizes. CLI search/ask and Threadline
+  vault search rebuild before querying when the vault no longer matches.
+  Rebuild failures surface as errors rather than returning old hits as fresh.
+  Tests cover external edits, additions, removals, and a 250-note fixture.
 - **Vault-backed Threadline workspace (G1.3).** Conversations, non-secret
   settings, and derived memory now live in
   `.engram/threadline/workspace.json`. The file is schema-versioned, bounded,
@@ -46,9 +51,10 @@ Run from `/Users/tk/engram` on macOS:
 |---|---|
 | `cargo fmt --all -- --check` | pass |
 | `cargo clippy --workspace --all-targets -- -D warnings` | pass |
-| `cargo test --workspace` | 78 passed, 0 failed |
+| `cargo test --workspace` | 82 passed, 0 failed |
 | `node crates/engram-cli/web/tests/*.test.mjs` (all eight files) | pass |
 | Localhost workspace API walkthrough | GET empty, PUT/GET round-trip, stale `409`, credential `400`, `0600`/`0700` modes |
+| Live index refresh walkthrough | CLI and web: external edit found immediately; old text absent |
 
 The takeover retention and tool-call guard are covered by the previous commit
 `ff6e00f` plus the JavaScript tests.
@@ -65,8 +71,7 @@ The takeover retention and tool-call guard are covered by the previous commit
 - Restore publication is atomic on Unix. On non-Unix targets the existing
   check-then-rename path remains; Windows `rename` refuses to replace an
   existing directory.
-- G1.2 (automatic stale-index detection) remains open. Personal v1 is not
-  tagged.
+- Personal v1 is not tagged.
 
 ## Personal-use boundary
 

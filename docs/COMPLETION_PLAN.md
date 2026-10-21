@@ -47,17 +47,17 @@ front door. On a Mac with macOS 26+ and Apple Intelligence, it can:
 
 The personal presentation path is complete. A 50-run first-run simulation passed
 50/50 with 950/950 HTTP 200s and no console/page/request failures. The latest
-10-run post-change simulation also passed 10/10. Rust tests, 7 JS tests, clippy,
+10-run post-change simulation also passed 10/10. Rust tests, 8 JS tests, clippy,
 formatting, and release builds pass. Real macOS control has been exercised.
 
 ### What it cannot do yet
 
 The important gaps are not "does the chat work?" They are:
 
-- **Note lifecycle is now implemented, but external edits still need a rebuild.**
-  The web vault can create, edit, rename, trash, and restore notes. The index is
-  updated for web writes; files changed outside the UI still require
-  `engram index`, and there is no stale-index warning yet.
+- **Note lifecycle and index freshness are implemented.** The web vault can
+  create, edit, rename, trash, and restore notes. Web writes update the index;
+  CLI and Threadline searches compare a stat-only vault fingerprint and rebuild
+  when files changed outside the UI.
 - **There is no guided no-model first-run state.** The available-model path is
   verified; the unavailable/malformed/endpoint-setup paths are not.
 - **The capability digest is shallow.** It records a CLI/app's version/help/flags
@@ -124,9 +124,9 @@ Status vocabulary:
 
 | Area | What it can do now | Status | Important limit |
 |---|---|---|---|
-| CLI / vault | `init`, `index`, `search` (OR/AND), `lexical`, `ask`, sync `export`/`import` with dry-run, `serve`, `open` (auto-inits empty/hidden-only vaults; `serve` is explicit), encrypted `backup`/`restore`, `import-files` | **Verified** | Index is manual for external edits; `ask` uses an OpenAI-compatible endpoint, not the embedded model; `import-files` copies only `.md`/`.markdown`/`.txt` |
-| Web vault | `/vault` search, note view with backlinks/broken links, new note, edit/save, rename, trash/restore, simple SVG graph, `/ask`, dump inbox/review | **Verified** | No stale-index warning; `/ask` requires a configured endpoint |
-| Threadline chat | Streaming chat, multiple conversations, context inspector, vault-context toggle, provider settings, accent themes | **Verified** | Conversations/settings/memory are browser-local; no cross-browser history; no server-side export |
+| CLI / vault | `init`, `index`, `search` (OR/AND), `lexical`, `ask`, sync `export`/`import` with dry-run, `serve`, `open` (auto-inits empty/hidden-only vaults; `serve` is explicit), encrypted `backup`/`restore`, `import-files` | **Verified** | Index refreshes automatically on external edits; `ask` uses an OpenAI-compatible endpoint, not the embedded model; `import-files` copies only `.md`/`.markdown`/`.txt` |
+| Web vault | `/vault` search, note view with backlinks/broken links, new note, edit/save, rename, trash/restore, simple SVG graph, `/ask`, dump inbox/review | **Verified** | `/ask` requires a configured endpoint |
+| Threadline chat | Streaming chat, multiple conversations, context inspector, vault-context toggle, provider settings, accent themes | **Verified** | Workspace is vault-backed; no cross-device sync; no hosted inference by default |
 | Memory | Per-conversation ledger, source-linked assertions, conflict preservation, deterministic decision-rule view, synthetic replay bench | **Implemented, prototype** | Lightweight heuristics, not truth detection; cross-chat recall is off; token counts are estimates |
 | Embedded inference | Apple Foundation Models in-process on macOS 26+, auto-detection, `/api/v1/inference/embedded`, `/v1/models`, same-origin `/v1/chat/completions`, serialized inference | **Verified** | macOS 26+ and Apple Intelligence required; text only; cannot call `computer_use` |
 | External inference | OpenAI-compatible endpoint, model discovery, explicit remote disclosure, tool-call fallback, fixed oMLX start/stop/restart and model load/unload | **Implemented; partial verification** | Browser calls the endpoint directly; API key is page-session-only; remote endpoints never receive `computer_use`; no real remote-model compatibility suite |
@@ -306,9 +306,10 @@ Acceptance:
 
 #### G1.2 Index freshness
 
-**Status:** partial. Web create/save/rename/delete/restore and dump apply update
-the index; the Vault view has a one-click rebuild. Stale detection for files
-changed outside the UI is still missing.
+**Status:** implemented. Web create/save/rename/delete/restore and dump apply
+update the index; the Vault view keeps a one-click rebuild. CLI search/ask and
+Threadline vault search compare a stat-only fingerprint of note paths, mtimes,
+and sizes, and rebuild before searching when the vault changed outside the UI.
 
 - Add incremental index/update/remove operations after web note writes and dump
   applies.
