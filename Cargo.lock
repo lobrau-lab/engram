@@ -393,6 +393,7 @@ dependencies = [
  "chat-applefm",
  "chat-core",
  "html2text",
+ "miniz_oxide",
  "rand",
  "rusqlite",
  "serde",

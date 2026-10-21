@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::embed::Embedder;
-use crate::vault::Note;
+use crate::vault::{Note, Vault};
 
 pub const STOPWORDS: &[&str] = &[
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "has", "have", "he",
@@ -126,6 +126,41 @@ impl Index {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Rebuild the index by streaming notes directly from disk via `Vault::scan_each`,
+    /// eliminating the need to buffer all note bodies in heap memory simultaneously.
+    pub fn rebuild_from_vault(
+        &self,
+        vault: &Vault,
+        embedder: &dyn Embedder,
+        indexed_at: i64,
+    ) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch("DELETE FROM notes; DELETE FROM notes_fts; DELETE FROM meta WHERE key = 'last_indexed';")?;
+        let mut count = 0usize;
+        vault.scan_each(|note| {
+            let tags = note.tags.join(",");
+            let links = note.links.join(",");
+            let embedding =
+                f32s_to_bytes(&embedder.embed(&format!("{} {} {}", note.title, note.body, tags)));
+            tx.execute(
+                "INSERT INTO notes(id, title, body, tags, links, mtime, embedding) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![note.id, note.title, note.body, tags, links, note.mtime, embedding],
+            )?;
+            tx.execute(
+                "INSERT INTO notes_fts(id, title, body, tags) VALUES(?1, ?2, ?3, ?4)",
+                params![note.id, note.title, note.body, tags],
+            )?;
+            count += 1;
+            Ok(())
+        })?;
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES('last_indexed', ?1)",
+            params![indexed_at.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(count)
     }
 
     pub fn set_last_indexed(&self, ts: i64) -> Result<()> {
@@ -345,7 +380,7 @@ fn bytes_to_f32s(b: &[u8]) -> Vec<f32> {
 mod tests {
     use super::Index;
     use crate::embed::HashingEmbedder;
-    use crate::vault::Note;
+    use crate::vault::{Note, Vault};
 
     #[test]
     fn remove_drops_a_note_from_search() {
@@ -400,6 +435,38 @@ mod tests {
         let reopened = Index::open(&path).unwrap();
         assert_eq!(reopened.get_last_indexed().unwrap(), Some(42));
         drop(reopened);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rebuild_from_vault_streams_all_notes() {
+        let dir = std::env::temp_dir().join(format!(
+            "engram-index-stream-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..10 {
+            std::fs::write(
+                dir.join(format!("note_{i}.md")),
+                format!("# Note {i}\nBody content with tag #streamed and [[link_{i}]]\n"),
+            )
+            .unwrap();
+        }
+
+        let vault = Vault::open(&dir).unwrap();
+        let index = Index::open(&dir.join("index.sqlite")).unwrap();
+        let embedder = HashingEmbedder::new(64);
+
+        let count = index.rebuild_from_vault(&vault, &embedder, 100).unwrap();
+        assert_eq!(count, 10);
+
+        let hits = index.search("streamed", false, 20).unwrap();
+        assert_eq!(hits.len(), 10);
+        drop(index);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

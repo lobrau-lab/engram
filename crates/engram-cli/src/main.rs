@@ -268,11 +268,10 @@ fn cmd_init(vault: &Path, config_path: &Path) -> Result<()> {
 fn cmd_index(vault: &Path, config_path: &Path) -> Result<()> {
     let cfg = load_config(vault, config_path)?;
     let v = Vault::open(vault.to_path_buf())?;
-    let notes = v.scan()?;
     let idx = Index::open(&cfg.db)?;
     let embedder = HashingEmbedder::new(cfg.embed_dim);
-    idx.rebuild(&notes, &embedder, unix_now())?;
-    println!("indexed {} notes into {}", notes.len(), cfg.db.display());
+    let count = idx.rebuild_from_vault(&v, &embedder, unix_now())?;
+    println!("indexed {} notes into {}", count, cfg.db.display());
     Ok(())
 }
 
@@ -394,7 +393,13 @@ fn stale_warning(idx: &Index, vault: &Path) -> Result<()> {
         None => eprintln!("warning: this vault has never been indexed (run `engram index`)"),
         Some(ts) => {
             let v = Vault::open(vault.to_path_buf())?;
-            let newest = v.scan()?.iter().map(|n| n.mtime).max().unwrap_or(0);
+            let mut newest = 0i64;
+            v.scan_each(|n| {
+                if n.mtime > newest {
+                    newest = n.mtime;
+                }
+                Ok(())
+            })?;
             if newest > ts {
                 eprintln!(
                     "warning: index may be stale (vault changed after last index; run `engram index`)"

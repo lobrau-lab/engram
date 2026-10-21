@@ -50,10 +50,24 @@ impl Vault {
         Ok(Self { root })
     }
 
+    /// Load all notes into a vector. Retained for compatibility.
     pub fn scan(&self) -> Result<Vec<Note>> {
         let mut notes = Vec::new();
+        self.scan_each(|note| {
+            notes.push(note);
+            Ok(())
+        })?;
+        Ok(notes)
+    }
+
+    /// Stream notes one by one through a callback without retaining all note
+    /// bodies simultaneously in memory.
+    pub fn scan_each<F>(&self, mut callback: F) -> Result<usize>
+    where
+        F: FnMut(Note) -> Result<()>,
+    {
         if !self.root.exists() {
-            return Ok(notes);
+            return Ok(0);
         }
         let walker = WalkDir::new(&self.root)
             .sort_by_file_name()
@@ -64,6 +78,7 @@ impl Vault {
                 }
                 !e.file_name().to_string_lossy().starts_with('.')
             });
+        let mut count = 0usize;
         for entry in walker {
             let entry = entry.with_context(|| format!("walking {}", self.root.display()))?;
             if !entry.file_type().is_file() {
@@ -76,9 +91,11 @@ impl Vault {
             if is_hidden_child(&self.root, path) {
                 continue;
             }
-            notes.push(self.load_note(path)?);
+            let note = self.load_note(path)?;
+            callback(note)?;
+            count += 1;
         }
-        Ok(notes)
+        Ok(count)
     }
 
     pub fn read_note(&self, id: &str) -> Result<Note> {

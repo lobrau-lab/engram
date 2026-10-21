@@ -1596,8 +1596,8 @@ fn vault_index(vault: &Path) -> Result<(Index, usize)> {
 
 fn rebuild_index(vault: &Path) -> Result<Vec<u8>> {
     let (index, embed_dim) = vault_index(vault)?;
-    let notes = Vault::open(vault.to_path_buf())?.scan()?;
-    index.rebuild(&notes, &HashingEmbedder::new(embed_dim), unix_secs())?;
+    let opened = Vault::open(vault.to_path_buf())?;
+    index.rebuild_from_vault(&opened, &HashingEmbedder::new(embed_dim), unix_secs())?;
     audit_mutation(vault, "index", "vault", "ok");
     Ok(redirect("/vault"))
 }
