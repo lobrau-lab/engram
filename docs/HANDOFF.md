@@ -8,7 +8,9 @@
 
 This report is for the next agent picking up the project. Read this first, then
 `README.md`, `DECISIONS.md`, `docs/THREAT_MODEL.md`, and
-`docs/superpowers/specs/2026-10-20-threadline-personal-agent.md`.
+`docs/superpowers/specs/2026-10-20-threadline-personal-agent.md`. For the
+current functionality inventory and the phase-by-phase completion plan, read
+`docs/COMPLETION_PLAN.md`.
 
 ## TL;DR
 
