@@ -14,7 +14,9 @@ or takeover behavior.
 
 Markdown remains the canonical source of truth. The SQLite index, embeddings,
 graph data, conversation history, and other metadata are disposable derived
-state under `.engram/`.
+state under `.engram/`. Index rebuilds stream notes from disk instead of
+buffering every body. Incremental sync stays out of the codebase until a real
+stale-index refresh path exists.
 
 ## Import scope
 
@@ -53,9 +55,12 @@ endpoint with function-tool support may use `computer_use` without a prompt for
 every step. The built-in Apple model currently supports text chat only, and the
 tool is never offered to a remote endpoint. A persistent Stop control and
 `Escape` cancel the session and terminate in-flight local action processes.
-Actions are appended to `.engram/takeover/audit.jsonl`. This is intentionally
-broader than the hash-checked capability digest: the digest is safe intake,
-while takeover is real control with a visible boundary.
+Actions are appended to `.engram/takeover/audit.jsonl`. The audit keeps its
+newest 2,000 entries after the file passes 2 MB, and screenshots are pruned to
+the newest 50. The local UI can export or delete both with a local-control
+request. This is intentionally broader than the hash-checked capability digest:
+the digest is safe intake, while takeover is real control with a visible
+boundary.
 
 ## Network policy
 
@@ -66,8 +71,10 @@ private-local default.
 ## Portability and recovery
 
 The supported portable path is an encrypted `.engram` backup using Argon2id and
-AES-256-GCM, transferred to USB or another local storage device. Restore is
-staged and refuses to overwrite a non-empty destination.
+AES-256-GCM, transferred to USB or another local storage device. The current V2
+archive uses a compressed binary payload; V1 archives still restore. Restore is
+staged, refuses any existing destination, and publishes atomically on Unix.
+Stale staging directories are pruned by age, not by PID.
 
 ## Release policy
 
