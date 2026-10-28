@@ -209,3 +209,105 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
     format!("{}…", &s[..end])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use url::Url;
+
+    #[test]
+    fn test_validate_local_endpoint_valid() {
+        assert_eq!(
+            validate_local_endpoint("http://localhost:8080/v1").unwrap(),
+            Url::parse("http://localhost:8080/v1").unwrap()
+        );
+        assert_eq!(
+            validate_local_endpoint("http://127.0.0.1:11434").unwrap(),
+            Url::parse("http://127.0.0.1:11434").unwrap()
+        );
+        assert_eq!(
+            validate_local_endpoint("http://[::1]:8080/api").unwrap(),
+            Url::parse("http://[::1]:8080/api").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_validate_local_endpoint_invalid_scheme() {
+        let err = validate_local_endpoint("https://localhost:8080/v1").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "inference endpoint must use plain HTTP without userinfo"
+        );
+    }
+
+    #[test]
+    fn test_validate_local_endpoint_with_userinfo() {
+        let err = validate_local_endpoint("http://user:pass@localhost:8080/v1").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "inference endpoint must use plain HTTP without userinfo"
+        );
+    }
+
+    #[test]
+    fn test_validate_local_endpoint_non_loopback() {
+        let err = validate_local_endpoint("http://example.com:8080/v1").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "inference endpoint host must be localhost, 127.0.0.1, or ::1"
+        );
+    }
+
+    #[test]
+    fn test_truncate() {
+        assert_eq!(truncate("hello world", 100), "hello world");
+        assert_eq!(truncate("hello world", 5), "hello…");
+        assert_eq!(truncate("hello world", 0), "…");
+
+        // "a" (1 byte), "👋" (4 bytes), "b" (1 byte)
+        let s = "a👋b";
+        assert_eq!(truncate(s, 6), "a👋b");
+        // max 5 -> cuts before b, keeping "a👋"
+        assert_eq!(truncate(s, 5), "a👋…");
+        // max 4 -> cuts before b, keeping "a👋"
+        assert_eq!(truncate(s, 4), "a…"); // Wait, char_boundary at 4 is actually after 👋 but max is 4, loop finds boundary at 1
+
+        let s2 = "a👋b";
+        // Let's test the boundary loop manually: max=4.
+        // end=4: is_char_boundary(4)? "a"(1) + "👋"(4) = 5. So at 4 it's inside the emoji.
+        // end=3: inside. end=2: inside. end=1: after 'a'.
+        // So truncate(s2, 4) should be "a…".
+        assert_eq!(truncate(s2, 4), "a…");
+    }
+
+    #[test]
+    fn test_build_context_prompt_empty() {
+        let prompt = build_context_prompt("What is life?", &[], 1000);
+        assert!(prompt.contains("No notes in the vault matched"));
+        assert!(prompt.contains("Question: What is life?"));
+    }
+
+    #[test]
+    fn test_build_context_prompt_with_notes() {
+        let notes = vec![
+            ("note1.md".to_string(), "Life is 42.".to_string()),
+            ("note2.md".to_string(), "Another note.".to_string()),
+        ];
+        let prompt = build_context_prompt("What is life?", &notes, 1000);
+        assert!(prompt.contains("### note1.md\nLife is 42."));
+        assert!(prompt.contains("### note2.md\nAnother note."));
+        assert!(prompt.contains("Question: What is life?"));
+    }
+
+    #[test]
+    fn test_build_context_prompt_truncation() {
+        let notes = vec![
+            ("note1.md".to_string(), "This is a very long note that needs to be truncated.".to_string()),
+            ("note2.md".to_string(), "Another very long note here.".to_string()),
+        ];
+        // Budget per note = 20 / 2 = 10
+        let prompt = build_context_prompt("What?", &notes, 20);
+        assert!(prompt.contains("### note1.md\nThis is a …"));
+        assert!(prompt.contains("### note2.md\nAnother ve…"));
+    }
+}
