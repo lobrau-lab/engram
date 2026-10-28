@@ -106,19 +106,25 @@ impl Index {
     pub fn rebuild(&self, notes: &[Note], embedder: &dyn Embedder, indexed_at: i64) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute_batch("DELETE FROM notes; DELETE FROM notes_fts; DELETE FROM meta WHERE key = 'last_indexed';")?;
-        for note in notes {
-            let tags = note.tags.join(",");
-            let links = note.links.join(",");
-            let embedding =
-                f32s_to_bytes(&embedder.embed(&format!("{} {} {}", note.title, note.body, tags)));
-            tx.execute(
-                "INSERT INTO notes(id, title, body, tags, links, mtime, embedding) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![note.id, note.title, note.body, tags, links, note.mtime, embedding],
-            )?;
-            tx.execute(
+        {
+            let mut insert_notes = tx.prepare_cached("INSERT INTO notes(id, title, body, tags, links, mtime, embedding) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
+            let mut insert_fts = tx.prepare_cached(
                 "INSERT INTO notes_fts(id, title, body, tags) VALUES(?1, ?2, ?3, ?4)",
-                params![note.id, note.title, note.body, tags],
             )?;
+
+            for note in notes {
+                let tags = note.tags.join(",");
+                let links = note.links.join(",");
+                let embedding = f32s_to_bytes(
+                    &embedder.embed(&format!("{} {} {}", note.title, note.body, tags)),
+                );
+
+                insert_notes.execute(params![
+                    note.id, note.title, note.body, tags, links, note.mtime, embedding
+                ])?;
+
+                insert_fts.execute(params![note.id, note.title, note.body, tags])?;
+            }
         }
         tx.execute(
             "INSERT INTO meta(key, value) VALUES('last_indexed', ?1)",
