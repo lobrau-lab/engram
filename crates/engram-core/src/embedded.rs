@@ -6,7 +6,7 @@
 //! report the backend as unavailable instead of silently reaching the
 //! network.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
