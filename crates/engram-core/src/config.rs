@@ -115,3 +115,104 @@ pub fn derive_device_id(vault: &Path) -> String {
         digest[0], digest[1], digest[2], digest[3]
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derive_device_id_is_deterministic() {
+        let path = Path::new("/test/vault/path");
+        let id1 = derive_device_id(path);
+        let id2 = derive_device_id(path);
+        assert_eq!(id1, id2);
+        assert!(!id1.is_empty());
+    }
+
+    #[test]
+    fn config_new_initializes_with_defaults() {
+        let vault = PathBuf::from("/my/vault");
+        let config = Config::new(&vault);
+
+        assert_eq!(config.vault, vault);
+        assert_eq!(config.db, vault.join(".engram").join("index.sqlite"));
+        assert_eq!(config.llm_base, default_llm_base());
+        assert_eq!(config.llm_model, default_llm_model());
+        assert_eq!(config.llm_key, None);
+        assert_eq!(config.embed_dim, default_embed_dim());
+        assert_eq!(config.provider, default_provider());
+        assert_eq!(config.context_window, default_context_window());
+        assert_eq!(config.device_id, derive_device_id(&vault));
+    }
+
+    #[test]
+    fn config_round_trips_through_save_and_load() {
+        let config_path = std::env::temp_dir().join("config_round_trip.toml");
+
+        let vault = PathBuf::from("/my/vault");
+        let mut original = Config::new(&vault);
+        original.llm_key = Some("test-key".to_string());
+        original.llm_model = "test-model".to_string();
+
+        original.save(&config_path).unwrap();
+
+        let loaded = Config::load(&config_path).unwrap();
+
+        assert_eq!(original.vault, loaded.vault);
+        assert_eq!(original.db, loaded.db);
+        assert_eq!(original.llm_base, loaded.llm_base);
+        assert_eq!(original.llm_model, loaded.llm_model);
+        assert_eq!(original.llm_key, loaded.llm_key);
+        assert_eq!(original.embed_dim, loaded.embed_dim);
+        assert_eq!(original.provider, loaded.provider);
+        assert_eq!(original.context_window, loaded.context_window);
+        assert_eq!(original.device_id, loaded.device_id);
+
+        let _ = std::fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn missing_device_id_fails_loudly() {
+        let config_path = std::env::temp_dir().join("config_missing_device_id.toml");
+
+        let toml_str = r#"
+            vault = "/tmp"
+            db = "/tmp/.engram/index.sqlite"
+        "#;
+
+        std::fs::write(&config_path, toml_str).unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err(), "Loading should fail if device_id is missing");
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("parsing config"), "Error should mention parsing config");
+
+        let _ = std::fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn missing_optional_fields_use_defaults() {
+        let config_path = std::env::temp_dir().join("config_missing_optional.toml");
+
+        let toml_str = r#"
+            vault = "/tmp"
+            db = "/tmp/.engram/index.sqlite"
+            device_id = "test-device-id"
+        "#;
+
+        std::fs::write(&config_path, toml_str).unwrap();
+
+        let loaded = Config::load(&config_path).unwrap();
+
+        assert_eq!(loaded.llm_base, default_llm_base());
+        assert_eq!(loaded.llm_model, default_llm_model());
+        assert_eq!(loaded.llm_key, None);
+        assert_eq!(loaded.embed_dim, default_embed_dim());
+        assert_eq!(loaded.provider, default_provider());
+        assert_eq!(loaded.context_window, default_context_window());
+        assert_eq!(loaded.device_id, "test-device-id");
+
+        let _ = std::fs::remove_file(config_path);
+    }
+}
