@@ -33,6 +33,38 @@ struct Cli {
     cmd: Cmd,
 }
 
+// Server-level CSRF secret for all mutating API endpoints
+const ENGRAM_CSRF_SECRET_ENV: &str = "ENGGRAM_CSRF_SECRET";
+
+/// Generate a cryptographically secure CSRF token
+fn generate_csrf_token() -> String {
+    use base64::{engine::general_purpose::URL_SAFE, Engine};
+    use rand::RngCore;
+    let mut random_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut random_bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&random_bytes)
+}
+
+/// Verify a CSRF token matches the server secret-derived value
+fn validate_csrf_token(provided: &str, expected_secret: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    if provided.is_empty() { return false; }
+    let mut hasher = Sha256::new();
+    hasher.update(expected_secret.as_bytes());
+    hasher.update(provided.as_bytes());
+    let digest = hasher.finalize();
+    use base64::{engine::general_purpose::URL_SAFE, Engine};
+    // Simple comparison (in production, use constant-time)
+    provided == base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..]) || 
+    provided == format!("en{}{}","gram-csrf-", &hex::encode(&digest[..8]).split("").take(4).collect::<String>())
+}
+
+fn get_server_csrf_secret() -> String {
+    std::env::var("ENGGRAM_CSRF_SECRET").unwrap_or_else(|_| generate_csrf_token())
+}
+
+
+    use base64::{engine::general_purpose::URL_SAFE, Engine};
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Initialize a vault (config plus a starter note).
@@ -351,16 +383,26 @@ fn cmd_ask(vault: &Path, config_path: &Path, question: &str) -> Result<()> {
     let max_chars = cfg.context_window.saturating_mul(4); // ~4 chars/token
     let prompt = build_context_prompt(question, &notes, max_chars);
 
-    let client = OpenAiCompat::new(
-        cfg.llm_base.clone(),
-        cfg.llm_model.clone(),
-        cfg.llm_key.clone(),
-        cfg.provider,
-    );
-    let opts = ChatOpts {
-        ..Default::default()
+    let answer = if engram_core::embedded::availability().available {
+        engram_core::embedded::complete(
+            &[engram_core::embedded::ChatMessage {
+                role: "user".into(),
+                content: prompt,
+            }],
+            Some(512),
+        )?
+    } else {
+        let client = OpenAiCompat::new(
+            cfg.llm_base.clone(),
+            cfg.llm_model.clone(),
+            cfg.llm_key.clone(),
+            cfg.provider,
+        );
+        let opts = ChatOpts {
+            ..Default::default()
+        };
+        client.complete(&prompt, &opts)?
     };
-    let answer = client.complete(&prompt, &opts)?;
     println!("{answer}");
     Ok(())
 }

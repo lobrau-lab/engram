@@ -963,12 +963,29 @@ fn script_arg(value: &Option<String>) -> Result<String, Failure> {
     if source.trim().is_empty() {
         return Err(Failure::bad_request("AppleScript source is required"));
     }
-    if source.len() > MAX_APPLESCRIPT {
+    
+    // SECURITY: Block dangerous AppleScript patterns that could execute shell commands
+    const BLOCKED_PATTERNS: &[&str] = &[
+        "do shell script",
+        "shell script","bash ",
+        "sh -c","run POSIX script",
+        "system task", "sudo ",
+    ];
+    let source_lower = source.to_lowercase();
+    for pattern in BLOCKED_PATTERNS {
+        if source_lower.contains(*pattern) {
+            return Err(Failure::forbidden("AppleScript commands blocked: shell execution not permitted"));
+        }
+    }
+    
+    // Sanitize by removing control characters
+    let sanitized = source.chars().filter(|c| !c.is_control()).collect::<String>();
+    if sanitized.len() > MAX_APPLESCRIPT {
         return Err(Failure::bad_request(format!(
             "AppleScript must be at most {MAX_APPLESCRIPT} bytes"
         )));
     }
-    Ok(source.to_string())
+    Ok(sanitized)
 }
 
 fn required_clean(value: &Option<String>, name: &str, max: usize) -> Result<String, Failure> {
