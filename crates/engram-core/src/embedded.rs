@@ -48,12 +48,7 @@ pub fn availability() -> EmbeddedAvailability {
     }
 }
 
-/// Run one completion entirely inside this process.
-///
-/// `messages` uses the same role names as the OpenAI chat format. The
-/// caller is responsible for keeping the total prompt within the model's
-/// context window; the web client already packs context against a budget.
-pub fn complete(messages: &[ChatMessage], max_tokens: Option<u32>) -> Result<String> {
+fn validate_messages(messages: &[ChatMessage]) -> Result<()> {
     anyhow::ensure!(!messages.is_empty(), "at least one message is required");
     anyhow::ensure!(
         messages.iter().any(|message| message.role == "user"),
@@ -68,85 +63,115 @@ pub fn complete(messages: &[ChatMessage], max_tokens: Option<u32>) -> Result<Str
         }),
         "messages must have a supported role and non-empty content"
     );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn build_conversation(messages: &[ChatMessage]) -> chat_core::types::messages::Messages {
+    use chat_core::types::messages::{content, Messages};
+
+    let mut conversation = Messages::default();
+    for message in messages {
+        let part = match message.role.as_str() {
+            "system" => content::from_system(vec![message.content.clone()]),
+            "assistant" | "model" => content::from_model(vec![message.content.clone()]),
+            _ => content::from_user(vec![message.content.clone()]),
+        };
+        conversation.push(part);
+    }
+    conversation
+}
+
+#[cfg(target_os = "macos")]
+fn get_inference_client(
+    max_tokens: Option<u32>,
+) -> Result<(&'static tokio::runtime::Runtime, chat_applefm::AppleFMClient)> {
+    use anyhow::Context;
+    use chat_applefm::AppleFMBuilder;
+    use std::sync::OnceLock;
+
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    static CLIENT: OnceLock<chat_applefm::AppleFMClient> = OnceLock::new();
+
+    let probe = chat_applefm::availability();
+    anyhow::ensure!(
+        probe.available,
+        "{}",
+        probe
+            .reason
+            .unwrap_or_else(|| "the built-in model is unavailable".to_string())
+    );
+
+    if RUNTIME.get().is_none() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .context("starting embedded inference runtime")?;
+        let _ = RUNTIME.set(runtime);
+    }
+    let runtime = RUNTIME
+        .get()
+        .context("embedded inference runtime is unavailable")?;
+
+    if CLIENT.get().is_none() {
+        let client = AppleFMBuilder::new()
+            .with_max_tokens(max_tokens.unwrap_or(1024).max(1))
+            .build()
+            .map_err(|failure| anyhow::anyhow!("{failure}"))?;
+        let _ = CLIENT.set(client);
+    }
+    let client = CLIENT
+        .get()
+        .context("embedded inference client is unavailable")?;
+
+    Ok((runtime, client.clone()))
+}
+
+#[cfg(target_os = "macos")]
+fn complete_macos(messages: &[ChatMessage], max_tokens: Option<u32>) -> Result<String> {
+    use anyhow::Context;
+    use chat_core::traits::CompletionProvider;
+    use chat_core::types::options::ChatOptions;
+
+    // The on-device provider is a shared system resource. Serialize
+    // completions while still allowing status, takeover, and file
+    // requests to run on other connection threads.
+    static INFERENCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = INFERENCE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let (runtime, mut client) = get_inference_client(max_tokens)?;
+    let mut conversation = build_conversation(messages);
+
+    let mut options = ChatOptions::default();
+    options.temperature = Some(0.4);
+    options.max_tokens = max_tokens;
+
+    let response = runtime
+        .block_on(client.complete(&mut conversation, None, Some(&options), None))
+        .map_err(|failure| anyhow::anyhow!("{failure}"))?;
+
+    response
+        .content
+        .parts
+        .text_response()
+        .map(|text| text.as_str().to_owned())
+        .context("the built-in model returned no text")
+}
+
+/// Run one completion entirely inside this process.
+///
+/// `messages` uses the same role names as the OpenAI chat format. The
+/// caller is responsible for keeping the total prompt within the model's
+/// context window; the web client already packs context against a budget.
+pub fn complete(messages: &[ChatMessage], max_tokens: Option<u32>) -> Result<String> {
+    validate_messages(messages)?;
 
     #[cfg(target_os = "macos")]
     {
-        use chat_applefm::AppleFMBuilder;
-        use chat_core::traits::CompletionProvider;
-        use chat_core::types::messages::{content, Messages};
-        use chat_core::types::options::ChatOptions;
-        use std::sync::OnceLock;
-
-        // The on-device provider is a shared system resource. Serialize
-        // completions while still allowing status, takeover, and file
-        // requests to run on other connection threads.
-        static INFERENCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = INFERENCE_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-        static CLIENT: OnceLock<chat_applefm::AppleFMClient> = OnceLock::new();
-
-        let probe = chat_applefm::availability();
-        anyhow::ensure!(
-            probe.available,
-            "{}",
-            probe
-                .reason
-                .unwrap_or_else(|| "the built-in model is unavailable".to_string())
-        );
-
-        if RUNTIME.get().is_none() {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .context("starting embedded inference runtime")?;
-            let _ = RUNTIME.set(runtime);
-        }
-        let runtime = RUNTIME
-            .get()
-            .context("embedded inference runtime is unavailable")?;
-
-        if CLIENT.get().is_none() {
-            let client = AppleFMBuilder::new()
-                .with_max_tokens(max_tokens.unwrap_or(1024).max(1))
-                .build()
-                .map_err(|failure| anyhow::anyhow!("{failure}"))?;
-            let _ = CLIENT.set(client);
-        }
-        let client = CLIENT
-            .get()
-            .context("embedded inference client is unavailable")?;
-
-        let mut conversation = Messages::default();
-        for message in messages {
-            let part = match message.role.as_str() {
-                "system" => content::from_system(vec![message.content.clone()]),
-                "assistant" | "model" => content::from_model(vec![message.content.clone()]),
-                _ => content::from_user(vec![message.content.clone()]),
-            };
-            conversation.push(part);
-        }
-
-        let mut options = ChatOptions::default();
-        options.temperature = Some(0.4);
-        options.max_tokens = max_tokens;
-
-        // The client's session is shared across clones and serialized
-        // internally; cloning avoids holding a lock across the bridge call.
-        let mut client = client.clone();
-        let response = runtime
-            .block_on(client.complete(&mut conversation, None, Some(&options), None))
-            .map_err(|failure| anyhow::anyhow!("{failure}"))?;
-        let text = response
-            .content
-            .parts
-            .text_response()
-            .map(|text| text.as_str().to_owned())
-            .context("the built-in model returned no text")?;
-        Ok(text)
+        complete_macos(messages, max_tokens)
     }
 
     #[cfg(not(target_os = "macos"))]
