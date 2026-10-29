@@ -25,6 +25,50 @@ struct BackupPayload {
     files: BTreeMap<String, Vec<u8>>,
 }
 
+struct FileContent<'a>(&'a Path);
+impl<'a> Serialize for FileContent<'a> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let bytes = std::fs::read(self.0).map_err(serde::ser::Error::custom)?;
+        serializer.serialize_bytes(&bytes)
+    }
+}
+
+struct FileMap<'a>(&'a BTreeMap<String, std::path::PathBuf>);
+impl<'a> Serialize for FileMap<'a> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (k, path) in self.0 {
+            map.serialize_entry(k, &FileContent(path))?;
+        }
+        map.end()
+    }
+}
+
+struct BackupPayloadSerialize<'a> {
+    manifest: &'a BackupManifest,
+    files: &'a BTreeMap<String, std::path::PathBuf>,
+}
+
+impl<'a> Serialize for BackupPayloadSerialize<'a> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("BackupPayload", 2)?;
+        state.serialize_field("manifest", self.manifest)?;
+        state.serialize_field("files", &FileMap(self.files))?;
+        state.end()
+    }
+}
+
 pub fn create(source: &Path, destination: &Path, password: &str) -> Result<BackupManifest> {
     let mut files = BTreeMap::new();
     for entry in WalkDir::new(source).into_iter().filter_entry(|e| {
@@ -41,15 +85,15 @@ pub fn create(source: &Path, destination: &Path, password: &str) -> Result<Backu
             .strip_prefix(source)?
             .to_string_lossy()
             .to_string();
-        files.insert(relative, std::fs::read(entry.path())?);
+        files.insert(relative, entry.path().to_path_buf());
     }
     let manifest = BackupManifest {
         version: 1,
         files: files.len(),
     };
-    let payload = serde_json::to_vec(&BackupPayload {
-        manifest: manifest.clone(),
-        files,
+    let payload = serde_json::to_vec(&BackupPayloadSerialize {
+        manifest: &manifest,
+        files: &files,
     })?;
     let salt = SaltString::generate(&mut OsRng);
     let key = derive_key(password, salt.as_str().as_bytes())?;

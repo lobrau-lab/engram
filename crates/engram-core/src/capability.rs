@@ -414,6 +414,7 @@ fn first_line(text: &str) -> Option<String> {
         .map(|line| truncate(line, 240))
 }
 
+#[allow(dead_code)]
 fn string_value(value: &serde_json::Value, key: &str) -> Option<String> {
     value
         .get(key)

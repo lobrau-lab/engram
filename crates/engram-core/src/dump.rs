@@ -190,9 +190,15 @@ pub fn get_analysis(vault: &Path, id: &str) -> Result<Analysis> {
     if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
         anyhow::bail!("invalid dump id");
     }
-    Ok(serde_json::from_slice(&std::fs::read(analysis_path(
-        vault, id,
-    ))?)?)
+    let mut analysis: Analysis = serde_json::from_slice(&std::fs::read(analysis_path(vault, id))?)?;
+    if analysis.version != 1 || analysis.suggestions.len() > 12 {
+        anyhow::bail!("unsupported or excessive analysis response")
+    }
+    let item = get(vault, id)?;
+    for (index, suggestion) in analysis.suggestions.iter_mut().enumerate() {
+        validate_suggestion(suggestion, &item, index)?;
+    }
+    Ok(analysis)
 }
 
 pub fn review(
