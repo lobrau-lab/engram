@@ -6,7 +6,8 @@
 //! report the backend as unavailable instead of silently reaching the
 //! network.
 
-use anyhow::Result;
+#[allow(unused_imports)]
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
