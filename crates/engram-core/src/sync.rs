@@ -425,3 +425,60 @@ impl SyncBackend for FolderSync {
         Ok(stats)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn test_save_and_load_local_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "engram-sync-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "test.md".to_string(),
+            LocalEntry {
+                hash: "hash123".to_string(),
+                mtime: 123456789,
+                lamport: 42,
+            },
+        );
+
+        let state = LocalState {
+            device_id: "device-1".to_string(),
+            lamport: 43,
+            entries,
+        };
+
+        // Save local state
+        save_local_state(&dir, &state).unwrap();
+
+        // Verify file exists
+        let state_file = dir.join(STATE_REL);
+        assert!(state_file.exists());
+
+        // Load local state
+        let loaded_state = load_local_state(&dir).unwrap();
+
+        assert_eq!(loaded_state.device_id, state.device_id);
+        assert_eq!(loaded_state.lamport, state.lamport);
+        assert_eq!(loaded_state.entries.len(), 1);
+
+        let loaded_entry = loaded_state.entries.get("test.md").unwrap();
+        assert_eq!(loaded_entry.hash, "hash123");
+        assert_eq!(loaded_entry.mtime, 123456789);
+        assert_eq!(loaded_entry.lamport, 42);
+
+        // Clean up
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
