@@ -327,25 +327,7 @@ fn dispatch(
         ("POST", path) if path.starts_with("/api/v1/inference/omlx/") => {
             project_error(403, "local control header required")
         }
-        ("GET", "/api/v1/vault/search") => {
-            let search = parameter(query, "q").unwrap_or_default();
-            if search.trim().is_empty() || search.len() > 512 {
-                response(
-                    400,
-                    "application/json; charset=utf-8",
-                    "{\"error\":\"query must contain 1–512 bytes\"}",
-                )
-            } else {
-                match search_vault_api(vault, &search) {
-                    Ok(json) => response(200, "application/json; charset=utf-8", &json),
-                    Err(error) => response(
-                        500,
-                        "application/json; charset=utf-8",
-                        &serde_json::json!({"error": error.to_string()}).to_string(),
-                    ),
-                }
-            }
-        }
+        ("GET", "/api/v1/vault/search") => search(vault, query),
         ("GET", "/note") => render_note(vault, query)?,
         ("GET", "/new") => render_new()?,
         ("POST", "/new") => create_note(vault, body)?,
@@ -1398,6 +1380,27 @@ fn render_index(vault: &Path, query: &str) -> Result<Vec<u8>> {
     }
     body.push_str("</ul><p>On-device workspace. Markdown files remain the source of truth.</p>");
     Ok(page("Vault", &body))
+}
+
+
+fn search(vault: &Path, query: &str) -> Vec<u8> {
+    let search = parameter(query, "q").unwrap_or_default();
+    if search.trim().is_empty() || search.len() > 512 {
+        response(
+            400,
+            "application/json; charset=utf-8",
+            "{\"error\":\"query must contain 1–512 bytes\"}",
+        )
+    } else {
+        match search_vault_api(vault, &search) {
+            Ok(json) => response(200, "application/json; charset=utf-8", &json),
+            Err(error) => response(
+                500,
+                "application/json; charset=utf-8",
+                &serde_json::json!({"error": error.to_string()}).to_string(),
+            ),
+        }
+    }
 }
 
 fn search_vault_api(vault: &Path, query: &str) -> Result<String> {
