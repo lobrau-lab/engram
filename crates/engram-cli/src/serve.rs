@@ -1202,6 +1202,7 @@ fn is_sensitive_project_path(path: &Path) -> bool {
             matches!(
                 name.as_str(),
                 ".git"
+                    | ".ds_store"
                     | ".engram"
                     | ".ssh"
                     | ".aws"
@@ -1210,8 +1211,7 @@ fn is_sensitive_project_path(path: &Path) -> bool {
                     | "node_modules"
                     | "target"
                     | "vendor"
-            ) || name == ".env"
-                || name.starts_with(".env.")
+            ) || name.starts_with(".env")
         }
         _ => true,
     })
