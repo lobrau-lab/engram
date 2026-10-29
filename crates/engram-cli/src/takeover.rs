@@ -11,7 +11,6 @@
 //! helper only acts when invoked with a command; it never listens in the
 //! background. On other platforms every operation reports unavailable.
 
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -995,7 +994,7 @@ fn now() -> u64 {
 
 fn random_hex(bytes: usize) -> String {
     let mut buffer = vec![0u8; bytes];
-    rand::thread_rng().fill_bytes(&mut buffer);
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut buffer);
     hex(&buffer)
 }
 
