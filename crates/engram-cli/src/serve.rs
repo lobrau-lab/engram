@@ -108,16 +108,7 @@ fn run_listener(
     println!("Engram workspace: {url}");
     println!("Local-only server; press Ctrl-C to stop.");
     if launch_browser {
-        let result = if cfg!(target_os = "macos") {
-            std::process::Command::new("open").arg(&url).spawn()
-        } else if cfg!(target_os = "windows") {
-            std::process::Command::new("cmd")
-                .args(["/C", "start", &url])
-                .spawn()
-        } else {
-            std::process::Command::new("xdg-open").arg(&url).spawn()
-        };
-        if let Err(error) = result {
+        if let Err(error) = open::that(&url) {
             eprintln!("could not open browser automatically: {error}");
         }
     }
@@ -330,7 +321,9 @@ fn dispatch(
         ("GET", "/api/v1/inference/omlx") => omlx_status(),
         ("POST", "/api/v1/inference/omlx/start") if local_control => omlx_action(OmlxAction::Start),
         ("POST", "/api/v1/inference/omlx/stop") if local_control => omlx_action(OmlxAction::Stop),
-        ("POST", "/api/v1/inference/omlx/restart") if local_control => omlx_action(OmlxAction::Restart),
+        ("POST", "/api/v1/inference/omlx/restart") if local_control => {
+            omlx_action(OmlxAction::Restart)
+        }
         ("POST", path) if path.starts_with("/api/v1/inference/omlx/") => {
             project_error(403, "local control header required")
         }
@@ -877,7 +870,6 @@ fn omlx_status() -> Vec<u8> {
         .to_string(),
     )
 }
-
 
 enum OmlxAction {
     Start,
