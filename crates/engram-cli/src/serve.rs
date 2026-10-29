@@ -330,7 +330,9 @@ fn dispatch(
         ("GET", "/api/v1/inference/omlx") => omlx_status(),
         ("POST", "/api/v1/inference/omlx/start") if local_control => omlx_action(OmlxAction::Start),
         ("POST", "/api/v1/inference/omlx/stop") if local_control => omlx_action(OmlxAction::Stop),
-        ("POST", "/api/v1/inference/omlx/restart") if local_control => omlx_action(OmlxAction::Restart),
+        ("POST", "/api/v1/inference/omlx/restart") if local_control => {
+            omlx_action(OmlxAction::Restart)
+        }
         ("POST", path) if path.starts_with("/api/v1/inference/omlx/") => {
             project_error(403, "local control header required")
         }
@@ -701,43 +703,10 @@ fn workshop_propose(project_root: Option<&Path>, vault: &Path, body: &str) -> Ve
         Ok(root) => root,
         Err(error) => return inference_error(500, &error.to_string()),
     };
-    let mut excerpts = String::new();
-    let mut included = Vec::new();
-    for relative in &request.files {
-        if relative.len() > 500 {
-            return inference_error(400, "a source file path is too long");
-        }
-        if is_sensitive_project_path(Path::new(relative)) {
-            return inference_error(
-                403,
-                "sensitive or hidden project paths are not available to the workshop",
-            );
-        }
-        let path = match resolve_project_path(&root, relative, false) {
-            Ok(path) => path,
-            Err(error) => return inference_error(400, &error.to_string()),
-        };
-        if !path.is_file() {
-            return inference_error(400, "workshop paths must be regular files");
-        }
-        let content = match std::fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(_) => return inference_error(415, "workshop files must be UTF-8 text"),
-        };
-        let excerpt = truncate_text(&content, 8000);
-        excerpts.push_str(&format!(
-            "\n--- FILE: {} ---\n{}\n",
-            relative.trim(),
-            excerpt
-        ));
-        included.push(relative.trim().to_string());
-        if excerpts.len() > 24000 {
-            return inference_error(
-                400,
-                "the selected source files exceed the workshop context budget",
-            );
-        }
-    }
+    let (excerpts, included) = match extract_workshop_files(&root, &request.files) {
+        Ok(extracted) => extracted,
+        Err((status, message)) => return inference_error(status, &message),
+    };
 
     let system = "You are the Threadline Workshop, a careful senior engineer. Propose the smallest reviewable change to Engram's own source code. Never claim a change was applied, tested, or merged. Never propose disabling tests, consent, Host/Origin checks, hidden-path checks, hash verification, or any other security control. Do not use tools or run commands. Output exactly these sections: 1) Intent, 2) Files, 3) Unified diff, 4) Tests, 5) Risks.";
     let prompt = format!(
@@ -760,6 +729,32 @@ fn workshop_propose(project_root: Option<&Path>, vault: &Path, body: &str) -> Ve
         Err(error) => return inference_error(503, &error.to_string()),
     };
 
+    let (id, path, document) = match save_workshop_proposal(vault, goal, &proposal, &included) {
+        Ok(saved) => saved,
+        Err((status, message)) => return inference_error(status, &message),
+    };
+
+    response(
+        200,
+        "application/json; charset=utf-8",
+        &serde_json::json!({
+            "id": id,
+            "title": goal,
+            "files": included,
+            "proposal": document,
+            "path": path.to_string_lossy(),
+            "status": "proposed",
+        })
+        .to_string(),
+    )
+}
+
+fn save_workshop_proposal(
+    vault: &Path,
+    goal: &str,
+    proposal: &str,
+    included: &[String],
+) -> Result<(String, PathBuf, String), (u16, String)> {
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -774,21 +769,53 @@ fn workshop_propose(project_root: Option<&Path>, vault: &Path, body: &str) -> Ve
         included.join(", ")
     );
     if let Err(error) = atomic_write::replace(&path, document.as_bytes()) {
-        return inference_error(500, &error.to_string());
+        return Err((500, error.to_string()));
     }
-    response(
-        200,
-        "application/json; charset=utf-8",
-        &serde_json::json!({
-            "id": id,
-            "title": goal,
-            "files": included,
-            "proposal": document,
-            "path": path.to_string_lossy(),
-            "status": "proposed",
-        })
-        .to_string(),
-    )
+    Ok((id, path, document))
+}
+
+fn extract_workshop_files(
+    root: &Path,
+    files: &[String],
+) -> Result<(String, Vec<String>), (u16, String)> {
+    let mut excerpts = String::new();
+    let mut included = Vec::new();
+    for relative in files {
+        if relative.len() > 500 {
+            return Err((400, "a source file path is too long".into()));
+        }
+        if is_sensitive_project_path(Path::new(relative)) {
+            return Err((
+                403,
+                "sensitive or hidden project paths are not available to the workshop".into(),
+            ));
+        }
+        let path = match resolve_project_path(root, relative, false) {
+            Ok(path) => path,
+            Err(error) => return Err((400, error.to_string())),
+        };
+        if !path.is_file() {
+            return Err((400, "workshop paths must be regular files".into()));
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(_) => return Err((415, "workshop files must be UTF-8 text".into())),
+        };
+        let excerpt = truncate_text(&content, 8000);
+        excerpts.push_str(&format!(
+            "\n--- FILE: {} ---\n{}\n",
+            relative.trim(),
+            excerpt
+        ));
+        included.push(relative.trim().to_string());
+        if excerpts.len() > 24000 {
+            return Err((
+                400,
+                "the selected source files exceed the workshop context budget".into(),
+            ));
+        }
+    }
+    Ok((excerpts, included))
 }
 
 fn truncate_text(value: &str, limit: usize) -> String {
@@ -877,7 +904,6 @@ fn omlx_status() -> Vec<u8> {
         .to_string(),
     )
 }
-
 
 enum OmlxAction {
     Start,
