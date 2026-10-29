@@ -1113,6 +1113,26 @@ mod tests {
     }
 
     #[test]
+    fn screenshot_bytes_validates_file_names() {
+        let vault = test_vault("screenshot_validation");
+        let takeover = Takeover::new(vault.clone());
+
+        assert_eq!(takeover.screenshot_bytes("").unwrap_err().status, 404);
+        assert_eq!(takeover.screenshot_bytes("screenshot.jpg").unwrap_err().status, 404);
+
+        let long_name = format!("{}.png", "a".repeat(100));
+        assert_eq!(takeover.screenshot_bytes(&long_name).unwrap_err().status, 404);
+
+        assert_eq!(takeover.screenshot_bytes("../screenshot.png").unwrap_err().status, 404);
+        assert_eq!(takeover.screenshot_bytes("file space.png").unwrap_err().status, 404);
+        assert_eq!(takeover.screenshot_bytes("foo/bar.png").unwrap_err().status, 404);
+
+        assert_eq!(takeover.screenshot_bytes("valid-name-123.png").unwrap_err().status, 404);
+
+        let _ = fs::remove_dir_all(vault);
+    }
+
+    #[test]
     fn summaries_do_not_store_typed_text() {
         let request: ActionRequest =
             serde_json::from_str(r#"{"action":"type","text":"super secret"}"#).expect("request");
