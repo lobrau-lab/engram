@@ -225,6 +225,27 @@ impl Index {
         Ok(out)
     }
 
+    pub fn backlinks(&self, target: &str, stem: &str) -> Result<Vec<NoteLite>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, title, tags, links FROM notes WHERE links LIKE '%' || ? || '%' OR links LIKE '%' || ? || '%' ORDER BY id")?;
+        let rows = stmt.query_map([target, stem], |r| {
+            let tags: String = r.get(2)?;
+            let links: String = r.get(3)?;
+            Ok(NoteLite {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                tags: split_csv(&tags),
+                links: split_csv(&links),
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// Notes paired with their stored embeddings, for brute-force cosine search.
     pub fn notes_with_embeddings(&self) -> Result<Vec<(NoteLite, Vec<f32>)>> {
         let mut stmt = self

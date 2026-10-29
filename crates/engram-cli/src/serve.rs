@@ -1379,12 +1379,13 @@ fn read_request(stream: &mut TcpStream) -> Result<Request> {
 
 fn render_index(vault: &Path, query: &str) -> Result<Vec<u8>> {
     let search = parameter(query, "q").unwrap_or_default();
-    let notes = Vault::open(vault.to_path_buf())?.scan()?;
+    let config = Config::load(&vault.join(".engram").join("config.toml"))?;
+    let notes = Index::open(&config.db)?.all_notes_lite()?;
     let mut body = String::from("<header style=\"display:flex;align-items:center;gap:16px\"><img src=\"/threadline/assets/engram-logo.png\" alt=\"Engram\" width=\"112\" height=\"112\" style=\"object-fit:contain\"><h1>Engram</h1></header><form><input name=\"q\" placeholder=\"Search\" value=\"");
     body.push_str(&escape(&search));
     body.push_str("\"><button>Search</button></form><p><a href=\"/new\">New note</a> · <a href=\"/ask\">Ask the local assistant</a> · <a href=\"/graph\">Open graph</a> · <a href=\"/threadline/\">Open Threadline chat</a></p><ul>");
     for note in notes {
-        let haystack = format!("{} {}", note.title, note.body).to_lowercase();
+        let haystack = format!("{} {}", note.title, note.tags.join(" ")).to_lowercase();
         if !search.is_empty() && !haystack.contains(&search.to_lowercase()) {
             continue;
         }
@@ -1560,14 +1561,16 @@ fn render_note(vault: &Path, query: &str) -> Result<Vec<u8>> {
     let path = safe_path(vault, &relative, false)?;
     let note = std::fs::read_to_string(&path)
         .with_context(|| format!("reading note {}", relative.display()))?;
-    let notes = Index::open(vault)?.all_notes_lite()?;
     let target = relative.to_string_lossy();
     let stem = relative
         .file_stem()
         .and_then(|x| x.to_str())
         .unwrap_or_default();
+    let config = Config::load(&vault.join(".engram").join("config.toml"))?;
+    let candidates = Index::open(&config.db)?.backlinks(&target, stem)?;
     let mut backlinks = String::from("<h2>Backlinks</h2><ul>");
-    for candidate in notes {
+    for candidate in candidates {
+        // Double-check the list actually contains exactly what we want since LIKE could return supersets (e.g. searching 'cat' returns 'catalog' in db). NoteLite provides standard parsed links so we can match correctly just in case.
         if candidate
             .links
             .iter()
