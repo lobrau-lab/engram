@@ -414,12 +414,6 @@ fn first_line(text: &str) -> Option<String> {
         .map(|line| truncate(line, 240))
 }
 
-fn string_value(value: &serde_json::Value, key: &str) -> Option<String> {
-    value
-        .get(key)
-        .and_then(|item| item.as_str())
-        .map(str::to_string)
-}
 
 fn slug(value: &str) -> String {
     let mut slug = String::new();

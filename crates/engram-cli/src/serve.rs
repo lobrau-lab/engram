@@ -328,9 +328,9 @@ fn dispatch(
         ("GET", "/v1/models") => embedded_models(),
         ("POST", "/v1/chat/completions") => chat_completions(body),
         ("GET", "/api/v1/inference/omlx") => omlx_status(),
-        ("POST", "/api/v1/inference/omlx/start") if local_control => omlx_action("start"),
-        ("POST", "/api/v1/inference/omlx/stop") if local_control => omlx_action("stop"),
-        ("POST", "/api/v1/inference/omlx/restart") if local_control => omlx_action("restart"),
+        ("POST", "/api/v1/inference/omlx/start") if local_control => omlx_action(OmlxAction::Start),
+        ("POST", "/api/v1/inference/omlx/stop") if local_control => omlx_action(OmlxAction::Stop),
+        ("POST", "/api/v1/inference/omlx/restart") if local_control => omlx_action(OmlxAction::Restart),
         ("POST", path) if path.starts_with("/api/v1/inference/omlx/") => {
             project_error(403, "local control header required")
         }
@@ -878,7 +878,24 @@ fn omlx_status() -> Vec<u8> {
     )
 }
 
-fn omlx_action(action: &str) -> Vec<u8> {
+
+enum OmlxAction {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl OmlxAction {
+    fn as_str(&self) -> &'static str {
+        match self {
+            OmlxAction::Start => "start",
+            OmlxAction::Stop => "stop",
+            OmlxAction::Restart => "restart",
+        }
+    }
+}
+
+fn omlx_action(action: OmlxAction) -> Vec<u8> {
     if !cfg!(target_os = "macos") {
         return response(
             501,
@@ -886,13 +903,8 @@ fn omlx_action(action: &str) -> Vec<u8> {
             r#"{"ok":false,"error":"oMLX lifecycle controls are available on macOS only."}"#,
         );
     }
-    if !matches!(action, "start" | "stop" | "restart") {
-        return response(
-            400,
-            "application/json; charset=utf-8",
-            r#"{"ok":false,"error":"Unsupported oMLX action."}"#,
-        );
-    }
+    let action = action.as_str();
+
     let Some(cli) = omlx_cli() else {
         return response(
             503,
@@ -1074,6 +1086,23 @@ fn resolve_project_path(root: &Path, raw: &str, allow_missing: bool) -> Result<P
     } else {
         anyhow::bail!("project path does not exist")
     };
+
+    // Additional strict validation: check that every ancestor is within root
+    let mut current = checked.clone();
+    loop {
+        if current == root {
+            break;
+        }
+        if !current.starts_with(root) {
+            anyhow::bail!("path escapes the granted project root");
+        }
+        if let Some(parent) = current.parent() {
+            current = parent.to_path_buf();
+        } else {
+            anyhow::bail!("path escapes the granted project root");
+        }
+    }
+
     anyhow::ensure!(
         checked.starts_with(root),
         "path escapes the granted project root"
@@ -1134,6 +1163,9 @@ fn project_create_directory(root: Option<&Path>, body: &str) -> Vec<u8> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if let Err(error) = std::fs::create_dir(&current) {
                     return project_error(500, &error.to_string());
+                }
+                if let Ok(canon) = current.canonicalize() {
+                    current = canon;
                 }
             }
             Err(error) => return project_error(500, &error.to_string()),
@@ -1471,16 +1503,22 @@ fn undo_dump(vault: &Path, path: &str, body: &str) -> Result<Vec<u8>> {
 }
 
 fn render_graph(vault: &Path) -> Result<Vec<u8>> {
-    let notes = Vault::open(vault.to_path_buf())?.scan()?;
+    let notes = Index::open(vault)?.all_notes_lite()?;
     let mut body = String::from("<a href=\"/vault\">← Vault</a><h1>Knowledge graph</h1><svg viewBox=\"0 0 900 520\" style=\"width:100%;border:1px solid #ddd;background:#fafafa\">");
+
+    let mut note_indices = std::collections::HashMap::new();
+    for (index, note) in notes.iter().enumerate() {
+        note_indices.insert(note.id.clone(), index);
+        if let Some(stem) = Path::new(&note.id).file_stem().and_then(|s| s.to_str()) {
+            note_indices.insert(stem.to_string(), index);
+        }
+    }
+
     for (index, note) in notes.iter().enumerate() {
         let x = 100 + (index % 5) * 170;
         let y = 100 + (index / 5) * 150;
         for link in &note.links {
-            if let Some(target) = notes.iter().position(|candidate| {
-                candidate.id == *link
-                    || candidate.path.file_stem().and_then(|s| s.to_str()) == Some(link)
-            }) {
+            if let Some(&target) = note_indices.get(link) {
                 let tx = 100 + (target % 5) * 170;
                 let ty = 100 + (target / 5) * 150;
                 body.push_str(&format!(
@@ -1505,7 +1543,7 @@ fn render_note(vault: &Path, query: &str) -> Result<Vec<u8>> {
     let path = safe_path(vault, &relative, false)?;
     let note = std::fs::read_to_string(&path)
         .with_context(|| format!("reading note {}", relative.display()))?;
-    let notes = Vault::open(vault.to_path_buf())?.scan()?;
+    let notes = Index::open(vault)?.all_notes_lite()?;
     let target = relative.to_string_lossy();
     let stem = relative
         .file_stem()

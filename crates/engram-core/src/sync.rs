@@ -233,12 +233,26 @@ impl SyncBackend for FolderSync {
         let mut lamport = state.lamport;
 
         for note in &notes {
+            let known = state.entries.get(&note.id).cloned();
+            if let Some(prev) = known.as_ref().filter(|e| e.mtime == note.mtime) {
+                stats.skipped += 1;
+                let size = std::fs::metadata(&note.path).map(|m| m.len()).unwrap_or(0);
+                entries.push(Entry {
+                    path: note.id.clone(),
+                    hash: prev.hash.clone(),
+                    mtime: note.mtime,
+                    size,
+                    device: self.device_id.clone(),
+                    lamport: prev.lamport,
+                });
+                continue;
+            }
+
             let content = std::fs::read_to_string(&note.path)
                 .with_context(|| format!("reading {}", note.path.display()))?;
             let hash = content_hash(&content);
             let size = content.len() as u64;
 
-            let known = state.entries.get(&note.id).cloned();
             if let Some(prev) = known.filter(|e| e.hash == hash) {
                 stats.skipped += 1;
                 entries.push(Entry {
@@ -320,11 +334,20 @@ impl SyncBackend for FolderSync {
                 "sync entry escapes the sync folder"
             );
 
+            let local = state.entries.get(&entry.path).cloned();
+            if let Some(ref local_entry) = local {
+                if local_entry.hash == entry.hash {
+                    stats.skipped += 1;
+                    max_lamport = max_lamport.max(entry.lamport);
+                    continue;
+                }
+            }
+
             let incoming = std::fs::read_to_string(&src_file)
                 .with_context(|| format!("reading {}", src_file.display()))?;
             let incoming_hash = content_hash(&incoming);
 
-            match state.entries.get(&entry.path).cloned() {
+            match local {
                 None => {
                     // New to this device.
                     if !self.dry_run {

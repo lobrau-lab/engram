@@ -145,3 +145,17 @@ fn rejects_source_symlink_outside_the_sync_folder() {
         let _ = fs::remove_dir_all(root);
     }
 }
+
+#[test]
+fn test_manifest_path() {
+    let dir = std::path::Path::new("/tmp/test");
+    let result = engram_core::sync::manifest_path(dir);
+    assert_eq!(result.to_str().unwrap(), "/tmp/test/.engram-manifest.json");
+}
+
+#[test]
+fn test_state_path() {
+    let dir = std::path::Path::new("/tmp/test");
+    let result = engram_core::sync::state_path(dir);
+    assert_eq!(result.to_str().unwrap(), "/tmp/test/.engram/state.json");
+}
