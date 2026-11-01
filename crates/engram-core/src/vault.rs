@@ -131,6 +131,10 @@ impl Vault {
             if path.extension().and_then(|e| e.to_str()) != Some("md") {
                 continue;
             }
+            let filename = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+            if filename.ends_with(".conflict.md") || filename.contains(".conflict.") || filename.contains(".conflict-") {
+                continue;
+            }
             if is_hidden_child(&self.root, path) {
                 continue;
             }

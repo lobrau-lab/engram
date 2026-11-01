@@ -5,14 +5,14 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=native/control.swift");
+    println!("cargo:rerun-if-changed=native/webview.swift");
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set by Cargo"));
     let helper = out_dir.join("engram-control");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
-        let source = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir"))
-            .join("native")
-            .join("control.swift");
+        let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
+        let source = manifest_dir.join("native").join("control.swift");
         let built = Command::new("xcrun")
             .args([
                 "swiftc",
@@ -35,6 +35,32 @@ fn main() {
                 write_fallback(&helper, "The GUI takeover helper was not built. Install Xcode Command Line Tools and rebuild Engram.");
             }
         }
+
+        let webview_source = manifest_dir.join("native").join("webview.swift");
+        let webview_lib = out_dir.join("libengram_webview.a");
+        let webview_status = Command::new("xcrun")
+            .args([
+                "swiftc",
+                "-O",
+                "-parse-as-library",
+                "-emit-library",
+                "-static",
+                "-module-name",
+                "EngramWebView",
+                webview_source.to_str().expect("valid UTF-8 path"),
+                "-o",
+                webview_lib.to_str().expect("valid UTF-8 output path"),
+            ])
+            .status()
+            .expect("failed to invoke xcrun swiftc for webview.swift");
+        assert!(
+            webview_status.success(),
+            "xcrun swiftc failed to compile webview.swift"
+        );
+        println!("cargo:rustc-link-search=native={}", out_dir.display());
+        println!("cargo:rustc-link-lib=static=engram_webview");
+        println!("cargo:rustc-link-lib=framework=AppKit");
+        println!("cargo:rustc-link-lib=framework=WebKit");
     } else {
         write_fallback(&helper, "GUI takeover is only available on macOS.");
     }

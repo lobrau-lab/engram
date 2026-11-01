@@ -50,6 +50,20 @@ pub struct AppRunResult {
     pub stderr: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowStep {
+    pub capability_id: String,
+    pub action: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityWorkflow {
+    pub id: String,
+    pub name: String,
+    pub steps: Vec<WorkflowStep>,
+    pub created_at: u64,
+}
+
 #[derive(Debug)]
 struct CommandOutput {
     status: Option<i32>,
@@ -84,6 +98,9 @@ pub fn list(vault: &Path) -> Result<Vec<CapabilityDigest>> {
     let mut digests = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
+        if path.file_name().and_then(|name| name.to_str()) == Some("workflows.json") {
+            continue;
+        }
         if path.extension().and_then(|part| part.to_str()) != Some("json") {
             continue;
         }
@@ -103,6 +120,40 @@ pub fn load(vault: &Path, id: &str) -> Result<CapabilityDigest> {
     let path = digest_path(vault, id)?;
     let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_slice(&bytes).context("parsing capability digest")
+}
+
+pub fn list_workflows(vault: &Path) -> Result<Vec<CapabilityWorkflow>> {
+    let path = workflows_path(vault);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_slice(&bytes).context("parsing capability workflows")
+}
+
+pub fn save_workflow(vault: &Path, workflow: CapabilityWorkflow) -> Result<()> {
+    anyhow::ensure!(
+        !workflow.id.is_empty()
+            && workflow.id.len() <= 120
+            && workflow.id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')),
+        "invalid workflow id"
+    );
+    anyhow::ensure!(!workflow.name.trim().is_empty() && workflow.name.len() <= 160, "workflow name must contain 1..=160 bytes");
+    anyhow::ensure!(!workflow.steps.is_empty() && workflow.steps.len() <= 32, "workflow must contain 1..=32 steps");
+    for step in &workflow.steps {
+        anyhow::ensure!(!step.capability_id.is_empty() && step.capability_id.len() <= 120, "invalid workflow capability id");
+        anyhow::ensure!(!step.action.is_empty() && step.action.len() <= 80, "invalid workflow action");
+    }
+    let mut workflows = list_workflows(vault)?;
+    workflows.retain(|existing| existing.id != workflow.id);
+    workflows.push(workflow);
+    workflows.sort_by_key(|item| std::cmp::Reverse(item.created_at));
+    let path = workflows_path(vault);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    atomic_write::replace(&path, serde_json::to_vec_pretty(&workflows)?.as_slice())
+        .with_context(|| format!("writing capability workflows {}", path.display()))
 }
 
 pub fn run(vault: &Path, id: &str, action: &str) -> Result<AppRunResult> {
@@ -293,6 +344,10 @@ fn save_digest(vault: &Path, digest: &CapabilityDigest) -> Result<()> {
 
 fn capabilities_dir(vault: &Path) -> PathBuf {
     vault.join(".engram").join("capabilities")
+}
+
+fn workflows_path(vault: &Path) -> PathBuf {
+    capabilities_dir(vault).join("workflows.json")
 }
 
 fn digest_path(vault: &Path, id: &str) -> Result<PathBuf> {

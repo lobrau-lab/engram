@@ -513,6 +513,37 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_from_vault_omits_conflict_notes() {
+        let dir = std::env::temp_dir().join(format!(
+            "engram-index-conflict-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("idea.md"), "# Idea\nkeep this note\n").unwrap();
+        std::fs::write(
+            dir.join("idea.conflict.md"),
+            "# Conflict\nthis must not be indexed\n",
+        )
+        .unwrap();
+
+        let vault = Vault::open(&dir).unwrap();
+        let index = Index::open(&dir.join("index.sqlite")).unwrap();
+        let count = index
+            .rebuild_from_vault(&vault, &HashingEmbedder::new(64), 100)
+            .unwrap();
+
+        assert_eq!(count, 1);
+        assert!(index.search("must not be indexed", false, 5).unwrap().is_empty());
+        assert_eq!(index.search("keep", false, 5).unwrap().len(), 1);
+        drop(index);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn external_edit_is_detected_and_refreshed() {
         let dir = std::env::temp_dir().join(format!(
             "engram-index-stale-{}-{}",

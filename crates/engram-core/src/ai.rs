@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::config::Provider;
+use std::net::IpAddr;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Msg {
@@ -65,22 +66,49 @@ pub trait LlmClient {
     fn complete(&self, prompt: &str, opts: &ChatOpts) -> Result<String>;
 }
 
+fn is_private_network_host(host: &str) -> bool {
+    let host = host.trim_matches(|c| c == '[' || c == ']').to_lowercase();
+    if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1") {
+        return false;
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(v4) => {
+                let octets = v4.octets();
+                octets[0] == 10
+                    || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+                    || (octets[0] == 192 && octets[1] == 168)
+                    || (octets[0] == 169 && octets[1] == 254)
+            }
+            IpAddr::V6(v6) => {
+                let segments = v6.segments();
+                (segments[0] & 0xfe00) == 0xfc00 || (segments[0] & 0xffc0) == 0xfe80
+            }
+        };
+    }
+    host.ends_with(".local") || host.ends_with(".lan") || host.ends_with(".home.arpa")
+}
+
 /// Validate Engram's Rust inference boundary.
 ///
-/// Local loopback HTTP is allowed because MLX-Serve/oMLX and similar local
-/// sidecars expose HTTP APIs. Internet and arbitrary-network destinations are
-/// rejected before ureq is constructed or invoked.
+/// Loopback HTTP is always allowed. Private-network HTTP endpoints (RFC1918,
+/// link-local, and mDNS-style hostnames) are also allowed so a model served on
+/// the user's own desktop or LAN can be used. Internet and arbitrary-network
+/// destinations remain rejected before ureq is constructed or invoked.
 pub fn validate_local_endpoint(base: &str) -> Result<Url> {
     let url = Url::parse(base)
-        .map_err(|_| anyhow!("inference endpoint must be a valid plain HTTP loopback URL"))?;
+        .map_err(|_| anyhow!("inference endpoint must be a valid plain HTTP URL"))?;
     if url.scheme() != "http" || !url.username().is_empty() || url.password().is_some() {
         anyhow::bail!("inference endpoint must use plain HTTP without userinfo")
     }
     let host = url
         .host_str()
-        .ok_or_else(|| anyhow!("inference endpoint must include a loopback host"))?;
-    if !matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") {
-        anyhow::bail!("inference endpoint host must be localhost, 127.0.0.1, or ::1")
+        .ok_or_else(|| anyhow!("inference endpoint must include a host"))?;
+    let host = host.to_lowercase();
+    let allowed = matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "[::1]")
+        || is_private_network_host(&host);
+    if !allowed {
+        anyhow::bail!("inference endpoint host must be loopback or a private LAN address")
     }
     Ok(url)
 }

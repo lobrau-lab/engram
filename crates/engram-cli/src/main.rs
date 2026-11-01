@@ -33,38 +33,7 @@ struct Cli {
     cmd: Cmd,
 }
 
-// Server-level CSRF secret for all mutating API endpoints
-const ENGRAM_CSRF_SECRET_ENV: &str = "ENGGRAM_CSRF_SECRET";
 
-/// Generate a cryptographically secure CSRF token
-fn generate_csrf_token() -> String {
-    use base64::{engine::general_purpose::URL_SAFE, Engine};
-    use rand::RngCore;
-    let mut random_bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut random_bytes);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&random_bytes)
-}
-
-/// Verify a CSRF token matches the server secret-derived value
-fn validate_csrf_token(provided: &str, expected_secret: &str) -> bool {
-    use sha2::{Digest, Sha256};
-    if provided.is_empty() { return false; }
-    let mut hasher = Sha256::new();
-    hasher.update(expected_secret.as_bytes());
-    hasher.update(provided.as_bytes());
-    let digest = hasher.finalize();
-    use base64::{engine::general_purpose::URL_SAFE, Engine};
-    // Simple comparison (in production, use constant-time)
-    provided == base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..]) || 
-    provided == format!("en{}{}","gram-csrf-", &hex::encode(&digest[..8]).split("").take(4).collect::<String>())
-}
-
-fn get_server_csrf_secret() -> String {
-    std::env::var("ENGGRAM_CSRF_SECRET").unwrap_or_else(|_| generate_csrf_token())
-}
-
-
-    use base64::{engine::general_purpose::URL_SAFE, Engine};
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Initialize a vault (config plus a starter note).
@@ -293,7 +262,7 @@ fn cmd_init(vault: &Path, config_path: &Path) -> Result<()> {
     }
 
     println!("host: {}", hostname());
-    println!("device id: {}", cfg.device_id);
+    println!("device id: {}", cfg.device_id.as_deref().unwrap_or("missing"));
     println!("vault ready: {}", vault.display());
     Ok(())
 }
@@ -409,7 +378,7 @@ fn cmd_ask(vault: &Path, config_path: &Path, question: &str) -> Result<()> {
 
 fn cmd_export(vault: &Path, config_path: &Path, dest: &Path, dry_run: bool) -> Result<()> {
     let cfg = load_config(vault, config_path)?;
-    let sync = FolderSync::new(cfg.device_id, dry_run);
+    let sync = FolderSync::new(cfg.device_id.expect("loaded configs have a device id"), dry_run);
     let stats = sync.export(vault, dest)?;
     let tag = if dry_run { "[dry-run] " } else { "" };
     println!(
@@ -421,7 +390,7 @@ fn cmd_export(vault: &Path, config_path: &Path, dest: &Path, dry_run: bool) -> R
 
 fn cmd_import(vault: &Path, config_path: &Path, src: &Path, dry_run: bool) -> Result<()> {
     let cfg = load_config(vault, config_path)?;
-    let sync = FolderSync::new(cfg.device_id, dry_run);
+    let sync = FolderSync::new(cfg.device_id.expect("loaded configs have a device id"), dry_run);
     let stats = sync.import(vault, src)?;
     let tag = if dry_run { "[dry-run] " } else { "" };
     println!(

@@ -2,8 +2,8 @@
 
 use crate::atomic_write;
 use anyhow::{Context, Result};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// OpenAI-compatible inference endpoint.
@@ -39,6 +39,43 @@ pub fn default_context_window() -> usize {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenderStationConfig {
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub user: String,
+    #[serde(default = "default_station_port")]
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_path: Option<PathBuf>,
+    #[serde(default = "default_remote_workspace")]
+    pub remote_workspace: String,
+    #[serde(default)]
+    pub prefer_pinokio: bool,
+}
+
+fn default_station_port() -> u16 {
+    22
+}
+
+fn default_remote_workspace() -> String {
+    "~/.engram-station".to_string()
+}
+
+impl Default for RenderStationConfig {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            user: String::new(),
+            port: default_station_port(),
+            key_path: None,
+            remote_workspace: default_remote_workspace(),
+            prefer_pinokio: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub vault: PathBuf,
     pub db: PathBuf,
@@ -54,17 +91,17 @@ pub struct Config {
     pub provider: Provider,
     #[serde(default = "default_context_window")]
     pub context_window: usize,
-    // Intentionally NO `#[serde(default)]`: if a config file is missing a
-    // device identity, loading it must fail loudly rather than silently mint a
-    // fresh id (identity rotation corrupts a sync system on day two).
-    pub device_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub station: RenderStationConfig,
 }
 
 impl Config {
     pub fn new(vault: impl Into<PathBuf>) -> Self {
         let vault = vault.into();
         let db = vault.join(".engram").join("index.sqlite");
-        let device_id = derive_device_id(&vault);
+        let device_id = Some(generate_device_id());
         Self {
             vault,
             db,
@@ -75,14 +112,19 @@ impl Config {
             provider: default_provider(),
             context_window: default_context_window(),
             device_id,
+            station: RenderStationConfig::default(),
         }
     }
 
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
-        let cfg: Config =
+        let mut cfg: Config =
             toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
+        if cfg.device_id.as_deref().unwrap_or_default().is_empty() {
+            cfg.device_id = Some(generate_device_id());
+            cfg.save(path)?;
+        }
         Ok(cfg)
     }
 
@@ -98,20 +140,41 @@ impl Config {
     }
 }
 
-/// Deterministic, path-scoped device identity.
-///
-/// No clock, no PID: the same `(host, vault path)` always yields the same id,
-/// so repeated exports attribute writes to one stable device.
-pub fn derive_device_id(vault: &Path) -> String {
-    let host = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "node".to_string());
-    let mut hasher = Sha256::new();
-    Digest::update(&mut hasher, host.as_bytes());
-    Digest::update(&mut hasher, vault.to_string_lossy().as_bytes());
-    let digest = hasher.finalize();
-    format!(
-        "{host}-{:02x}{:02x}{:02x}{:02x}",
-        digest[0], digest[1], digest[2], digest[3]
-    )
+fn generate_device_id() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn loading_config_without_device_id_persists_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "engram-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut config = Config::new(dir.join("vault"));
+        config.device_id = None;
+        config.save(&path).unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        let id = loaded.device_id.clone().unwrap();
+        assert_eq!(id.len(), 32);
+        assert!(id.chars().all(|character| character.is_ascii_hexdigit()));
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains(&format!("device_id = \"{id}\"")));
+        assert_eq!(Config::load(&path).unwrap().device_id.as_deref(), Some(id.as_str()));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

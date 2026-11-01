@@ -5,9 +5,11 @@ use engram_core::capability;
 use engram_core::dump;
 use engram_core::embedded::{self, ChatMessage};
 use engram_core::index::Index;
+use engram_core::remote_station::{RemoteStationClient, RenderJob, RenderJobType};
 use engram_core::vault::validate_relative_path;
 use engram_core::{
-    atomic_write, build_context_prompt, Config, HashingEmbedder, LlmClient, OpenAiCompat, Vault,
+    atomic_write, build_context_prompt, Config, HashingEmbedder, LlmClient, OpenAiCompat,
+    RenderStationConfig, Vault,
 };
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -306,6 +308,8 @@ fn dispatch(
         }
         ("GET", "/api/v1/workspace") => workspace_get(vault),
         ("PUT", "/api/v1/workspace") => workspace_put(vault, body),
+        ("POST", "/api/v1/station/dispatch") => station_dispatch(body),
+        ("POST", "/api/v1/station/poll") => station_poll(body),
         ("GET", "/api/v1/project/status") => project_status(project_root),
         ("GET", "/api/v1/project/files") => project_files(project_root, query),
         ("GET", "/api/v1/project/read") => project_read(project_root, query),
@@ -316,6 +320,8 @@ fn dispatch(
         ("GET", "/api/v1/apps") => list_apps(vault),
         ("POST", "/api/v1/apps/inspect") => inspect_app(vault, body),
         ("POST", "/api/v1/apps/run") => run_app(vault, body),
+        ("GET", "/api/v1/workflows") => list_workflows(vault),
+        ("POST", "/api/v1/workflows") => save_workflow(vault, body),
         ("GET", "/api/v1/workshop") => list_workshop(vault),
         ("POST", "/api/v1/workshop/propose") => workshop_propose(project_root, vault, body),
         ("GET", "/api/v1/takeover/status") => takeover_status(takeover),
@@ -648,6 +654,24 @@ fn run_app(vault: &Path, body: &str) -> Vec<u8> {
             "application/json; charset=utf-8",
             &serde_json::to_string(&result).unwrap_or_else(|_| "{}".into()),
         ),
+        Err(error) => inference_error(400, &error.to_string()),
+    }
+}
+
+fn list_workflows(vault: &Path) -> Vec<u8> {
+    match capability::list_workflows(vault) {
+        Ok(workflows) => response(200, "application/json; charset=utf-8", &serde_json::json!({"workflows": workflows}).to_string()),
+        Err(error) => inference_error(500, &error.to_string()),
+    }
+}
+
+fn save_workflow(vault: &Path, body: &str) -> Vec<u8> {
+    let workflow = match serde_json::from_str::<capability::CapabilityWorkflow>(body) {
+        Ok(workflow) => workflow,
+        Err(error) => return inference_error(400, &format!("invalid workflow: {error}")),
+    };
+    match capability::save_workflow(vault, workflow) {
+        Ok(()) => response(201, "application/json; charset=utf-8", r#"{"ok":true}"#),
         Err(error) => inference_error(400, &error.to_string()),
     }
 }
@@ -991,6 +1015,101 @@ fn workspace_put(vault: &Path, body: &str) -> Vec<u8> {
         ),
         Err(SaveError::BadRequest(error)) => project_error(400, &error),
         Err(SaveError::Internal(error)) => project_error(500, &error),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct StationDispatchRequest {
+    #[serde(rename = "type")]
+    job_type: RenderJobType,
+    prompt: String,
+    #[serde(default)]
+    params: serde_json::Value,
+    station: RenderStationConfig,
+}
+
+#[derive(serde::Deserialize)]
+struct StationPollRequest {
+    job: RenderJob,
+    station: RenderStationConfig,
+}
+
+fn valid_station_workspace(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 240
+        && (value.starts_with('~') || value.starts_with('/'))
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '~'))
+}
+
+fn normalize_station_config(config: &mut RenderStationConfig) {
+    if config.key_path.as_ref().is_some_and(|path| path.as_os_str().is_empty()) {
+        config.key_path = None;
+    }
+}
+
+fn station_error(status: u16, error: impl std::fmt::Display) -> Vec<u8> {
+    response(
+        status,
+        "application/json; charset=utf-8",
+        &serde_json::json!({"ok": false, "error": error.to_string()}).to_string(),
+    )
+}
+
+fn station_dispatch(body: &str) -> Vec<u8> {
+    let mut request = match serde_json::from_str::<StationDispatchRequest>(body) {
+        Ok(request) => request,
+        Err(error) => return station_error(400, format!("invalid station request: {error}")),
+    };
+    request.prompt = request.prompt.trim().to_string();
+    if request.prompt.is_empty() || request.prompt.len() > 16 * 1024 {
+        return station_error(400, "prompt must contain 1–16384 bytes");
+    }
+    if !valid_station_workspace(&request.station.remote_workspace) {
+        return station_error(400, "remote workspace must be an absolute or home-relative safe path");
+    }
+    normalize_station_config(&mut request.station);
+    let extension = match request.job_type {
+        RenderJobType::Image => "png",
+        RenderJobType::Video => "mp4",
+        RenderJobType::Audio => "wav",
+    };
+    let mut job = RenderJob::new(
+        request.job_type,
+        request.prompt,
+        format!("render.pending.{extension}"),
+        request.params,
+    );
+    job.output_filename = format!("render-{}.{}", job.id, extension);
+    match RemoteStationClient::new(request.station).dispatch_job(&mut job) {
+        Ok(()) => response(
+            200,
+            "application/json; charset=utf-8",
+            &serde_json::json!({"ok": true, "job": job}).to_string(),
+        ),
+        Err(error) => station_error(502, error),
+    }
+}
+
+fn station_poll(body: &str) -> Vec<u8> {
+    let request = match serde_json::from_str::<StationPollRequest>(body) {
+        Ok(request) => request,
+        Err(error) => return station_error(400, format!("invalid station poll request: {error}")),
+    };
+    if !valid_station_workspace(&request.station.remote_workspace) {
+        return station_error(400, "remote workspace must be an absolute or home-relative safe path");
+    }
+    let mut station = request.station;
+    normalize_station_config(&mut station);
+    let mut job = request.job;
+    match RemoteStationClient::new(station).poll_job_status(&mut job) {
+        Ok(_) => response(
+            200,
+            "application/json; charset=utf-8",
+            &serde_json::json!({"ok": true, "job": job}).to_string(),
+        ),
+        Err(error) => station_error(502, error),
     }
 }
 
@@ -1480,7 +1599,7 @@ fn render_dump_review(vault: &Path, query: &str) -> Result<Vec<u8>> {
     let item = dump::get(vault, &id)?;
     let analysis = dump::get_analysis(vault, &id).ok();
     let suggestions = analysis.map(|a| a.suggestions).unwrap_or_default();
-    let cards = suggestions.iter().map(|s| format!("<article><h3>{} · {}</h3><p><b>Source evidence:</b> {}</p><p>{}</p><form method=\"post\" action=\"/api/v1/dump/{}/review\"><input type=\"hidden\" name=\"suggestion_id\" value=\"{}\"><label>Path <input name=\"path\" value=\"{}\"></label><label>Title <input name=\"title\" value=\"{}\"></label><label>Body <textarea name=\"body\">{}</textarea></label><button name=\"status\" value=\"accepted\">Accept proposal</button><button name=\"status\" value=\"rejected\">Reject</button></form><h4>Preview</h4><pre>{}</pre>{}<form method=\"post\" action=\"/api/v1/dump/{}/apply\"><input type=\"hidden\" name=\"suggestion_id\" value=\"{}\"><button>Apply accepted proposal</button></form>{}</article>", escape(&s.kind), escape(&s.review_status), escape(&s.evidence), escape(&s.rationale), encode(&id), encode(&s.id), escape(s.edited_path.as_deref().or(s.path.as_deref()).unwrap_or("")), escape(s.edited_title.as_deref().or(s.title.as_deref()).unwrap_or("")), escape(s.edited_body.as_deref().or(s.body.as_deref()).unwrap_or("")), escape(&format!("# {}\n\n{}", s.edited_title.as_deref().or(s.title.as_deref()).unwrap_or("Untitled"), s.edited_body.as_deref().or(s.body.as_deref()).unwrap_or(""))), if s.review_status == "accepted" { "" } else { "<small>Accept before applying.</small>" }, encode(&id), encode(&s.id), if s.review_status == "applied" { format!("<form method=\"post\" action=\"/api/v1/dump/{}/undo\"><input type=\"hidden\" name=\"suggestion_id\" value=\"{}\"><button>Undo</button></form>", encode(&id), encode(&s.id)) } else { String::new() })).collect::<String>();
+    let cards = suggestions.iter().map(|s| format!("<article><h3>{} · {}</h3><p><b>Source evidence:</b> {}</p><p>{}</p><form method=\"post\" action=\"/api/v1/dump/{}/review\"><input type=\"hidden\" name=\"suggestion_id\" value=\"{}\"><label>Path <input name=\"path\" value=\"{}\"></label><label>Title <input name=\"title\" value=\"{}\"></label><label>Body <textarea name=\"body\">{}</textarea></label><button name=\"status\" value=\"accepted\">Accept proposal</button><button name=\"status\" value=\"rejected\">Reject</button></form><h4>Preview</h4><pre>{}</pre>{}<form method=\"post\" action=\"/api/v1/dump/{}/apply\"><input type=\"hidden\" name=\"suggestion_id\" value=\"{}\"><button {}{}>Apply accepted proposal</button></form>{}</article>", escape(&s.kind), escape(&s.review_status), escape(&s.evidence), escape(&s.rationale), encode(&id), encode(&s.id), escape(s.edited_path.as_deref().or(s.path.as_deref()).unwrap_or("")), escape(s.edited_title.as_deref().or(s.title.as_deref()).unwrap_or("")), escape(s.edited_body.as_deref().or(s.body.as_deref()).unwrap_or("")), escape(&format!("# {}\n\n{}", s.edited_title.as_deref().or(s.title.as_deref()).unwrap_or("Untitled"), s.edited_body.as_deref().or(s.body.as_deref()).unwrap_or(""))), if s.review_status == "accepted" { "" } else { "<small>Accept before applying.</small>" }, encode(&id), encode(&s.id), if s.kind == "create_note" { "" } else { "disabled" }, if s.kind == "create_note" { "" } else { " title=\"Coming in v0.2 - only Create Note is supported\"" }, if s.review_status == "applied" { format!("<form method=\"post\" action=\"/api/v1/dump/{}/undo\"><input type=\"hidden\" name=\"suggestion_id\" value=\"{}\"><button>Undo</button></form>", encode(&id), encode(&s.id)) } else { String::new() })).collect::<String>();
     let html = format!("<a href=\"/dump\">← Inbox</a><h1>Review dump item</h1><p><b>Original source:</b> {}</p><pre>{}</pre><section>{}</section>", escape(&item.filename), escape(&item.content), cards);
     Ok(page("Dump review", &html))
 }
@@ -2086,7 +2205,7 @@ fn safe_path(vault: &Path, relative: &Path, for_write: bool) -> Result<std::path
 
 fn page(title: &str, body: &str) -> Vec<u8> {
     response(200, "text/html; charset=utf-8", &format!(
-        "<!doctype html><meta charset=utf-8><title>{}</title><style>body{{font:16px system-ui;max-width:900px;margin:40px auto;padding:0 20px}}textarea{{width:100%;height:55vh;font:15px monospace}}a{{color:#36c}}.preview{{border:1px solid #ddd;padding:20px;line-height:1.55}}code,pre{{background:#f3f3f3;padding:2px 5px}}</style>{}",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{} · Engram</title><style>:root{{--bg:#111411;--sidebar:#171a17;--panel:#1b1f1b;--panel-2:#202520;--line:#2b302b;--line-soft:#252a25;--text:#eef1e9;--muted:#9ba398;--dim:#727a70;--green:#c8f169;--gold:#e7bd70;--blue:#8ab7c5;--red:#df8679}}*{{box-sizing:border-box}}html,body{{margin:0;min-height:100%;background:var(--bg);color:var(--text);font:14px 'DM Sans',system-ui,sans-serif}}a{{color:var(--green);text-decoration:none}}a:hover{{text-decoration:underline}}.legacy-shell{{min-height:100vh;display:grid;grid-template-columns:220px minmax(0,1fr)}}.legacy-sidebar{{background:var(--sidebar);border-right:1px solid var(--line-soft);padding:26px 16px;display:flex;flex-direction:column;gap:22px}}.legacy-brand{{display:flex;align-items:center;gap:10px;color:var(--text);font-size:18px;font-weight:700;letter-spacing:-.5px}}.legacy-mark{{width:22px;height:22px;display:inline-flex;align-items:flex-end;gap:3px;justify-content:center}}.legacy-mark i{{width:4px;border-radius:4px;background:var(--green);display:block}}.legacy-mark i:nth-child(1){{height:11px}}.legacy-mark i:nth-child(2){{height:17px}}.legacy-mark i:nth-child(3){{height:14px}}.legacy-kicker{{color:var(--dim);font-size:10px;letter-spacing:.12em}}.legacy-nav{{display:grid;gap:5px}}.legacy-nav a{{padding:10px 11px;border-radius:6px;color:var(--muted);font-size:12px}}.legacy-nav a:hover{{background:var(--panel-2);color:var(--text);text-decoration:none}}.legacy-main{{width:min(1100px,100%);padding:42px clamp(20px,5vw,72px);overflow:hidden}}.legacy-content{{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:28px;box-shadow:0 16px 40px #0004}}h1{{margin:0 0 10px;font-size:30px;letter-spacing:-1px}}h2{{margin-top:30px;font-size:17px}}h3{{font-size:14px}}p{{color:var(--muted);line-height:1.6}}small{{color:var(--dim)}}button{{border:1px solid #4b583d;border-radius:6px;background:var(--green);color:#17200e;padding:9px 14px;font-weight:700;cursor:pointer}}button:hover{{filter:brightness(1.08)}}input,textarea,select{{width:100%;border:1px solid var(--line);border-radius:6px;background:var(--panel-2);color:var(--text);padding:10px;margin:6px 0 12px;font:inherit}}textarea{{min-height:180px;font-family:ui-monospace,SFMono-Regular,monospace}}ul{{padding-left:20px}}li{{padding:10px 0;border-bottom:1px solid var(--line-soft)}}article,.preview{{border:1px solid var(--line);border-radius:8px;background:var(--panel-2);padding:18px;line-height:1.6}}pre,code{{background:#121612;color:#d6e0ce;padding:3px 5px;border-radius:4px;overflow:auto}}form{{margin:16px 0}}.legacy-actions{{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0}}.legacy-actions a{{border:1px solid var(--line);border-radius:6px;padding:9px 12px}}@media(max-width:700px){{.legacy-shell{{display:block}}.legacy-sidebar{{padding:16px;position:static}}.legacy-nav{{display:flex;overflow:auto}}.legacy-main{{padding:18px 12px}}.legacy-content{{padding:18px}}}}</style></head><body><div class=\"legacy-shell\"><aside class=\"legacy-sidebar\"><a class=\"legacy-brand\" href=\"/vault\"><span class=\"legacy-mark\"><i></i><i></i><i></i></span>Engram</a><span class=\"legacy-kicker\">LOCAL KNOWLEDGE WORKSPACE</span><nav class=\"legacy-nav\"><a href=\"/threadline/\">Threadline chat</a><a href=\"/vault\">Vault</a><a href=\"/new\">New note</a><a href=\"/dump\">Dump / Inbox</a><a href=\"/graph\">Knowledge graph</a><a href=\"/ask\">Ask locally</a><a href=\"/trash\">Trash</a></nav></aside><main class=\"legacy-main\"><section class=\"legacy-content\">{}</section></main></div></body></html>",
         escape(title), body
     ))
 }
@@ -2130,6 +2249,10 @@ fn threadline_asset(path: &str) -> Option<(&'static str, &'static str)> {
         "/threadline/src/core/store.js" => (
             "text/javascript; charset=utf-8",
             include_str!("../web/src/core/store.js"),
+        ),
+        "/threadline/src/core/station-state.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("../web/src/core/station-state.js"),
         ),
         "/threadline/src/core/memory-manager.js" => (
             "text/javascript; charset=utf-8",
@@ -2498,6 +2621,7 @@ mod tests {
         for path in [
             "/threadline/src/core/evaluation-bench.js",
             "/threadline/src/core/store.js",
+            "/threadline/src/core/station-state.js",
             "/threadline/src/core/memory-manager.js",
             "/threadline/src/core/context-packer.js",
             "/threadline/src/core/app-actions.js",
@@ -2551,4 +2675,89 @@ mod tests {
         assert!(removed["hits"].as_array().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(vault);
     }
+
+    #[test]
+    fn station_api_contracts() {
+        use serde_json::json;
+
+        fn parse_response(bytes: &[u8]) -> (u16, serde_json::Value) {
+            let text = String::from_utf8_lossy(bytes);
+            let (headers, body) = text.split_once("\r\n\r\n").unwrap();
+            let status = headers
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .parse()
+                .unwrap();
+            (status, serde_json::from_str(body).unwrap_or(serde_json::Value::Null))
+        }
+
+        fn station(host: &str, workspace: &str) -> serde_json::Value {
+            json!({
+                "host": host,
+                "user": "render",
+                "port": 22,
+                "key_path": "",
+                "remote_workspace": workspace,
+                "prefer_pinokio": false
+            })
+        }
+
+        fn dispatch_payload(station: serde_json::Value, prompt: &str) -> String {
+            json!({"type": "image", "prompt": prompt, "params": {"seed": 42}, "station": station}).to_string()
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "engram-station-test-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let fake_bin = root.join("bin");
+        std::fs::create_dir_all(&fake_bin).unwrap();
+        let ssh = fake_bin.join("ssh");
+        std::fs::write(&ssh, "#!/bin/sh\ncase \"$*\" in *\"kill -0\"*) echo RUNNING ;; *) echo 123 ;; esac\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&ssh).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&ssh, permissions).unwrap();
+        }
+
+        let orig_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{orig_path}", fake_bin.display()));
+
+        let (status, body) = parse_response(&super::station_dispatch(&dispatch_payload(station("127.0.0.1", "/tmp/station_test"), "cyberpunk skyline")));
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["job"]["job_type"], "image");
+        assert_eq!(body["job"]["status"], "running");
+
+        let poll_req = json!({"job": body["job"], "station": station("127.0.0.1", "/tmp/station_test")}).to_string();
+        let (status, poll) = parse_response(&super::station_poll(&poll_req));
+        assert_eq!(status, 200, "{poll}");
+        assert_eq!(poll["ok"], true);
+        assert_eq!(poll["job"]["status"], "running");
+
+        let cases = [
+            ("empty prompt", dispatch_payload(station("127.0.0.1", "/tmp/station_test"), ""), "prompt must contain"),
+            ("oversized prompt", dispatch_payload(station("127.0.0.1", "/tmp/station_test"), &"x".repeat(16_385)), "prompt must contain 1–16384 bytes"),
+            ("relative traversal", dispatch_payload(station("127.0.0.1", "../../etc"), "safe"), "remote workspace"),
+            ("shell injection", dispatch_payload(station("127.0.0.1", "; rm -rf /"), "safe"), "remote workspace"),
+        ];
+        for (name, payload, message) in cases {
+            let (status, response) = parse_response(&super::station_dispatch(&payload));
+            assert_eq!(status, 400, "{name}: {response}");
+            assert!(response["error"].as_str().unwrap().contains(message), "{name}: {response}");
+        }
+
+        let (status, accepted) = parse_response(&super::station_dispatch(&dispatch_payload(station("127.0.0.1", "/valid/path/here"), "safe")));
+        assert_eq!(status, 200, "{accepted}");
+
+        std::env::set_var("PATH", orig_path);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
+

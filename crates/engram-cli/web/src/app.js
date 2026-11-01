@@ -1,16 +1,18 @@
 import { getWorkspace, activeConversation, appendTurn, createConversation, setActiveConversation, updateActive, updateMemory, updateSettings, subscribe, clearWorkspace, removeAssertion, getSessionApiKey, setSessionApiKey, hydrateWorkspace, flushWorkspace, exportWorkspace, replaceWorkspace, reloadWorkspaceFromServer, getWorkspaceStatus } from './core/store.js';
 import { recordAndUpdate, retrieveEvidence, evaluateRules } from './core/memory-manager.js';
 import { filterRemoteHistory, packContext } from './core/context-packer.js';
-import { listModels, setModelLoaded, streamChat } from './providers/openai-compatible.js';
+import { completeChat, listModels, setModelLoaded, streamChat } from './providers/openai-compatible.js';
 import { searchEngramVault } from './providers/engram-vault.js';
 import { applicationTools, executeApplicationAction, executeProjectAction } from './core/app-actions.js';
 import { classifyEndpoint, canSendVaultContext, requestCategories, confirmDisclosure, supportsFunctionTools } from './core/privacy-policy.js';
 import { toolCallRejection } from './core/permission-gate.js';
 import { runMemoryBench } from './core/evaluation-bench.js';
+import { createStationJob, dispatchPayload, statusLabel, updateStationJob } from './core/station-state.js';
+import { resolveModelProfile } from './core/model-profiles.js';
 
 const $ = selector => document.querySelector(selector);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
-let currentView = 'chat'; let inspectorTab = 'assembly'; let sending = false; let aborter = null; let embeddedModel = null; let appDigests = []; let appResult = ''; let appsLoaded = false; let workshopProposals = []; let workshopResult = ''; let workshopLoaded = false; let takeoverStatus = null; let takeoverSession = null; let takeoverResult = ''; let takeoverTree = ''; let takeoverShot = ''; let takeoverBusy = false; let takeoverTimer = null; let takeoverRequest = 0; let takeoverMinutes = 15;
+let currentView = 'chat'; let inspectorTab = 'assembly'; let sending = false; let aborter = null; let embeddedModel = null; let embeddedProbeComplete = false; let embeddedSetupDismissed = false; let stationJobs = []; let stationBusy = false; let appDigests = []; let appResult = ''; let appsLoaded = false; let appWorkflows = []; let workflowsLoaded = false; let workflowRecording = null; let workshopProposals = []; let workshopResult = ''; let workshopLoaded = false; let takeoverStatus = null; let takeoverSession = null; let takeoverResult = ''; let takeoverTree = ''; let takeoverShot = ''; let takeoverBusy = false; let takeoverTimer = null; let takeoverRequest = 0; let takeoverMinutes = 15;
 
 const accentOptions = {
   green: { label: 'Green', color: '#c8f169', image: 'engram-mark-green.png' },
@@ -77,18 +79,24 @@ function renderMessages() {
   const convo = current(); const msgs = $('#messages');
   $('#welcome').classList.toggle('hidden', convo.turns.length > 0);
   $('#top-title').textContent = convo.title;
-  msgs.innerHTML = convo.turns.map(turn => {
+  const setupCard = embeddedProbeComplete && !embeddedModel && !embeddedSetupDismissed ? '<aside class="setup-card" role="status"><button class="setup-card-dismiss" id="dismiss-embedded-setup" type="button" aria-label="Dismiss setup message">×</button><strong>On-device Apple Foundation Models unavailable.</strong><p>Connect a local OpenAI-compatible endpoint (like MLX, llama.cpp, or vLLM) in Connections &amp; Settings.</p><button class="primary-button" id="open-embedded-settings" type="button">Open Connections &amp; Settings</button></aside>' : '';
+  msgs.innerHTML = setupCard + convo.turns.map(turn => {
     const turnSources = turn.sourceTurnIds || []; const noteSources = turn.sourceNoteIds || [];
     const sourceCount = turnSources.length + noteSources.length;
     const sourceDetails = [...turnSources.map(id => `turn ${id.slice(0, 8)}`), ...noteSources.map(id => `<a href="/note?path=${encodeURIComponent(id)}">${esc(id)}</a>`)];
-    return `<article class="message-row ${turn.role === 'assistant' ? 'assistant-row' : 'user-row'}"><div class="message-avatar ${turn.role}">${turn.role === 'assistant' ? '<img src="./assets/engram-mark.png" alt="" />' : 'T'}</div><div class="message-main"><div class="message-meta"><strong>${turn.role === 'assistant' ? 'Threadline' : 'You'}</strong><time>${new Date(turn.timestamp).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</time>${turn.role === 'assistant' && sourceCount ? `<span class="source-badge">⌘ ${sourceCount} sources</span>` : ''}</div><div class="message-text">${esc(turn.content).replace(/\n/g, '<br>')}</div>${turn.role === 'assistant' && sourceCount ? `<details class="message-sources"><summary>Sources used</summary><span>${sourceDetails.join(' · ')}</span></details>` : ''}</div></article>`;
+    const thinkingBlock = turn.thinking ? `<details class="message-thinking"><summary>Thought process</summary><div class="thinking-content">${esc(turn.thinking).replace(/\n/g, '<br>')}</div></details>` : '';
+    return `<article class="message-row ${turn.role === 'assistant' ? 'assistant-row' : 'user-row'}"><div class="message-avatar ${turn.role}">${turn.role === 'assistant' ? '<img src="./assets/engram-mark.png" alt="" />' : 'T'}</div><div class="message-main"><div class="message-meta"><strong>${turn.role === 'assistant' ? 'Threadline' : 'You'}</strong><time>${new Date(turn.timestamp).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</time>${turn.role === 'assistant' && sourceCount ? `<span class="source-badge">⌘ ${sourceCount} sources</span>` : ''}</div>${thinkingBlock}<div class="message-text">${esc(turn.content).replace(/\n/g, '<br>')}</div>${turn.role === 'assistant' && sourceCount ? `<details class="message-sources"><summary>Sources used</summary><span>${sourceDetails.join(' · ')}</span></details>` : ''}</div></article>`;
   }).join('');
+  $('#open-embedded-settings')?.addEventListener('click', () => switchView('settings'));
+  $('#dismiss-embedded-setup')?.addEventListener('click', () => { embeddedSetupDismissed = true; renderMessages(); });
   msgs.scrollTop = msgs.scrollHeight;
 }
 
 function renderStatus() {
   const settings = getWorkspace().settings;
-  $('#connection-label').textContent = settings.model ? `${settings.model} · ${settings.connectionStatus || 'not tested'}` : 'Connect a model';
+  const profile = resolveModelProfile(settings.model, settings.modelProfile);
+  const profileTag = settings.model ? ` [${profile.id.toUpperCase()}]` : '';
+  $('#connection-label').textContent = settings.model ? `${settings.model}${profileTag} · ${settings.connectionStatus || 'not tested'}` : 'Connect a model';
   $('#connection-pill').classList.toggle('configured', Boolean(settings.model));
   $('#budget-label').textContent = `Context · ${Math.round(settings.contextLimit / 1024)}k`;
   $('#vault-toggle').classList.toggle('active', Boolean(settings.vaultSearchEnabled));
@@ -133,9 +141,79 @@ function switchView(view) {
   document.querySelectorAll('.nav-item').forEach(item => item.classList.toggle('active', item.dataset.view === view));
   $('#chat-view').classList.toggle('hidden', view !== 'chat');
   $('#workspace-view').classList.toggle('hidden', view === 'chat');
-  const labels = { chat: current().title, memory: 'Memory ledger', bench: 'Memory bench', rules: 'Decision rules', apps: 'Application digests', takeover: 'Takeover', workshop: 'Workshop', settings: 'Connections & settings' };
+  const labels = { chat: current().title, memory: 'Memory ledger', bench: 'Memory bench', rules: 'Decision rules', station: 'Render Station', apps: 'Application digests', takeover: 'Takeover', workshop: 'Workshop', settings: 'Connections & settings' };
   $('#top-title').textContent = labels[view]; if (view !== 'chat') renderWorkspaceView();
   if (view === 'takeover') loadTakeover(true);
+}
+
+function stationConfig() {
+  return getWorkspace().settings.station || { host: '', user: '', port: 22, key_path: '', remote_workspace: '~/.engram-station', prefer_pinokio: false };
+}
+
+function stationSettingsMarkup(settings) {
+  const station = settings.station || stationConfig();
+  return `<section class="settings-card wide-card"><div class="settings-card-heading"><span class="settings-icon warm">▣</span><div><h2>Render Station</h2><p>Desktop rendering machine connection</p></div><span class="module-label">STATION</span></div><div class="field-row setting-numbers"><div><label class="field-label" for="station-host">Host / IP address</label><input id="station-host" name="stationHost" value="${esc(station.host)}" placeholder="desktop.local" /></div><div><label class="field-label" for="station-user">SSH user</label><input id="station-user" name="stationUser" value="${esc(station.user)}" placeholder="render" /></div><div><label class="field-label" for="station-port">SSH port</label><input id="station-port" name="stationPort" type="number" min="1" max="65535" value="${station.port || 22}" /></div></div><div class="field-row setting-numbers"><div><label class="field-label" for="station-key-path">Key path</label><input id="station-key-path" name="stationKeyPath" value="${esc(station.key_path)}" placeholder="~/.ssh/id_ed25519" /></div><div><label class="field-label" for="station-workspace">Remote workspace</label><input id="station-workspace" name="stationWorkspace" value="${esc(station.remote_workspace || '~/.engram-station')}" /></div></div><label class="check-row"><input type="checkbox" name="stationPreferPinokio" ${station.prefer_pinokio ? 'checked' : ''} /><span><b>Prefer Pinokio runner</b><small>Use the Pinokio manifest instead of the direct Python runner.</small></span><i></i></label></section>`;
+}
+
+async function dispatchStationJob(event) {
+  event.preventDefault();
+  if (stationBusy) return;
+  const form = new FormData(event.currentTarget);
+  const station = stationConfig();
+  if (!station.host.trim()) { toast('Configure a Render Station host first.'); return; }
+  const job = createStationJob(form.get('type'), form.get('prompt').trim());
+  if (!job.prompt) { toast('Add a prompt before dispatching.'); return; }
+  stationBusy = true;
+  const optimistic = { ...job, status: 'queued' };
+  stationJobs = [optimistic, ...stationJobs];
+  renderWorkspaceView();
+  try {
+    const response = await fetch('/api/v1/station/dispatch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(dispatchPayload(job, station)) });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || `Station dispatch failed (${response.status}).`);
+    stationJobs = updateStationJob(stationJobs, job.id, { ...data.job, status: data.job?.status || 'running' });
+    setTimeout(pollStationJobs, 5000);
+    toast('Render dispatched to the station.');
+  } catch (error) {
+    stationJobs = updateStationJob(stationJobs, job.id, { status: 'failed', error: error.message });
+    toast(error.message);
+  } finally {
+    stationBusy = false;
+    renderWorkspaceView();
+  }
+}
+
+async function insertStationJob(job) {
+  const body = `Render station job ${job.id}\n\nType: ${job.type}\nPrompt: ${job.prompt}\nStatus: ${job.status}\nOutput: ${job.output_filename || 'not reported'}`;
+  try {
+    const response = await fetch('/new', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ title: `Render: ${job.prompt.slice(0, 48)}`, body }) });
+    if (!response.ok) throw new Error('Could not create the note.');
+    toast('Render details inserted into a new note.');
+  } catch (error) { toast(error.message); }
+}
+
+async function pollStationJobs() {
+  const active = stationJobs.filter(job => job.status === 'running' || job.status === 'queued');
+  if (!active.length) return;
+  const station = stationConfig();
+  await Promise.all(active.map(async job => {
+    try {
+      const response = await fetch('/api/v1/station/poll', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job, station }) });
+      const data = await response.json().catch(() => ({}));
+      if (response.ok && data.job) stationJobs = updateStationJob(stationJobs, job.id, data.job);
+    } catch {}
+  }));
+  if (currentView === 'station') renderWorkspaceView();
+  if (stationJobs.some(job => job.status === 'running' || job.status === 'queued')) setTimeout(pollStationJobs, 5000);
+}
+
+function renderStationView(host) {
+  const station = stationConfig();
+  const configured = Boolean(station.host.trim());
+  const jobs = stationJobs.length ? stationJobs.map(job => `<article class="station-job"><div><span class="station-job-id">${esc(job.id)}</span><strong>${esc(job.type)}</strong><p>${esc(job.prompt)}</p></div><span class="station-status ${esc(job.status)}">${esc(statusLabel(job.status))}</span>${job.status === 'completed' ? `<button class="secondary-button" type="button" data-insert-job="${esc(job.id)}">Insert to Note</button>` : ''}</article>`).join('') : '<div class="ledger-empty">No station jobs yet. Dispatch a prompt to start a render.</div>';
+  host.innerHTML = `<div class="page-heading"><div class="eyebrow">DESKTOP RENDERING</div><h1>Render Station</h1><p class="station-connection ${configured ? 'configured' : ''}"><span class="status-light"></span>${configured ? `Connected to ${esc(station.host)}` : 'Not configured — check Settings'}</p></div><section class="settings-card wide-card"><div class="settings-card-heading"><span class="settings-icon warm">✦</span><div><h2>Quick Render</h2><p>Send a media generation job to the configured desktop station.</p></div><span class="module-label">${station.prefer_pinokio ? 'PINOKIO PREFERRED' : 'SSH RUNNER'}</span></div><form id="station-render-form" class="station-form"><label class="field-label" for="station-type">Render type</label><select id="station-type" name="type"><option value="image">Image</option><option value="video">Video</option><option value="audio">Audio</option></select><label class="field-label" for="station-prompt">Prompt</label><textarea id="station-prompt" name="prompt" rows="4" required placeholder="A quiet cinematic shot of rain on a window…"></textarea><button class="primary-button" type="submit" ${stationBusy || !configured ? 'disabled' : ''}>${stationBusy ? 'Dispatching…' : 'Dispatch to Station'}</button></form></section><section class="station-jobs"><div class="section-title"><span>RENDER JOBS</span><span>${stationJobs.length} local</span></div>${jobs}</section>`;
+  $('#station-render-form')?.addEventListener('submit', dispatchStationJob);
+  host.querySelectorAll('[data-insert-job]').forEach(button => button.addEventListener('click', () => { const job = stationJobs.find(item => item.id === button.dataset.insertJob); if (job) insertStationJob(job); }));
 }
 
 function renderWorkspaceView() {
@@ -147,6 +225,8 @@ function renderWorkspaceView() {
     host.innerHTML = `<div class="page-heading"><div class="eyebrow">CONVERSATION STATE</div><h1>Memory ledger</h1><p>A compact set of variables that points back to the original conversation. Nothing here replaces the transcript.</p></div><div class="ledger-grid">${[['Current goal', memory.currentGoal, '01'], ['Active topics', memory.activeTopics, '02'], ['Decisions', memory.decisions, '03'], ['Constraints', memory.constraints, '04'], ['Preferences', memory.preferences, '05'], ['Open questions', memory.openQuestions, '06']].map(([title, items, num]) => `<section class="ledger-card"><div class="ledger-head"><span>${num}</span><h2>${title}</h2><small>${items.length} variables</small></div>${items.length ? items.map(item => `<div class="ledger-item"><p>${esc(item.text)}</p><div><span class="direct-label">DIRECTLY DERIVED</span><span>Source ${item.sourceTurnIds?.map(id => id.slice(0, 8)).join(', ')}</span></div></div>`).join('') : '<div class="ledger-empty">New user messages can add a source-linked variable here.</div>'}</section>`).join('')}</div><div class="transcript-strip"><div><span class="eyebrow">SOURCE OF RECORD</span><h2>Conversation transcript</h2><p>${current().turns.length} immutable turns in this conversation.</p></div><button class="secondary-button" id="back-to-chat">Return to chat ↗</button></div>`;
   } else if (currentView === 'apps') {
     renderAppsView(host);
+  } else if (currentView === 'station') {
+    renderStationView(host);
   } else if (currentView === 'takeover') {
     renderTakeoverView(host);
   } else if (currentView === 'workshop') {
@@ -155,9 +235,14 @@ function renderWorkspaceView() {
     host.innerHTML = `<div class="page-heading"><div class="eyebrow">POLICY ENGINE</div><h1>Decision rules</h1><p>The “growing if statement” is an inspectable set of small policies. Each module can be swapped without rewriting the chat flow.</p></div><div class="rule-catalog">${[['01','Memory gate','IF memory is disabled, skip extraction and retrieval.','Memory policy'],['02','Evidence gate','IF a response recalls the conversation, retrieve and attach source turns.','Evidence policy'],['03','Correction handling','IF a correction is explicit, supersede the derived assertion and retain both source turns.','Conflict policy'],['04','Ambiguity handling','IF incompatible statements lack a clear correction, preserve both and surface uncertainty.','Conflict policy'],['05','Budget gate','IF candidate context exceeds the usable budget, rank and omit optional items first.','Packing policy'],['06','Provider fallback','IF the endpoint fails, preserve the draft and show a retryable connection error.','Provider policy']].map(([n,title,rule,module]) => `<article class="rule-card"><span class="rule-index">${n}</span><div><span class="module-label">${module}</span><h2>${title}</h2><p>${rule}</p></div><span class="rule-enabled">ENABLED <i></i></span></article>`).join('')}</div><div class="rule-note"><span>i</span><p>These starter rules are deterministic and transparent. Language extraction is a lightweight heuristic in this prototype; it is not a truth detector.</p></div>`;
   } else {
     const settings = getWorkspace().settings;
-    host.innerHTML = `<div class="page-heading"><div class="eyebrow">PROVIDER & POLICIES</div><h1>Connections & settings</h1><p>Connect a compatible inference endpoint and tune how each prompt is assembled. Provider API keys stay in memory for this page session and are not saved with workspace settings. Conversations, settings, and derived memory are saved in this vault’s Threadline workspace.</p></div><form id="settings-form" class="settings-layout"><section class="settings-card wide-card"><div class="settings-card-heading"><span class="settings-icon">◈</span><div><h2>Threadline appearance &amp; accent</h2><p>Choose the app accent and matching icon treatment</p></div><span class="module-label">APPEARANCE</span></div><p class="brand-appearance-copy">The chosen accent is saved with this vault’s Threadline workspace. Threadline is the chat and agent workspace; Engram remains a separate local project.</p><div class="accent-picker" role="group" aria-label="App accent and icon"><button class="accent-option" type="button" data-accent="green" aria-pressed="${(settings.accent || 'green') === 'green'}"><img src="./assets/engram-mark-green.png" alt="" /><span>Green</span></button><button class="accent-option" type="button" data-accent="purple" aria-pressed="${settings.accent === 'purple'}"><img src="./assets/engram-icon-purple.png" alt="" /><span>Purple</span></button><button class="accent-option" type="button" data-accent="pink" aria-pressed="${settings.accent === 'pink'}"><img src="./assets/engram-icon-pink.png" alt="" /><span>Pink</span></button><button class="accent-option" type="button" data-accent="blue" aria-pressed="${settings.accent === 'blue'}"><img src="./assets/engram-icon-blue.png" alt="" /><span>Blue</span></button><button class="accent-option" type="button" data-accent="fire" aria-pressed="${settings.accent === 'fire'}"><img src="./assets/engram-icon-fire.png" alt="" /><span>Ember</span></button><button class="accent-option" type="button" data-accent="forest" aria-pressed="${settings.accent === 'forest'}"><img src="./assets/engram-icon-forest.png" alt="" /><span>Forest</span></button><button class="accent-option" type="button" data-accent="ice" aria-pressed="${settings.accent === 'ice'}"><img src="./assets/engram-icon-ice.png" alt="" /><span>Ice</span></button></div></section><section class="settings-card"><div class="settings-card-heading"><span class="settings-icon">↔</span><div><h2>Inference server</h2><p>OpenAI-compatible chat completions API</p></div><span class="module-label">PROVIDER MODULE</span></div><label class="field-label" for="base-url">API base URL</label><input id="base-url" name="baseUrl" type="url" value="${esc(settings.baseUrl)}" placeholder="http://localhost:8000/v1" required /><div class="field-row"><div><label class="field-label" for="model-id">Model ID</label><input id="model-id" name="model" value="${esc(settings.model)}" placeholder="Select or type a model ID" /></div><button type="button" class="secondary-button discover-button" id="discover-models">Discover models</button></div><label class="field-label" for="api-key">API key <span>optional for local servers</span></label><input id="api-key" name="apiKey" type="password" value="${esc(settings.apiKey)}" autocomplete="off" placeholder="Re-enter for each page session" /><div class="settings-actions"><button class="primary-button" type="submit">Save connection</button><button class="secondary-button" id="test-connection" type="button">Test connection</button><span id="connection-feedback" role="status"></span></div><div class="endpoint-note"><span class="status-light"></span><span>Chat endpoint: <code id="endpoint-preview">${esc(settings.baseUrl.replace(/\/$/, ''))}/chat/completions</code></span></div></section><section class="settings-card" id="embedded-model-card"><div class="settings-card-heading"><span class="settings-icon warm">◉</span><div><h2>Built-in on-device model</h2><p>Runs inside Engram with no model server</p></div><span class="module-label">EMBEDDED MODULE</span></div><div class="omlx-status-row"><span class="status-light" id="embedded-status-light"></span><span id="embedded-status-text" role="status">Checking the built-in model…</span></div><div class="settings-actions"><button class="primary-button" type="button" id="use-embedded">Use built-in model</button><button class="secondary-button" type="button" id="refresh-embedded">Refresh</button></div><p class="local-service-note">Apple Intelligence runs the model inside this process on macOS 26 or later. Nothing is sent to a model server or the network. Conversation context stays on this Mac.</p></section><section class="settings-card wide-card" id="omlx-manager-card"><div class="settings-card-heading"><span class="settings-icon warm">◉</span><div><h2>Local oMLX service</h2><p>Manage the on-device inference server from Threadline</p></div><span class="module-label">LOCAL SERVICE MODULE</span></div><p class="brand-appearance-copy">Controls only the installed oMLX service on this Mac. Threadline runs fixed <code>omlx start</code>, <code>stop</code>, or <code>restart</code> actions without a shell. It does not install software or download models.</p><div class="omlx-status-row"><span class="status-light" id="omlx-status-light"></span><span id="omlx-status-text" role="status">Checking local service…</span></div><div class="settings-actions omlx-actions"><button class="primary-button" type="button" data-omlx-action="start">Start oMLX</button><button class="secondary-button" type="button" data-omlx-action="restart">Restart</button><button class="secondary-button" type="button" data-omlx-action="stop">Stop</button><button class="text-button" type="button" id="refresh-omlx">Refresh status</button></div><div class="settings-actions omlx-actions"><button class="secondary-button" type="button" id="load-model">Load selected model</button><button class="secondary-button" type="button" id="unload-model">Unload selected model</button><span id="model-load-feedback" role="status"></span></div><p class="local-service-note">Loading warms the selected local model into memory for immediate requests. oMLX’s idle policy may unload it later; use oMLX model settings to pin it permanently. Threadline leaves model residency and cache policy to oMLX. This manager is available only for the local oMLX service on port 8000.</p></section>
+    host.innerHTML = `<div class="page-heading"><div class="eyebrow">PROVIDER & POLICIES</div><h1>Connections & settings</h1><p>Connect a compatible inference endpoint and tune how each prompt is assembled. Provider API keys stay in memory for this page session and are not saved with workspace settings. Conversations, settings, and derived memory are saved in this vault’s Threadline workspace.</p></div><form id="settings-form" class="settings-layout"><section class="settings-card wide-card"><div class="settings-card-heading"><span class="settings-icon">◈</span><div><h2>Threadline appearance &amp; accent</h2><p>Choose the app accent and matching icon treatment</p></div><span class="module-label">APPEARANCE</span></div><p class="brand-appearance-copy">The chosen accent is saved with this vault’s Threadline workspace. Threadline is the chat and agent workspace; Engram remains a separate local project.</p><div class="accent-picker" role="group" aria-label="App accent and icon"><button class="accent-option" type="button" data-accent="green" aria-pressed="${(settings.accent || 'green') === 'green'}"><img src="./assets/engram-mark-green.png" alt="" /><span>Green</span></button><button class="accent-option" type="button" data-accent="purple" aria-pressed="${settings.accent === 'purple'}"><img src="./assets/engram-icon-purple.png" alt="" /><span>Purple</span></button><button class="accent-option" type="button" data-accent="pink" aria-pressed="${settings.accent === 'pink'}"><img src="./assets/engram-icon-pink.png" alt="" /><span>Pink</span></button><button class="accent-option" type="button" data-accent="blue" aria-pressed="${settings.accent === 'blue'}"><img src="./assets/engram-icon-blue.png" alt="" /><span>Blue</span></button><button class="accent-option" type="button" data-accent="fire" aria-pressed="${settings.accent === 'fire'}"><img src="./assets/engram-icon-fire.png" alt="" /><span>Ember</span></button><button class="accent-option" type="button" data-accent="forest" aria-pressed="${settings.accent === 'forest'}"><img src="./assets/engram-icon-forest.png" alt="" /><span>Forest</span></button><button class="accent-option" type="button" data-accent="ice" aria-pressed="${settings.accent === 'ice'}"><img src="./assets/engram-icon-ice.png" alt="" /><span>Ice</span></button></div></section><section class="settings-card"><div class="settings-card-heading"><span class="settings-icon">↔</span><div><h2>Inference server</h2><p>OpenAI-compatible chat completions API</p></div><span class="module-label">PROVIDER MODULE</span></div><label class="field-label" for="base-url">API base URL</label><input id="base-url" name="baseUrl" type="url" value="${esc(settings.baseUrl)}" placeholder="http://localhost:8000/v1" required /><div class="field-row"><div><label class="field-label" for="model-id">Model ID</label><input id="model-id" name="model" value="${esc(settings.model)}" placeholder="Select or type a model ID" /></div><button type="button" class="secondary-button discover-button" id="discover-models">Discover models</button></div><div class="field-row"><div style="flex:1;"><label class="field-label" for="model-profile">Harness profile</label><select id="model-profile" name="modelProfile"><option value="auto" ${(!settings.modelProfile || settings.modelProfile === 'auto') ? 'selected' : ''}>Auto-detect (recommended)</option><option value="qwen" ${settings.modelProfile === 'qwen' ? 'selected' : ''}>Qwen (2.5 / Coder) · Tool-first precision (temp 0.2)</option><option value="deepseek" ${settings.modelProfile === 'deepseek' ? 'selected' : ''}>DeepSeek (V3 / R1) · Structured reasoning &amp; &lt;think&gt; parsing (temp 0.3)</option><option value="gemma" ${settings.modelProfile === 'gemma' ? 'selected' : ''}>Gemma (2 / 3 / IT) · Direct &amp; strict formatting (temp 0.4)</option><option value="apple" ${settings.modelProfile === 'apple' ? 'selected' : ''}>Apple Foundation Models · Built-in text</option><option value="generic" ${settings.modelProfile === 'generic' ? 'selected' : ''}>Generic OpenAI-Compatible</option></select></div></div><label class="field-label" for="api-key">API key <span>optional for local servers</span></label><input id="api-key" name="apiKey" type="password" value="${esc(settings.apiKey)}" autocomplete="off" placeholder="Re-enter for each page session" /><div class="settings-actions"><button class="primary-button" type="submit">Save connection</button><button class="secondary-button" id="test-connection" type="button">Test connection</button><span id="connection-feedback" role="status"></span></div><div class="endpoint-note"><span class="status-light"></span><span>Chat endpoint: <code id="endpoint-preview">${esc(settings.baseUrl.replace(/\/$/, ''))}/chat/completions</code></span></div></section><section class="settings-card" id="embedded-model-card"><div class="settings-card-heading"><span class="settings-icon warm">◉</span><div><h2>Built-in on-device model</h2><p>Runs inside Engram with no model server</p></div><span class="module-label">EMBEDDED MODULE</span></div><div class="omlx-status-row"><span class="status-light" id="embedded-status-light"></span><span id="embedded-status-text" role="status">Checking the built-in model…</span></div><div class="settings-actions"><button class="primary-button" type="button" id="use-embedded">Use built-in model</button><button class="secondary-button" type="button" id="refresh-embedded">Refresh</button></div><p class="local-service-note">Apple Intelligence runs the model inside this process on macOS 26 or later. Nothing is sent to a model server or the network. Conversation context stays on this Mac.</p></section><section class="settings-card wide-card" id="omlx-manager-card"><div class="settings-card-heading"><span class="settings-icon warm">◉</span><div><h2>Local oMLX service</h2><p>Manage the on-device inference server from Threadline</p></div><span class="module-label">LOCAL SERVICE MODULE</span></div><p class="brand-appearance-copy">Controls only the installed oMLX service on this Mac. Threadline runs fixed <code>omlx start</code>, <code>stop</code>, or <code>restart</code> actions without a shell. It does not install software or download models.</p><div class="omlx-status-row"><span class="status-light" id="omlx-status-light"></span><span id="omlx-status-text" role="status">Checking local service…</span></div><div class="settings-actions omlx-actions"><button class="primary-button" type="button" data-omlx-action="start">Start oMLX</button><button class="secondary-button" type="button" data-omlx-action="restart">Restart</button><button class="secondary-button" type="button" data-omlx-action="stop">Stop</button><button class="text-button" type="button" id="refresh-omlx">Refresh status</button></div><div class="settings-actions omlx-actions"><button class="secondary-button" type="button" id="load-model">Load selected model</button><button class="secondary-button" type="button" id="unload-model">Unload selected model</button><span id="model-load-feedback" role="status"></span></div><p class="local-service-note">Loading warms the selected local model into memory for immediate requests. oMLX’s idle policy may unload it later; use oMLX model settings to pin it permanently. Threadline leaves model residency and cache policy to oMLX. This manager is available only for the local oMLX service on port 8000.</p></section>
       <section class="settings-card"><div class="settings-card-heading"><span class="settings-icon warm">⌘</span><div><h2>Context algorithm</h2><p>Budget, recency, and evidence packing</p></div><span class="module-label">PACKER MODULE</span></div><div class="field-row setting-numbers"><div><label class="field-label" for="context-limit">Model context limit</label><input id="context-limit" name="contextLimit" type="number" min="1024" step="512" value="${settings.contextLimit}" /></div><div><label class="field-label" for="output-reserve">Output reserve</label><input id="output-reserve" name="outputReserve" type="number" min="128" step="1" value="${settings.outputReserve}" /></div><div><label class="field-label" for="safety-margin">Safety margin</label><input id="safety-margin" name="safetyMargin" type="number" min="0" step="100" value="${settings.safetyMargin}" /></div></div><label class="field-label" for="recent-turns">Recent turns to retain <span id="recent-value">${settings.recentTurns}</span></label><input id="recent-turns" name="recentTurns" type="range" min="2" max="16" value="${settings.recentTurns}" /><label class="field-label" for="strategy">Memory strategy</label><select id="strategy" name="strategy"><option value="hybrid" ${settings.strategy === 'hybrid' ? 'selected' : ''}>Structured state + retrieved turns</option><option value="recent" ${settings.strategy === 'recent' ? 'selected' : ''}>Recent turns only</option><option value="state" ${settings.strategy === 'state' ? 'selected' : ''}>Structured state + recent turns</option></select><label class="check-row"><input type="checkbox" name="memoryEnabled" ${settings.memoryEnabled ? 'checked' : ''} /><span><b>Use conversation memory</b><small>Derive local variables and retrieve relevant turns.</small></span><i></i></label><label class="check-row"><input type="checkbox" name="showEvidence" ${settings.showEvidence ? 'checked' : ''} /><span><b>Show source references</b><small>Display turn IDs when history evidence was packed.</small></span><i></i></label></section>
       <section class="settings-card wide-card"><div class="settings-card-heading"><span class="settings-icon blue-icon">✳</span><div><h2>Assistant operating instructions</h2><p>Baseline prompt used for every request</p></div><span class="module-label">SYSTEM MODULE</span></div><textarea id="system-prompt" name="systemPrompt" rows="4">${esc(settings.systemPrompt)}</textarea><div class="settings-actions"><button class="primary-button" type="submit">Save all settings</button><button class="secondary-button" type="button" id="export-workspace">Export workspace</button><label class="secondary-button workspace-import" for="import-workspace">Import workspace</label><input id="import-workspace" type="file" accept="application/json,.json" hidden /><button class="text-button" type="button" id="reset-data">Delete workspace data</button></div><p class="local-service-note">Workspace data lives at <code>.engram/threadline/workspace.json</code>. Encrypted note backups exclude <code>.engram</code>, so export this workspace separately before restoring elsewhere.</p></section><section class="settings-card wide-card"><div class="settings-card-heading"><span class="settings-icon blue-icon">⌘</span><div><h2>Threadline project tools</h2><p>Local file access and fixed offline checks</p></div><span class="module-label">CAPABILITY MODULE</span></div><p class="brand-appearance-copy" id="project-access-status">Checking whether a project folder was granted…</p><div class="project-tool-list"><span>Browse and read approved source files</span><span>Create directories and write files after review</span><span>Run git status and allowlisted Cargo checks (Cargo forced offline)</span></div><p class="brand-appearance-copy">Hidden credentials, the <code>.engram</code> vault data, build output, and dependency folders are excluded. Project source stays on device: project tools are withheld from remote models and require a local inference endpoint.</p></section></form>`;
+    $('#settings-form').insertAdjacentHTML('afterbegin', stationSettingsMarkup(settings));
+    $('#settings-form').addEventListener('submit', event => {
+      const form = new FormData(event.currentTarget);
+      updateSettings({ station: { host: String(form.get('stationHost') || '').trim(), user: String(form.get('stationUser') || '').trim(), port: Number(form.get('stationPort')) || 22, key_path: String(form.get('stationKeyPath') || '').trim(), remote_workspace: String(form.get('stationWorkspace') || '~/.engram-station').trim() || '~/.engram-station', prefer_pinokio: form.has('stationPreferPinokio') } });
+    });
     fetch('/api/v1/project/status').then(response => response.json()).then(status => {
       const label = $('#project-access-status');
       if (status.enabled) label.textContent = `Project tools enabled · ${status.root} · list, read, write, and fixed offline checks. Each action requires approval.`;
@@ -180,7 +265,7 @@ function renderWorkspaceView() {
     }));
     $('#base-url').addEventListener('input', e => { $('#endpoint-preview').textContent = `${e.target.value.replace(/\/$/, '')}/chat/completions`; });
     $('#recent-turns').addEventListener('input', e => { $('#recent-value').textContent = e.target.value; });
-    $('#settings-form').addEventListener('submit', e => { e.preventDefault(); const form = new FormData(e.currentTarget); setSessionApiKey(form.get('apiKey')); updateSettings({ baseUrl: form.get('baseUrl').trim().replace(/\/$/, ''), model: form.get('model').trim(), contextLimit: Number(form.get('contextLimit')), outputReserve: Number(form.get('outputReserve')), safetyMargin: Number(form.get('safetyMargin')), recentTurns: Number(form.get('recentTurns')), strategy: form.get('strategy'), memoryEnabled: form.has('memoryEnabled'), showEvidence: form.has('showEvidence'), systemPrompt: form.get('systemPrompt') }); renderAll(); $('#connection-feedback').textContent = 'Settings saved for this page session; reload requires re-entering the key.'; toast('Settings saved locally. API key is session-only.'); });
+    $('#settings-form').addEventListener('submit', e => { e.preventDefault(); const form = new FormData(e.currentTarget); setSessionApiKey(form.get('apiKey')); updateSettings({ baseUrl: form.get('baseUrl').trim().replace(/\/$/, ''), model: form.get('model').trim(), modelProfile: form.get('modelProfile') || 'auto', contextLimit: Number(form.get('contextLimit')), outputReserve: Number(form.get('outputReserve')), safetyMargin: Number(form.get('safetyMargin')), recentTurns: Number(form.get('recentTurns')), strategy: form.get('strategy'), memoryEnabled: form.has('memoryEnabled'), showEvidence: form.has('showEvidence'), systemPrompt: form.get('systemPrompt') }); renderAll(); $('#connection-feedback').textContent = 'Settings saved for this page session; reload requires re-entering the key.'; toast('Settings saved locally. API key is session-only.'); });
     $('#discover-models').addEventListener('click', discoverModels);
     $('#test-connection').addEventListener('click', async () => { const feedback = $('#connection-feedback'); feedback.textContent = 'Checking endpoint…'; try { const baseUrl = $('#base-url').value.trim().replace(/\/$/, ''); const target = classifyEndpoint(baseUrl); if (!target.allowed) throw new Error(target.reason); const apiKey = $('#api-key').value; if (target.kind === 'remote' && !(await confirmDisclosure({ endpoint: target.origin, apiKey, discovery: true }))) return; const models = await listModels({ baseUrl, apiKey }); updateSettings({ connectionStatus: 'reachable', connectionTestedAt: new Date().toISOString() }); feedback.textContent = `Connected · ${models.length} model(s) found`; toast('Inference server responded.'); } catch (error) { updateSettings({ connectionStatus: 'unreachable', connectionTestedAt: new Date().toISOString() }); feedback.textContent = error.message; } });
     $('#export-workspace').addEventListener('click', downloadWorkspace);
@@ -198,12 +283,14 @@ async function refreshEmbeddedStatus() {
     const response = await fetch('/api/v1/inference/embedded');
     const status = await response.json();
     embeddedModel = status.available ? status.model : null;
+    embeddedProbeComplete = true;
     label.textContent = status.available ? `Ready · ${status.model}` : (status.reason || 'The built-in model is unavailable on this Mac.');
     light.classList.toggle('is-on', Boolean(status.available));
     light.classList.toggle('is-error', !status.available);
     button.disabled = !status.available;
   } catch {
     embeddedModel = null;
+    embeddedProbeComplete = true;
     label.textContent = 'Could not read the built-in model status.'; light.classList.add('is-error'); button.disabled = true;
   }
 }
@@ -219,6 +306,8 @@ async function configureEmbeddedDefault() {
   try {
     const response = await fetch('/api/v1/inference/embedded');
     const status = await response.json();
+    embeddedModel = status.available ? status.model : null;
+    embeddedProbeComplete = true;
     const settings = getWorkspace().settings;
     const untouched = !settings.model && (!settings.baseUrl || settings.baseUrl === 'http://localhost:8000/v1');
     if (status.available && untouched) {
@@ -226,7 +315,12 @@ async function configureEmbeddedDefault() {
       renderAll();
       toast('Built-in on-device model is ready.');
     }
-  } catch {}
+    else renderMessages();
+  } catch {
+    embeddedModel = null;
+    embeddedProbeComplete = true;
+    renderMessages();
+  }
 }
 
 async function inspectApplicationForTool(path) {
@@ -299,25 +393,69 @@ async function draftWorkshopProposal(goal, filesInput) {
   }
 }
 
+function renderWorkflowPanel() {
+  const recorder = workflowRecording
+    ? `<div class="workflow-recording"><span class="status-light"></span><div><strong>Recording “${esc(workflowRecording.name)}”</strong><small>${workflowRecording.steps.length} approved step(s) captured</small></div><button class="danger-button" type="button" id="stop-workflow-recording">Stop &amp; save</button></div>`
+    : `<div class="settings-actions"><input id="workflow-name" placeholder="Workflow name, e.g. Prepare a release" /><button class="secondary-button" type="button" id="start-workflow-recording">Start recording</button></div>`;
+  const saved = appWorkflows.length ? appWorkflows.map(workflow => `<article class="workflow-row"><div><strong>${esc(workflow.name)}</strong><small>${workflow.steps.length} step(s) · ${new Date(workflow.created_at * 1000).toLocaleString()}</small></div><span>${workflow.steps.map(step => esc(step.action)).join(' → ')}</span></article>`).join('') : '<div class="ledger-empty">Approved action sequences will appear here.</div>';
+  return `<section class="settings-card wide-card workflow-panel"><div class="settings-card-heading"><span class="settings-icon warm">↳</span><div><h2>Workflow recorder</h2><p>Capture approved application actions into a reusable, reviewable recipe.</p></div><span class="module-label">USER-INITIATED</span></div>${recorder}<div class="workflow-list">${saved}</div></section>`;
+}
+
 function renderAppsView(host) {
   const cards = appDigests.length ? appDigests.map(app => {
     const actionLabels = { help: 'Run --help', version: 'Run --version', open: 'Open application' };
     const actions = app.actions.map(action => `<button class="secondary-button" type="button" data-app-run="${esc(app.id)}" data-app-action="${esc(action)}">${esc(actionLabels[action] || action)}</button>`).join('');
+    const inspected = app.inspected_at ? new Date(app.inspected_at * 1000).toLocaleString() : 'unknown';
     const details = [
       `Path: ${app.path}`,
       app.version ? `Version: ${app.version}` : null,
       app.bundle_id ? `Bundle: ${app.bundle_id}` : null,
       app.usage ? `Usage: ${app.usage}` : null,
+      `Inspected: ${inspected}`,
+      `Verified hash: ${app.hash.slice(0, 16)}…`,
       app.flags.length ? `Flags: ${app.flags.slice(0, 12).join(' ')}${app.flags.length > 12 ? ` … +${app.flags.length - 12}` : ''}` : null
     ].filter(Boolean).map(line => `<p>${esc(line)}</p>`).join('');
-    return `<section class="ledger-card"><div class="ledger-head"><span>${app.kind === 'app' ? '▣' : '›_'}</span><h2>${esc(app.name)}</h2><small>${esc(app.kind)} · ${esc(app.risk)} risk</small></div>${details}<div class="settings-actions">${actions}</div></section>`;
+    return `<section class="ledger-card capability-card"><div class="ledger-head"><span>${app.kind === 'app' ? '▣' : '›_'}</span><h2>${esc(app.name)}</h2><small>${esc(app.kind)} · ${esc(app.risk)} risk · ${app.actions.length} approved action(s)</small></div><div class="capability-learned"><span class="module-label">DIGESTED</span><span>Threadline knows this app’s identity, entry points, and safe reviewed actions.</span></div>${details}<details class="capability-help"><summary>Read discovered help</summary><pre>${esc(app.help_excerpt || 'No help output was returned.')}</pre></details><div class="settings-actions">${actions}</div></section>`;
   }).join('') : '<section class="ledger-card"><div class="ledger-empty">No applications digested yet. Inspect a local program to record its version, usage, and flags.</div></section>';
 
   host.innerHTML = `<div class="page-heading"><div class="eyebrow">CAPABILITY DIGEST</div><h1>Applications</h1><p>Threadline can read a local program’s help and version output, record its capabilities, and later run only the reviewed actions. It runs the exact path without a shell and refuses if the program changed.</p></div><form id="inspect-app-form" class="settings-card wide-card"><div class="settings-card-heading"><span class="settings-icon warm">▣</span><div><h2>Teach Threadline an application</h2><p>Absolute path to an executable or a macOS .app bundle</p></div><span class="module-label">DIGEST MODULE</span></div><label class="field-label" for="app-path">Application path</label><input id="app-path" name="path" placeholder="/usr/bin/git or /Applications/Safari.app" autocomplete="off" required /><div class="settings-actions"><button class="primary-button" type="submit">Inspect application</button><span id="app-inspect-feedback" role="status"></span></div><p class="local-service-note">Inspection runs the program with only <code>--help</code> and <code>--version</code> (or reads the bundle metadata for an app). Each later action asks for confirmation. The digest is stored under <code>.engram/capabilities/</code> in this vault.</p></form><div class="ledger-grid">${cards}</div>${appResult ? `<pre class="app-result" aria-live="polite">${esc(appResult)}</pre>` : ''}`;
 
+  $('#inspect-app-form').insertAdjacentHTML('afterend', renderWorkflowPanel());
   $('#inspect-app-form').addEventListener('submit', event => { event.preventDefault(); inspectApplication($('#app-path').value.trim()); });
   host.querySelectorAll('[data-app-run]').forEach(button => button.addEventListener('click', () => runApplication(button.dataset.appRun, button.dataset.appAction)));
+  host.querySelector('#start-workflow-recording')?.addEventListener('click', startWorkflowRecording);
+  host.querySelector('#stop-workflow-recording')?.addEventListener('click', saveWorkflowRecording);
   if (!appsLoaded) { appsLoaded = true; loadApps(); }
+  if (!workflowsLoaded) { workflowsLoaded = true; loadWorkflows(); }
+}
+
+function startWorkflowRecording() {
+  const name = $('#workflow-name')?.value.trim();
+  if (!name) { toast('Name the workflow before recording.'); return; }
+  workflowRecording = { name, steps: [] };
+  renderWorkspaceView();
+}
+
+async function saveWorkflowRecording() {
+  if (!workflowRecording?.steps.length) { toast('Run at least one approved action before saving.'); return; }
+  try {
+    const response = await fetch('/api/v1/workflows', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: crypto.randomUUID(), name: workflowRecording.name, steps: workflowRecording.steps, created_at: Math.floor(Date.now() / 1000) }) });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || 'Could not save workflow.');
+    workflowRecording = null;
+    await loadWorkflows();
+    toast('Workflow saved to the local capability library.');
+  } catch (error) { toast(error.message); }
+}
+
+async function loadWorkflows() {
+  try {
+    const response = await fetch('/api/v1/workflows');
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Could not load workflows.');
+    appWorkflows = data.workflows || [];
+    if (currentView === 'apps') renderWorkspaceView();
+  } catch (error) { appResult = `Could not load workflows: ${error.message}`; }
 }
 
 async function loadApps() {
@@ -362,6 +500,7 @@ async function runApplication(id, action) {
     const data = await response.json();
     if (!response.ok) throw new Error(data.error?.message || 'The application could not run.');
     appResult = `$ ${app.path} · ${action}\n\n${data.stdout || '(no standard output)'}${data.stderr ? `\n\n[stderr]\n${data.stderr}` : ''}\n\nExit: ${data.status ?? 'unknown'}`;
+    if (workflowRecording) workflowRecording.steps.push({ capability_id: id, action });
     renderWorkspaceView();
   } catch (error) {
     appResult = `Run failed: ${error.message}`;
@@ -748,6 +887,7 @@ async function submitMessage(message) {
   const placeholder = $('#thinking-indicator');
   try {
      let answer = '';
+     let thinking = null;
      let requestMessages = pack.messages; let actionRounds = 0;
      while (actionRounds++ < 3) {
        if (endpoint.kind === 'remote' && actionRounds > 1) {
@@ -757,18 +897,20 @@ async function submitMessage(message) {
        let toolCalls = [];
       let toolSupport = true;
       try {
-        for await (const event of streamChat({ ...settings, apiKey: getSessionApiKey(), messages: requestMessages, tools: modelTools, signal: aborter.signal })) {
-          if (event.type === 'token') { answer += event.content; placeholder.querySelector('.thinking-text').textContent = answer; $('#messages').scrollTop = $('#messages').scrollHeight; }
-          if (event.type === 'tool_calls') toolCalls = event.calls;
-        }
+        const result = await completeChat({ ...settings, apiKey: getSessionApiKey(), messages: requestMessages, tools: modelTools, signal: aborter.signal, modelProfile: settings.modelProfile });
+        answer = result.content;
+        if (result.thinking) thinking = result.thinking;
+        toolCalls = result.toolCalls;
+        if (answer) { placeholder.querySelector('.thinking-text').textContent = answer; $('#messages').scrollTop = $('#messages').scrollHeight; }
       } catch (error) {
         if (![400, 404, 422].includes(error.status)) throw error;
         toolSupport = false;
         answer = '';
         placeholder.querySelector('.thinking-text').innerHTML = '<span class="stream-state">Endpoint did not accept function tools · retrying chat without app actions</span>';
-        for await (const event of streamChat({ ...settings, apiKey: getSessionApiKey(), messages: requestMessages, signal: aborter.signal })) {
-          if (event.type === 'token') { answer += event.content; placeholder.querySelector('.thinking-text').textContent = answer; }
-        }
+        const result = await completeChat({ ...settings, apiKey: getSessionApiKey(), messages: requestMessages, signal: aborter.signal, modelProfile: settings.modelProfile });
+        answer = result.content;
+        if (result.thinking) thinking = result.thinking;
+        if (answer) placeholder.querySelector('.thinking-text').textContent = answer;
       }
       if (!toolSupport) break;
       if (!toolCalls.length) break;
@@ -812,7 +954,7 @@ async function submitMessage(message) {
     }
     placeholder.remove();
     const vaultSourceNoteIds = [...new Set(pack.audit.selected.flatMap(item => item.sourceNoteIds || []))];
-    appendTurn({ role: 'assistant', content: answer || 'The model returned an empty response.', sourceTurnIds: settings.showEvidence ? pack.audit.selected.filter(item => item.kind.startsWith('source')).flatMap(item => item.sourceTurnIds) : [], sourceNoteIds: settings.showEvidence ? vaultSourceNoteIds : [], vaultSourceNoteIds, vaultProvenanceKnown: true, estimatedTokens: pack.audit.estimatedInputTokens });
+    appendTurn({ role: 'assistant', content: answer || 'The model returned an empty response.', thinking, sourceTurnIds: settings.showEvidence ? pack.audit.selected.filter(item => item.kind.startsWith('source')).flatMap(item => item.sourceTurnIds) : [], sourceNoteIds: settings.showEvidence ? vaultSourceNoteIds : [], vaultSourceNoteIds, vaultProvenanceKnown: true, estimatedTokens: pack.audit.estimatedInputTokens });
   } catch (error) {
     placeholder?.remove();
     if (error.name === 'AbortError') appendTurn({ role: 'assistant', content: 'Generation stopped.' });

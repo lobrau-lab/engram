@@ -1,4 +1,5 @@
 import { classifyEndpoint } from '../core/privacy-policy.js';
+import { resolveModelProfile } from '../core/model-profiles.js';
 
 function endpoint(baseUrl) {
   const result = classifyEndpoint(baseUrl);
@@ -28,12 +29,41 @@ export async function setModelLoaded({ baseUrl, apiKey, model, loaded }) {
   return response.json().catch(() => ({}));
 }
 
-export async function* streamChat({ baseUrl, apiKey, model, messages, tools, signal }) {
+export async function completeChat({ baseUrl, apiKey, model, messages, tools, signal, temperature, modelProfile }) {
   const target = endpoint(baseUrl);
+  const profile = resolveModelProfile(model, modelProfile);
+  const temp = typeof temperature === 'number' ? temperature : profile.defaultTemperature;
+  const response = await fetch(`${target.url.toString().replace(/\/$/, '')}/chat/completions`, {
+    method: 'POST',
+    signal,
+    headers: { 'Content-Type': 'application/json', ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
+    body: JSON.stringify({ model, messages, ...(tools?.length ? { tools, tool_choice: 'auto' } : {}), stream: false, temperature: temp })
+  });
+  if (!response.ok) {
+    let detail = ''; try { detail = (await response.json()).error?.message || ''; } catch {}
+    const error = new Error(detail || `Inference request failed (${response.status}). Verify the model ID and compatible endpoint.`);
+    error.status = response.status;
+    throw error;
+  }
+  const data = await response.json();
+  const message = data.choices?.[0]?.message || {};
+  const parsed = profile.parseContent(message.content || '');
+  return {
+    content: parsed.content,
+    thinking: parsed.thinking,
+    toolCalls: Array.isArray(message.tool_calls) ? message.tool_calls : [],
+    profile: profile.id
+  };
+}
+
+export async function* streamChat({ baseUrl, apiKey, model, messages, tools, signal, temperature, modelProfile }) {
+  const target = endpoint(baseUrl);
+  const profile = resolveModelProfile(model, modelProfile);
+  const temp = typeof temperature === 'number' ? temperature : profile.defaultTemperature;
   const response = await fetch(`${target.url.toString().replace(/\/$/, '')}/chat/completions`, {
     method: 'POST', signal,
     headers: { 'Content-Type': 'application/json', ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
-    body: JSON.stringify({ model, messages, ...(tools?.length ? { tools, tool_choice: 'auto' } : {}), stream: true, temperature: 0.7 })
+    body: JSON.stringify({ model, messages, ...(tools?.length ? { tools, tool_choice: 'auto' } : {}), stream: true, temperature: temp })
   });
   if (!response.ok) {
     let detail = ''; try { detail = (await response.json()).error?.message || ''; } catch {}

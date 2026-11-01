@@ -23,11 +23,14 @@ Allowed endpoint forms:
 - `http://localhost:8080/v1`
 - `http://127.0.0.1:1234/v1`
 - `http://[::1]:8080/v1`
+- `http://192.168.1.42:8080/v1` (private LAN)
+- `http://desktop.local:8080/v1` (mDNS-style LAN hostname)
 
 The port and path prefix are configurable. The validator rejects HTTPS,
-non-loopback IP addresses, arbitrary DNS names, malformed URLs, and userinfo.
-It does not resolve DNS names to decide whether they happen to map to loopback.
-Invalid configuration fails locally before a ureq request is created or sent.
+public IP addresses, arbitrary DNS names, malformed URLs, and userinfo. It does
+not resolve DNS names to decide whether they happen to map to a private
+address. Invalid configuration fails locally before a ureq request is created
+or sent.
 
 The crawler separately rejects `http://` and `https://` roots. Localhost
 workspace serving is inbound browser traffic and is distinct from outbound

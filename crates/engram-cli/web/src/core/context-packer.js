@@ -1,4 +1,5 @@
 import { evidenceLabel, relevantConflicts } from './memory-manager.js';
+import { resolveModelProfile } from './model-profiles.js';
 
 export function estimateTokens(text) { return Math.ceil((text || '').length / 3.7); }
 
@@ -60,11 +61,15 @@ export function packContext({ message, history, memory, evidence, vaultNotes = [
     add(`recent · ${turn.role}`, `${turn.role}: ${turn.content}`, [turn.id], 0.25);
   }
   const lines = [`COMPACT CONVERSATION STATE\n${selected.filter(x => x.kind === 'state').map(x => `- ${x.text}`).join('\n') || '- No relevant state variables found.'}`, `UNRESOLVED CONFLICTS\n${selected.filter(x => x.kind === 'conflict').map(x => x.text).join('\n') || '- No relevant unresolved conflicts selected.'}`, `CONVERSATION SOURCE TURNS\n${selected.filter(x => x.kind.startsWith('source')).map(x => `- ${x.text}`).join('\n') || '- No matching conversation source turns found.'}`, `ENGRAM VAULT SOURCES\n${selected.filter(x => x.kind.startsWith('vault')).map(x => `- ${x.text}`).join('\n') || '- No Engram vault notes selected.'}\nCite note IDs in square brackets when using these sources. Do not imply a note supports a claim unless its excerpt does.`, `RECENT CONTEXT\n${selected.filter(x => x.kind.startsWith('recent')).map(x => `- ${x.text}`).join('\n') || '- None.'}`];
-  const assembledSystem = `${system}\n\n${lines.join('\n\n')}`;
+  const profile = resolveModelProfile(settings?.model, settings?.modelProfile);
+  let assembledSystem = `${system}\n\n${lines.join('\n\n')}`;
+  if (profile?.systemSuffix) {
+    assembledSystem += `\n\n${profile.systemSuffix}`;
+  }
   const items = [{ role: 'system', content: assembledSystem }, { role: 'user', content: message }];
   const counted = estimateTokens(assembledSystem) + messageCost;
   return {
     messages: items,
-    audit: { contextLimit: Number(settings.contextLimit), outputReserve: Number(settings.outputReserve), safetyMargin: Number(settings.safetyMargin), usableInput: usable, estimatedInputTokens: counted, exactCount: false, remainingTokens: Math.max(0, usable - counted), selected, retrievalCandidates: evidence.length + vaultNotes.length, budgetStatus: counted <= usable ? 'within budget (estimated)' : 'over budget estimate' }
+    audit: { contextLimit: Number(settings.contextLimit), outputReserve: Number(settings.outputReserve), safetyMargin: Number(settings.safetyMargin), usableInput: usable, estimatedInputTokens: counted, exactCount: false, remainingTokens: Math.max(0, usable - counted), selected, retrievalCandidates: evidence.length + vaultNotes.length, budgetStatus: counted <= usable ? 'within budget (estimated)' : 'over budget estimate', modelProfile: profile?.id || 'generic' }
   };
 }

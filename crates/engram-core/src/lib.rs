@@ -16,12 +16,14 @@ pub mod error;
 pub mod events;
 pub mod import;
 pub mod index;
+pub mod remote_station;
 pub mod sync;
 pub mod vault;
 
 pub use ai::{build_context_prompt, ChatOpts, LlmClient, OpenAiCompat};
-pub use config::{Config, Provider};
+pub use config::{Config, Provider, RenderStationConfig};
 pub use embed::{cosine, Embedder, HashingEmbedder};
 pub use index::{Hit, Index, NoteLite, QueryFilterResult};
+pub use remote_station::{RemoteStationClient, RenderJob, RenderJobType, RenderStatus};
 pub use sync::{FolderSync, LocalState, SyncBackend, SyncStats};
 pub use vault::{is_hidden_child, Note, Vault};

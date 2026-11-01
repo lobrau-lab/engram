@@ -1,0 +1,19 @@
+{
+  "name": "Engram Render Station",
+  "version": "0.1.0",
+  "description": "Run an Engram image, video, or audio render job locally.",
+  "input": [
+    { "name": "type", "type": "select", "options": ["image", "video", "audio"], "default": "image" },
+    { "name": "prompt", "type": "text", "default": "" },
+    { "name": "output", "type": "text", "default": "out/render.bin" },
+    { "name": "params", "type": "text", "default": "{}" }
+  ],
+  "run": [
+    {
+      "method": "shell.run",
+      "params": {
+        "message": "python3 runner.py --type {{input.type}} --prompt {{input.prompt}} --output {{input.output}} --params '{{input.params}}'"
+      }
+    }
+  ]
+}
