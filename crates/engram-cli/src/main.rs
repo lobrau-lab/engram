@@ -65,6 +65,9 @@ enum Cmd {
     },
     /// Open a local browser workspace for the vault.
     Serve {
+        /// Optional vault root path (overrides global --vault).
+        #[arg(value_name = "VAULT")]
+        vault_path: Option<PathBuf>,
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
         #[arg(long, default_value_t = 0)]
@@ -75,6 +78,9 @@ enum Cmd {
     },
     /// Start the local workspace and open it in the system browser.
     Open {
+        /// Optional vault root path (overrides global --vault).
+        #[arg(value_name = "VAULT")]
+        vault_path: Option<PathBuf>,
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
         #[arg(long, default_value_t = 0)]
@@ -108,17 +114,27 @@ fn main() -> Result<()> {
         Cmd::Export { dest, dry_run } => cmd_export(&vault, &config_path, &dest, dry_run),
         Cmd::Import { src, dry_run } => cmd_import(&vault, &config_path, &src, dry_run),
         Cmd::Serve {
-            host,
-            port,
-            project_root,
-        } => serve::run(&vault, project_root.as_deref(), &host, port),
-        Cmd::Open {
+            vault_path,
             host,
             port,
             project_root,
         } => {
-            ensure_open_vault(&vault, &config_path)?;
-            serve::open(&vault, project_root.as_deref(), &host, port)
+            let active_vault = vault_path.unwrap_or(vault);
+            serve::run(&active_vault, project_root.as_deref(), &host, port)
+        }
+        Cmd::Open {
+            vault_path,
+            host,
+            port,
+            project_root,
+        } => {
+            let active_vault = vault_path.unwrap_or(vault);
+            let active_config = cli
+                .config
+                .clone()
+                .unwrap_or_else(|| active_vault.join(".engram").join("config.toml"));
+            ensure_open_vault(&active_vault, &active_config)?;
+            serve::open(&active_vault, project_root.as_deref(), &host, port)
         }
         Cmd::Backup { dest } => cmd_backup(&vault, &dest),
         Cmd::Restore { src } => cmd_restore(&vault, &src),
