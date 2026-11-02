@@ -9,6 +9,7 @@ import { toolCallRejection } from './core/permission-gate.js';
 import { runMemoryBench } from './core/evaluation-bench.js';
 import { createStationJob, dispatchPayload, statusLabel, updateStationJob } from './core/station-state.js';
 import { resolveModelProfile } from './core/model-profiles.js';
+import { renderTurnContent } from './core/media-renderer.js';
 
 const $ = selector => document.querySelector(selector);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
@@ -75,32 +76,6 @@ function renderThreads() {
   document.querySelectorAll('[data-conversation]').forEach(button => button.addEventListener('click', () => { setActiveConversation(button.dataset.conversation); renderAll(); }));
 }
 
-function renderTurnContent(rawContent) {
-  if (!rawContent) return '';
-  let safe = esc(rawContent);
-  safe = safe.replace(/!\[(.*?)\]\((\/media\/[a-zA-Z0-9._-]+)\)/g, (_m, alt, url) => {
-    const ext = url.split('.').pop().toLowerCase();
-    if (['mp4', 'webm', 'mov'].includes(ext)) {
-      return `<video src="${url}" controls style="max-width:100%;border-radius:8px;margin:8px 0;display:block;background:#000;"></video>`;
-    }
-    if (['wav', 'mp3', 'ogg'].includes(ext)) {
-      return `<audio src="${url}" controls style="width:100%;margin:8px 0;display:block;"></audio>`;
-    }
-    return `<img src="${url}" alt="${alt}" style="max-width:100%;border-radius:8px;margin:8px 0;display:block;" />`;
-  });
-  safe = safe.replace(/\[(\/media\/[a-zA-Z0-9._-]+)\]/g, (_m, url) => {
-    const ext = url.split('.').pop().toLowerCase();
-    if (['mp4', 'webm', 'mov'].includes(ext)) {
-      return `<video src="${url}" controls style="max-width:100%;border-radius:8px;margin:8px 0;display:block;background:#000;"></video>`;
-    }
-    if (['wav', 'mp3', 'ogg'].includes(ext)) {
-      return `<audio src="${url}" controls style="width:100%;margin:8px 0;display:block;"></audio>`;
-    }
-    return `<img src="${url}" alt="" style="max-width:100%;border-radius:8px;margin:8px 0;display:block;" />`;
-  });
-  return safe.replace(/\n/g, '<br>');
-}
-
 function renderMessages() {
   const convo = current(); const msgs = $('#messages');
   $('#welcome').classList.toggle('hidden', convo.turns.length > 0);
@@ -111,7 +86,7 @@ function renderMessages() {
     const sourceCount = turnSources.length + noteSources.length;
     const sourceDetails = [...turnSources.map(id => `turn ${id.slice(0, 8)}`), ...noteSources.map(id => `<a href="/note?path=${encodeURIComponent(id)}">${esc(id)}</a>`)];
     const thinkingBlock = turn.thinking ? `<details class="message-thinking"><summary>Thought process</summary><div class="thinking-content">${esc(turn.thinking).replace(/\n/g, '<br>')}</div></details>` : '';
-    return `<article class="message-row ${turn.role === 'assistant' ? 'assistant-row' : 'user-row'}"><div class="message-avatar ${turn.role}">${turn.role === 'assistant' ? '<img src="./assets/engram-mark.png" alt="" />' : 'T'}</div><div class="message-main"><div class="message-meta"><strong>${turn.role === 'assistant' ? 'Threadline' : 'You'}</strong><time>${new Date(turn.timestamp).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</time>${turn.role === 'assistant' && sourceCount ? `<span class="source-badge">⌘ ${sourceCount} sources</span>` : ''}</div>${thinkingBlock}<div class="message-text">${renderTurnContent(turn.content)}</div>${turn.role === 'assistant' && sourceCount ? `<details class="message-sources"><summary>Sources used</summary><span>${sourceDetails.join(' · ')}</span></details>` : ''}</div></article>`;
+    return `<article class="message-row ${turn.role === 'assistant' ? 'assistant-row' : 'user-row'}"><div class="message-avatar ${turn.role}">${turn.role === 'assistant' ? '<img src="./assets/engram-mark.png" alt="" />' : 'T'}</div><div class="message-main"><div class="message-meta"><strong>${turn.role === 'assistant' ? 'Threadline' : 'You'}</strong><time>${new Date(turn.timestamp).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</time>${turn.role === 'assistant' && sourceCount ? `<span class="source-badge">⌘ ${sourceCount} sources</span>` : ''}</div>${thinkingBlock}<div class="message-text">${renderTurnContent(turn.content, esc)}</div>${turn.role === 'assistant' && sourceCount ? `<details class="message-sources"><summary>Sources used</summary><span>${sourceDetails.join(' · ')}</span></details>` : ''}</div></article>`;
   }).join('');
   $('#open-embedded-settings')?.addEventListener('click', () => switchView('settings'));
   $('#dismiss-embedded-setup')?.addEventListener('click', () => { embeddedSetupDismissed = true; renderMessages(); });
@@ -194,7 +169,7 @@ async function dispatchStationJob(event) {
   stationJobs = [optimistic, ...stationJobs];
   renderWorkspaceView();
   try {
-    const response = await fetch('/api/v1/station/dispatch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(dispatchPayload(job, station)) });
+    const response = await fetch('/api/v1/station/dispatch', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Threadline-Local-Control': '1' }, body: JSON.stringify(dispatchPayload(job, station)) });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error || `Station dispatch failed (${response.status}).`);
     stationJobs = updateStationJob(stationJobs, job.id, { ...data.job, status: data.job?.status || 'running' });
@@ -224,7 +199,7 @@ async function pollStationJobs() {
   const station = stationConfig();
   await Promise.all(active.map(async job => {
     try {
-      const response = await fetch('/api/v1/station/poll', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job, station }) });
+      const response = await fetch('/api/v1/station/poll', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Threadline-Local-Control': '1' }, body: JSON.stringify({ job, station }) });
       const data = await response.json().catch(() => ({}));
       if (response.ok && data.job) stationJobs = updateStationJob(stationJobs, job.id, data.job);
     } catch {}

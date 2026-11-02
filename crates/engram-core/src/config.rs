@@ -38,6 +38,26 @@ pub fn default_context_window() -> usize {
     2048
 }
 
+fn default_station_port() -> u16 {
+    22
+}
+
+fn default_remote_workspace() -> String {
+    "~/.engram-station".to_string()
+}
+
+fn default_connect_timeout() -> u32 {
+    10
+}
+
+fn default_server_alive_interval() -> u32 {
+    10
+}
+
+fn default_server_alive_count_max() -> u32 {
+    3
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderStationConfig {
     #[serde(default)]
@@ -52,14 +72,12 @@ pub struct RenderStationConfig {
     pub remote_workspace: String,
     #[serde(default)]
     pub prefer_pinokio: bool,
-}
-
-fn default_station_port() -> u16 {
-    22
-}
-
-fn default_remote_workspace() -> String {
-    "~/.engram-station".to_string()
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout_seconds: u32,
+    #[serde(default = "default_server_alive_interval")]
+    pub server_alive_interval: u32,
+    #[serde(default = "default_server_alive_count_max")]
+    pub server_alive_count_max: u32,
 }
 
 impl Default for RenderStationConfig {
@@ -71,6 +89,9 @@ impl Default for RenderStationConfig {
             key_path: None,
             remote_workspace: default_remote_workspace(),
             prefer_pinokio: false,
+            connect_timeout_seconds: default_connect_timeout(),
+            server_alive_interval: default_server_alive_interval(),
+            server_alive_count_max: default_server_alive_count_max(),
         }
     }
 }

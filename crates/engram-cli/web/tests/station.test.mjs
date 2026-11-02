@@ -127,6 +127,7 @@ try {
   assert.deepEqual(dispatchResult.expected_artifacts, ['render-job-987.mp4']);
 
   const fetchResult = await executeStationAction('station_fetch_artifact', {
+    job_id: 'job-987',
     filename: 'render-job-987.mp4'
   }, {
     actionId: 'action-2',

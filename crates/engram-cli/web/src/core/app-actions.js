@@ -196,7 +196,7 @@ export async function executeStationAction(name, rawArguments, callbacks = {}) {
       };
       response = await fetch('/api/v1/station/dispatch', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Threadline-Local-Control': '1' },
         body: JSON.stringify(payload)
       });
       const result = await response.json();
@@ -221,7 +221,7 @@ export async function executeStationAction(name, rawArguments, callbacks = {}) {
       };
       response = await fetch('/api/v1/station/fetch', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Threadline-Local-Control': '1' },
         body: JSON.stringify(payload)
       });
       const result = await response.json();

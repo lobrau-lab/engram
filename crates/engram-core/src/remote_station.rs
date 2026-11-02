@@ -39,39 +39,50 @@ pub enum StationErrorKind {
 }
 
 /// Classify SSH and SCP stderr output into distinct operational categories.
-pub fn classify_ssh_error(stderr: &str) -> (StationErrorKind, String) {
+pub fn classify_ssh_error_with_code(stderr: &str, exit_code: Option<i32>) -> (StationErrorKind, String) {
     let lower = stderr.to_lowercase();
+    let raw_diag = if stderr.trim().is_empty() {
+        format!("(exit code {})", exit_code.map(|c| c.to_string()).unwrap_or_else(|| "none".into()))
+    } else {
+        format!("{}. Raw stderr: {}", exit_code.map(|c| format!("(exit code {c})")).unwrap_or_default(), stderr.trim())
+    };
+
     if lower.contains("timed out")
         || lower.contains("no route to host")
         || lower.contains("network is unreachable")
+        || (exit_code == Some(255) && lower.contains("connection closed"))
     {
         (
             StationErrorKind::Unreachable,
-            "Render station unreachable or asleep (timed out after 5s). Ensure the desktop rig is powered on and connected to your network.".to_string(),
+            format!("Render station unreachable or asleep. Ensure the desktop rig is powered on and connected to your network. {raw_diag}"),
         )
     } else if lower.contains("connection refused") {
         (
             StationErrorKind::ConnectionRefused,
-            "Render station connection refused. Ensure SSH server is active and listening on the configured port.".to_string(),
+            format!("Render station connection refused. Ensure SSH server is active and listening on the configured port. {raw_diag}"),
         )
     } else if lower.contains("permission denied") || lower.contains("authentication failed") {
         (
             StationErrorKind::AuthenticationFailed,
-            "Render station authentication failed. Verify SSH username and private key permissions.".to_string(),
+            format!("Render station authentication failed. Verify SSH username and private key permissions. {raw_diag}"),
         )
     } else if lower.contains("host key verification failed")
         || lower.contains("remote host identification has changed")
     {
         (
             StationErrorKind::HostKeyMismatch,
-            "Render station SSH host key verification failed. The desktop host identity has changed or requires verification.".to_string(),
+            format!("Render station SSH host key verification failed. The desktop host identity has changed or requires verification. {raw_diag}"),
         )
     } else {
         (
             StationErrorKind::CommandFailed,
-            format!("Render station command failed: {}", stderr.trim()),
+            format!("Render station command failed: {raw_diag}"),
         )
     }
+}
+
+pub fn classify_ssh_error(stderr: &str) -> (StationErrorKind, String) {
+    classify_ssh_error_with_code(stderr, None)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,20 +162,20 @@ impl RemoteStationClient {
     }
 
     /// Centralized base SSH/SCP options enforcing fast timeouts and reliable probes.
-    pub fn base_ssh_opts() -> Vec<String> {
+    pub fn base_ssh_opts(&self) -> Vec<String> {
         vec![
             "-o".to_string(),
             "BatchMode=yes".to_string(),
             "-o".to_string(),
             "StrictHostKeyChecking=accept-new".to_string(),
             "-o".to_string(),
-            "ConnectTimeout=5".to_string(),
+            format!("ConnectTimeout={}", self.config.connect_timeout_seconds),
             "-o".to_string(),
             "ConnectionAttempts=1".to_string(),
             "-o".to_string(),
-            "ServerAliveInterval=5".to_string(),
+            format!("ServerAliveInterval={}", self.config.server_alive_interval),
             "-o".to_string(),
-            "ServerAliveCountMax=2".to_string(),
+            format!("ServerAliveCountMax={}", self.config.server_alive_count_max),
         ]
     }
 
@@ -215,7 +226,7 @@ impl RemoteStationClient {
 
     /// Construct `ssh` command arguments.
     pub fn build_ssh_args(&self, remote_cmd: &str) -> Vec<String> {
-        let mut args = Self::base_ssh_opts();
+        let mut args = self.base_ssh_opts();
         if self.config.port != 22 && self.config.port != 0 {
             args.push("-p".to_string());
             args.push(self.config.port.to_string());
@@ -231,7 +242,7 @@ impl RemoteStationClient {
 
     /// Construct `scp` command arguments for pulling artifacts.
     pub fn build_scp_args(&self, remote_relative_or_abs: &str, local_dest: &Path) -> Vec<String> {
-        let mut args = Self::base_ssh_opts();
+        let mut args = self.base_ssh_opts();
         if self.config.port != 22 && self.config.port != 0 {
             args.push("-P".to_string());
             args.push(self.config.port.to_string());
@@ -261,7 +272,7 @@ impl RemoteStationClient {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let (_kind, message) = classify_ssh_error(&stderr);
+            let (_kind, message) = classify_ssh_error_with_code(&stderr, output.status.code());
             job.status = RenderStatus::Failed;
             job.error = Some(message.clone());
             anyhow::bail!("{message}");
@@ -294,7 +305,7 @@ impl RemoteStationClient {
         let output = Command::new("ssh").args(&ssh_args).output()?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let (_kind, message) = classify_ssh_error(&stderr);
+            let (_kind, message) = classify_ssh_error_with_code(&stderr, output.status.code());
             job.status = RenderStatus::Failed;
             job.error = Some(message.clone());
             anyhow::bail!("{message}");
@@ -338,7 +349,7 @@ impl RemoteStationClient {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let (_kind, message) = classify_ssh_error(&stderr);
+            let (_kind, message) = classify_ssh_error_with_code(&stderr, output.status.code());
             anyhow::bail!("{message}");
         }
 
@@ -417,10 +428,10 @@ mod tests {
         assert!(args.contains(&"2222".to_string()));
         assert!(args.contains(&"-i".to_string()));
         assert!(args.contains(&"/Users/tk/.ssh/id_ed25519".to_string()));
-        assert!(args.contains(&"ConnectTimeout=5".to_string()));
+        assert!(args.contains(&"ConnectTimeout=10".to_string()));
         assert!(args.contains(&"ConnectionAttempts=1".to_string()));
-        assert!(args.contains(&"ServerAliveInterval=5".to_string()));
-        assert!(args.contains(&"ServerAliveCountMax=2".to_string()));
+        assert!(args.contains(&"ServerAliveInterval=10".to_string()));
+        assert!(args.contains(&"ServerAliveCountMax=3".to_string()));
         assert_eq!(args.last().unwrap(), "uptime");
     }
 
@@ -428,7 +439,11 @@ mod tests {
     fn classifies_ssh_errors_accurately() {
         let (kind, msg) = classify_ssh_error("ssh: connect to host 192.168.1.100 port 22: Operation timed out");
         assert_eq!(kind, StationErrorKind::Unreachable);
-        assert!(msg.contains("timed out after 5s"));
+        assert!(msg.contains("timed out"));
+
+        let (kind, msg) = classify_ssh_error_with_code("Connection closed by 192.168.1.100 port 22", Some(255));
+        assert_eq!(kind, StationErrorKind::Unreachable);
+        assert!(msg.contains("Raw stderr"));
 
         let (kind, msg) = classify_ssh_error("ssh: connect to host 192.168.1.100 port 22: Connection refused");
         assert_eq!(kind, StationErrorKind::ConnectionRefused);

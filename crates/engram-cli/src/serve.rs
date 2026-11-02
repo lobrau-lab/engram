@@ -310,11 +310,14 @@ fn dispatch(
         }
         ("GET", "/api/v1/workspace") => workspace_get(vault),
         ("PUT", "/api/v1/workspace") => workspace_put(vault, body),
-        ("POST", "/api/v1/station/dispatch") => station_dispatch(body),
-        ("POST", "/api/v1/station/poll") => station_poll(body),
-        ("POST", "/api/v1/station/fetch") => station_fetch(vault, body),
-        ("GET", path) if path.starts_with("/media/") => {
-            serve_media(vault, path, request.range.as_deref())
+        ("POST", "/api/v1/station/dispatch") if local_control => station_dispatch(vault, body),
+        ("POST", "/api/v1/station/poll") if local_control => station_poll(body),
+        ("POST", "/api/v1/station/fetch") if local_control => station_fetch(vault, body),
+        ("POST", path) if path.starts_with("/api/v1/station/") => {
+            project_error(403, "local control header required")
+        }
+        ("GET", path) | ("HEAD", path) if path.starts_with("/media/") => {
+            serve_media(vault, &request.method, path, request.range.as_deref())
         }
         ("GET", "/api/v1/project/status") => project_status(project_root),
         ("GET", "/api/v1/project/files") => project_files(project_root, query),
@@ -1065,7 +1068,7 @@ fn station_error(status: u16, error: impl std::fmt::Display) -> Vec<u8> {
     )
 }
 
-fn station_dispatch(body: &str) -> Vec<u8> {
+fn station_dispatch(vault: &Path, body: &str) -> Vec<u8> {
     let mut request = match serde_json::from_str::<StationDispatchRequest>(body) {
         Ok(request) => request,
         Err(error) => return station_error(400, format!("invalid station request: {error}")),
@@ -1091,11 +1094,19 @@ fn station_dispatch(body: &str) -> Vec<u8> {
     );
     job.output_filename = format!("render-{}.{}", job.id, extension);
     match RemoteStationClient::new(request.station).dispatch_job(&mut job) {
-        Ok(()) => response(
-            200,
-            "application/json; charset=utf-8",
-            &serde_json::json!({"ok": true, "job": job}).to_string(),
-        ),
+        Ok(()) => {
+            let jobs_dir = vault.join(".engram").join("station").join("jobs");
+            let _ = std::fs::create_dir_all(&jobs_dir);
+            let job_file = jobs_dir.join(format!("{}.json", job.id));
+            if let Ok(serialized) = serde_json::to_string_pretty(&job) {
+                let _ = atomic_write::replace(&job_file, serialized.as_bytes());
+            }
+            response(
+                200,
+                "application/json; charset=utf-8",
+                &serde_json::json!({"ok": true, "job": job}).to_string(),
+            )
+        }
         Err(error) => station_error(502, error),
     }
 }
@@ -1122,10 +1133,8 @@ fn station_poll(body: &str) -> Vec<u8> {
 }
 
 #[derive(serde::Deserialize)]
-#[allow(dead_code)]
 struct StationFetchRequest {
-    #[serde(default)]
-    job_id: Option<String>,
+    job_id: String,
     filename: String,
     station: RenderStationConfig,
 }
@@ -1134,7 +1143,7 @@ fn is_safe_media_filename(filename: &str) -> bool {
     if filename.is_empty() || filename.len() > 255 || filename.starts_with('.') {
         return false;
     }
-    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+    if filename.contains('/') || filename.contains('\\') || filename.contains("..") || filename.contains('\0') {
         return false;
     }
     let Some((_, ext)) = filename.rsplit_once('.') else {
@@ -1155,6 +1164,22 @@ fn station_fetch(vault: &Path, body: &str) -> Vec<u8> {
     if !is_safe_media_filename(&request.filename) {
         return station_error(400, "filename must be a safe media file name with supported extension");
     }
+    if request.job_id.is_empty() || !request.job_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return station_error(400, "valid job_id is required");
+    }
+    let jobs_dir = vault.join(".engram").join("station").join("jobs");
+    let job_file = jobs_dir.join(format!("{}.json", request.job_id));
+    if !job_file.is_file() {
+        return station_error(403, format!("unauthorized or unregistered job_id: {}", request.job_id));
+    }
+    let recorded_job: RenderJob = match std::fs::read_to_string(&job_file).ok().and_then(|s| serde_json::from_str(&s).ok()) {
+        Some(j) => j,
+        None => return station_error(500, "corrupted job record"),
+    };
+    if recorded_job.output_filename != request.filename {
+        return station_error(403, "requested artifact filename does not match registered job_id artifact");
+    }
+
     if !valid_station_workspace(&request.station.remote_workspace) {
         return station_error(400, "remote workspace must be an absolute or home-relative safe path");
     }
@@ -1184,7 +1209,10 @@ fn station_fetch(vault: &Path, body: &str) -> Vec<u8> {
     }
     let bytes = match std::fs::read(&target_dest) {
         Ok(b) => b,
-        Err(err) => return station_error(500, format!("failed to read downloaded file: {err}")),
+        Err(err) => {
+            let _ = std::fs::remove_file(&target_dest);
+            return station_error(500, format!("failed to read downloaded file: {err}"));
+        }
     };
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
     response(
@@ -1218,40 +1246,88 @@ fn media_content_type(filename: &str) -> &'static str {
     }
 }
 
-fn serve_media(vault: &Path, path: &str, range_header: Option<&str>) -> Vec<u8> {
-    let filename = path.strip_prefix("/media/").unwrap_or_default();
-    if filename.is_empty()
-        || filename.starts_with('.')
-        || filename.contains('/')
-        || filename.contains('\\')
-        || filename.contains("..")
+fn serve_media(vault: &Path, method: &str, path: &str, range_header: Option<&str>) -> Vec<u8> {
+    let raw = path.strip_prefix("/media/").unwrap_or_default();
+    let decoded = decode(raw);
+    if decoded.contains('\0') {
+        return response(400, "text/plain; charset=utf-8", "invalid media filename: null bytes prohibited");
+    }
+    if decoded.is_empty()
+        || decoded.starts_with('.')
+        || decoded.contains('/')
+        || decoded.contains('\\')
+        || decoded.contains("..")
     {
         return response(400, "text/plain; charset=utf-8", "invalid media filename");
     }
-    let file_path = vault.join("Media").join(filename);
-    if !file_path.is_file() {
+    let media_dir = vault.join("Media");
+    if !media_dir.exists() {
+        return response(404, "text/plain; charset=utf-8", "media directory not found");
+    }
+    let media_dir_canonical = match media_dir.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return response(500, "text/plain; charset=utf-8", "failed to resolve media directory"),
+    };
+    let file_path = media_dir.join(&decoded);
+    if !file_path.exists() {
         return response(404, "text/plain; charset=utf-8", "media file not found");
     }
-    let metadata = match std::fs::metadata(&file_path) {
+    let canonical_file = match file_path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return response(403, "text/plain; charset=utf-8", "forbidden media path"),
+    };
+    if !canonical_file.starts_with(&media_dir_canonical) || !canonical_file.is_file() {
+        return response(403, "text/plain; charset=utf-8", "forbidden media path");
+    }
+    let metadata = match std::fs::metadata(&canonical_file) {
         Ok(m) => m,
         Err(_) => return response(500, "text/plain; charset=utf-8", "failed to read file metadata"),
     };
     let total_len = metadata.len();
-    let content_type = media_content_type(filename);
+    let content_type = media_content_type(&decoded);
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let etag = format!("\"{:x}-{:x}\"", mtime, total_len);
 
     if let Some(range) = range_header {
+        if range.contains(',') {
+            return response(400, "text/plain; charset=utf-8", "multiple ranges not supported");
+        }
         if let Some(spec) = range.strip_prefix("bytes=") {
-            let (start_str, end_str) = spec.split_once('-').unwrap_or((spec, ""));
-            let start = start_str.trim().parse::<u64>().unwrap_or(0);
-            let end = if end_str.trim().is_empty() {
-                total_len.saturating_sub(1)
+            let spec = spec.trim();
+            let (start, end) = if let Some(suffix_str) = spec.strip_prefix('-') {
+                let suffix_len = suffix_str.trim().parse::<u64>().unwrap_or(0);
+                if suffix_len == 0 || total_len == 0 {
+                    let header = format!(
+                        "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total_len}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    return header.into_bytes();
+                }
+                let s = total_len.saturating_sub(suffix_len);
+                (s, total_len.saturating_sub(1))
+            } else if let Some((start_str, end_str)) = spec.split_once('-') {
+                let s = start_str.trim().parse::<u64>().unwrap_or(0);
+                let e = if end_str.trim().is_empty() {
+                    total_len.saturating_sub(1)
+                } else {
+                    end_str
+                        .trim()
+                        .parse::<u64>()
+                        .unwrap_or(total_len.saturating_sub(1))
+                        .min(total_len.saturating_sub(1))
+                };
+                (s, e)
             } else {
-                end_str
-                    .trim()
-                    .parse::<u64>()
-                    .unwrap_or(total_len.saturating_sub(1))
-                    .min(total_len.saturating_sub(1))
+                let header = format!(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total_len}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                return header.into_bytes();
             };
+
             if start > end || start >= total_len {
                 let header = format!(
                     "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total_len}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -1259,7 +1335,13 @@ fn serve_media(vault: &Path, path: &str, range_header: Option<&str>) -> Vec<u8> 
                 return header.into_bytes();
             }
             let chunk_len = (end - start + 1) as usize;
-            let mut file = match std::fs::File::open(&file_path) {
+            let header = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Type: {content_type}\r\nContent-Range: bytes {start}-{end}/{total_len}\r\nContent-Length: {chunk_len}\r\nAccept-Ranges: bytes\r\nETag: {etag}\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n"
+            );
+            if method == "HEAD" {
+                return header.into_bytes();
+            }
+            let mut file = match std::fs::File::open(&canonical_file) {
                 Ok(f) => f,
                 Err(_) => return response(500, "text/plain; charset=utf-8", "failed to open media file"),
             };
@@ -1271,9 +1353,6 @@ fn serve_media(vault: &Path, path: &str, range_header: Option<&str>) -> Vec<u8> 
             if file.read_exact(&mut buf).is_err() {
                 return response(500, "text/plain; charset=utf-8", "read chunk failed");
             }
-            let header = format!(
-                "HTTP/1.1 206 Partial Content\r\nContent-Type: {content_type}\r\nContent-Range: bytes {start}-{end}/{total_len}\r\nContent-Length: {chunk_len}\r\nAccept-Ranges: bytes\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n"
-            );
             let mut res = Vec::with_capacity(header.len() + chunk_len);
             res.extend_from_slice(header.as_bytes());
             res.extend_from_slice(&buf);
@@ -1281,14 +1360,16 @@ fn serve_media(vault: &Path, path: &str, range_header: Option<&str>) -> Vec<u8> 
         }
     }
 
-    let bytes = match std::fs::read(&file_path) {
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {total_len}\r\nAccept-Ranges: bytes\r\nETag: {etag}\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n"
+    );
+    if method == "HEAD" {
+        return header.into_bytes();
+    }
+    let bytes = match std::fs::read(&canonical_file) {
         Ok(b) => b,
         Err(_) => return response(500, "text/plain; charset=utf-8", "failed to read media file"),
     };
-    let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
-        bytes.len()
-    );
     let mut res = Vec::with_capacity(header.len() + bytes.len());
     res.extend_from_slice(header.as_bytes());
     res.extend_from_slice(&bytes);
@@ -1469,6 +1550,7 @@ fn project_replace(root: Option<&Path>, body: &str) -> Vec<u8> {
     let Some(new_str) = payload.get("new_str").and_then(serde_json::Value::as_str) else {
         return project_error(400, "new_str is required");
     };
+    let preserve_endings = payload.get("preserve_line_endings").and_then(serde_json::Value::as_bool).unwrap_or(false);
     if old_str.is_empty() {
         return project_error(400, "old_str cannot be empty");
     }
@@ -1488,7 +1570,11 @@ fn project_replace(root: Option<&Path>, body: &str) -> Vec<u8> {
     };
     let style = detect_line_ending(&original);
     let norm_old = normalize_line_endings(old_str, style);
-    let norm_new = normalize_line_endings(new_str, style);
+    let norm_new = if preserve_endings {
+        new_str.to_string()
+    } else {
+        normalize_line_endings(new_str, style)
+    };
     let count = original.matches(&norm_old).count();
     let updated = if count == 1 {
         original.replacen(&norm_old, &norm_new, 1)
@@ -1507,6 +1593,25 @@ fn project_replace(root: Option<&Path>, body: &str) -> Vec<u8> {
             LineEnding::Crlf => "CRLF (\\r\\n)",
             LineEnding::Lf => "LF (\\n)",
         };
+
+        let mut best_prefix_len = 0;
+        for len in 1..=norm_old.len() {
+            if original.contains(&norm_old[..len]) {
+                best_prefix_len = len;
+            } else {
+                break;
+            }
+        }
+        let visible = |s: &str| -> String {
+            s.replace(' ', "␣").replace('\t', "\\t").replace('\r', "\\r").replace('\n', "\\n")
+        };
+        let mismatch_diag = if best_prefix_len > 0 && best_prefix_len < norm_old.len() {
+            let req_char = norm_old.chars().nth(best_prefix_len).map(|c| visible(&c.to_string())).unwrap_or_else(|| "<end>".into());
+            format!(" First mismatch at character offset {best_prefix_len} (expected {req_char}).")
+        } else {
+            String::new()
+        };
+
         let hint = if original.contains(norm_old.trim()) {
             " Target substring exists with different leading/trailing whitespace or indentation."
         } else {
@@ -1514,7 +1619,7 @@ fn project_replace(root: Option<&Path>, body: &str) -> Vec<u8> {
         };
         return project_error(
             400,
-            &format!("old_str not found in target file. Target file uses {file_style_desc} line endings while request provided {model_style_desc}.{hint}"),
+            &format!("old_str not found in target file. Target file uses {file_style_desc} line endings while request provided {model_style_desc}.{mismatch_diag}{hint}"),
         );
     };
     if let Err(error) = atomic_write::replace(&path, updated.as_bytes()) {
@@ -1530,8 +1635,10 @@ fn project_replace(root: Option<&Path>, body: &str) -> Vec<u8> {
 const TRACE_TRIGGER_BYTES: u64 = 2 * 1024 * 1024;
 const TRACE_KEEP_BYTES: usize = 1024 * 1024;
 const TRACE_MAX_ENTRIES: usize = 2000;
+static TRACE_LOCK: Mutex<()> = Mutex::new(());
 
 fn record_trace(vault: &Path, body: &str) -> Vec<u8> {
+    let _lock = TRACE_LOCK.lock().unwrap();
     let trace_val: serde_json::Value = match serde_json::from_str(body) {
         Ok(val) => val,
         Err(err) => return response(400, "application/json; charset=utf-8", &serde_json::json!({"ok": false, "error": err.to_string()}).to_string()),
@@ -1547,7 +1654,10 @@ fn record_trace(vault: &Path, body: &str) -> Vec<u8> {
     let current_len = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
     if current_len + line.len() as u64 > TRACE_TRIGGER_BYTES {
         if let Ok(content) = std::fs::read_to_string(&file_path) {
-            let mut lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+            let mut lines: Vec<&str> = content
+                .lines()
+                .filter(|l| !l.trim().is_empty() && serde_json::from_str::<serde_json::Value>(l).is_ok())
+                .collect();
             if lines.len() > TRACE_MAX_ENTRIES {
                 lines = lines[lines.len() - TRACE_MAX_ENTRIES..].to_vec();
             }
@@ -1560,6 +1670,11 @@ fn record_trace(vault: &Path, body: &str) -> Vec<u8> {
                 }
                 accumulated += entry_size;
                 kept.push(entry);
+            }
+            if kept.is_empty() {
+                if let Some(last_valid) = content.lines().rev().find(|l| !l.trim().is_empty() && serde_json::from_str::<serde_json::Value>(l).is_ok()) {
+                    kept.push(last_valid);
+                }
             }
             kept.reverse();
             let mut rotated = kept.join("\n");
@@ -1577,6 +1692,7 @@ fn record_trace(vault: &Path, body: &str) -> Vec<u8> {
     if let Err(err) = file.write_all(line.as_bytes()) {
         return response(500, "application/json; charset=utf-8", &serde_json::json!({"ok": false, "error": err.to_string()}).to_string());
     }
+    let _ = file.sync_all();
     response(200, "application/json; charset=utf-8", &serde_json::json!({"ok": true}).to_string())
 }
 
@@ -2625,6 +2741,10 @@ fn threadline_asset(path: &str) -> Option<(&'static str, &'static str)> {
             "text/javascript; charset=utf-8",
             include_str!("../web/src/core/privacy-policy.js"),
         ),
+        "/threadline/src/core/media-renderer.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("../web/src/core/media-renderer.js"),
+        ),
         "/threadline/src/providers/openai-compatible.js" => (
             "text/javascript; charset=utf-8",
             include_str!("../web/src/providers/openai-compatible.js"),
@@ -2971,6 +3091,7 @@ mod tests {
             "/threadline/src/core/privacy-policy.js",
             "/threadline/src/providers/openai-compatible.js",
             "/threadline/src/providers/engram-vault.js",
+            "/threadline/src/core/media-renderer.js",
         ] {
             assert!(
                 threadline_asset(path).is_some(),
@@ -3069,11 +3190,16 @@ mod tests {
         let orig_path = std::env::var("PATH").unwrap_or_default();
         std::env::set_var("PATH", format!("{}:{orig_path}", fake_bin.display()));
 
-        let (status, body) = parse_response(&super::station_dispatch(&dispatch_payload(station("127.0.0.1", "/tmp/station_test"), "cyberpunk skyline")));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+
+        let (status, body) = parse_response(&super::station_dispatch(&vault, &dispatch_payload(station("127.0.0.1", "/tmp/station_test"), "cyberpunk skyline")));
         assert_eq!(status, 200, "{body}");
         assert_eq!(body["ok"], true);
         assert_eq!(body["job"]["job_type"], "image");
         assert_eq!(body["job"]["status"], "running");
+        let job_id = body["job"]["id"].as_str().unwrap();
+        let expected_fn = body["job"]["output_filename"].as_str().unwrap();
 
         let poll_req = json!({"job": body["job"], "station": station("127.0.0.1", "/tmp/station_test")}).to_string();
         let (status, poll) = parse_response(&super::station_poll(&poll_req));
@@ -3088,20 +3214,15 @@ mod tests {
             ("shell injection", dispatch_payload(station("127.0.0.1", "; rm -rf /"), "safe"), "remote workspace"),
         ];
         for (name, payload, message) in cases {
-            let (status, response) = parse_response(&super::station_dispatch(&payload));
+            let (status, response) = parse_response(&super::station_dispatch(&vault, &payload));
             assert_eq!(status, 400, "{name}: {response}");
             assert!(response["error"].as_str().unwrap().contains(message), "{name}: {response}");
         }
 
-        let (status, accepted) = parse_response(&super::station_dispatch(&dispatch_payload(station("127.0.0.1", "/valid/path/here"), "safe")));
+        let (status, accepted) = parse_response(&super::station_dispatch(&vault, &dispatch_payload(station("127.0.0.1", "/valid/path/here"), "safe")));
         assert_eq!(status, 200, "{accepted}");
 
-        // Test station_fetch validation
-        let fetch_req = json!({
-            "job_id": "job-123",
-            "filename": "render-job-123.png",
-            "station": station("127.0.0.1", "/tmp/station_test")
-        }).to_string();
+        // Test station_fetch validation and job_id binding
         let scp = fake_bin.join("scp");
         std::fs::write(&scp, "#!/bin/sh\nlast=\"\"\nfor arg in \"$@\"; do last=\"$arg\"; done\ncat > \"$last\" <<'EOF'\nfake png content\nEOF\n").unwrap();
         #[cfg(unix)]
@@ -3112,13 +3233,36 @@ mod tests {
             std::fs::set_permissions(&scp, permissions).unwrap();
         }
 
-        let vault = root.join("vault");
-        std::fs::create_dir_all(&vault).unwrap();
-        let (status, fetch_res) = parse_response(&super::station_fetch(&vault, &fetch_req));
+        let valid_fetch_req = json!({
+            "job_id": job_id,
+            "filename": expected_fn,
+            "station": station("127.0.0.1", "/tmp/station_test")
+        }).to_string();
+        let (status, fetch_res) = parse_response(&super::station_fetch(&vault, &valid_fetch_req));
         assert_eq!(status, 200, "{fetch_res}");
         assert_eq!(fetch_res["ok"], true);
-        assert_eq!(fetch_res["url"], "/media/render-job-123.png");
+        assert_eq!(fetch_res["url"], format!("/media/{expected_fn}"));
         assert!(fetch_res["sha256"].as_str().is_some());
+
+        // Test unauthorized job_id rejected (403)
+        let unauth_fetch_req = json!({
+            "job_id": "job-unregistered-999",
+            "filename": "render-job-unregistered-999.png",
+            "station": station("127.0.0.1", "/tmp/station_test")
+        }).to_string();
+        let (status, unauth_res) = parse_response(&super::station_fetch(&vault, &unauth_fetch_req));
+        assert_eq!(status, 403, "{unauth_res}");
+        assert!(unauth_res["error"].as_str().unwrap().contains("unauthorized or unregistered job_id"));
+
+        // Test mismatched filename rejected (403)
+        let mismatch_fn_req = json!({
+            "job_id": job_id,
+            "filename": "render-other.png",
+            "station": station("127.0.0.1", "/tmp/station_test")
+        }).to_string();
+        let (status, mismatch_res) = parse_response(&super::station_fetch(&vault, &mismatch_fn_req));
+        assert_eq!(status, 403, "{mismatch_res}");
+        assert!(mismatch_res["error"].as_str().unwrap().contains("does not match registered job_id artifact"));
 
         // Test station_fetch rejects directory traversal or illegal extensions
         let bad_cases = [
@@ -3129,12 +3273,30 @@ mod tests {
         ];
         for (name, bad_fn) in bad_cases {
             let bad_req = json!({
+                "job_id": job_id,
                 "filename": bad_fn,
                 "station": station("127.0.0.1", "/tmp/station_test")
             }).to_string();
             let (status, bad_res) = parse_response(&super::station_fetch(&vault, &bad_req));
             assert_eq!(status, 400, "{name}: {bad_res}");
         }
+
+        // Test server-side permission gate: dispatch without local_control returns 403
+        let takeover = std::sync::Arc::new(crate::takeover::Takeover::new(vault.clone()));
+        let unprivileged_request = super::Request {
+            method: "POST".into(),
+            target: "/api/v1/station/dispatch".into(),
+            body: dispatch_payload(station("127.0.0.1", "/tmp/station_test"), "safe"),
+            local_control: false,
+            host: "127.0.0.1:8765".into(),
+            origin: Some("http://127.0.0.1:8765".into()),
+            sec_fetch_site: Some("same-origin".into()),
+            range: None,
+        };
+        let gate_res = super::dispatch(&vault, None, &takeover, &unprivileged_request).unwrap();
+        let (gate_status, gate_json) = parse_response(&gate_res);
+        assert_eq!(gate_status, 403, "{gate_json}");
+        assert!(gate_json["error"].as_str().unwrap().contains("local control header required"));
 
         std::env::set_var("PATH", orig_path);
         let _ = std::fs::remove_dir_all(root);
@@ -3153,38 +3315,76 @@ mod tests {
         std::fs::write(&video_file, payload).unwrap();
 
         // 1. Full 200 GET
-        let res_full = super::serve_media(&vault, "/media/sample.mp4", None);
+        let res_full = super::serve_media(&vault, "GET", "/media/sample.mp4", None);
         let text_full = String::from_utf8_lossy(&res_full);
         assert!(text_full.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(text_full.contains("Content-Type: video/mp4\r\n"));
         assert!(text_full.contains("Accept-Ranges: bytes\r\n"));
+        assert!(text_full.contains("ETag: "));
         assert!(res_full.ends_with(payload));
 
-        // 2. Partial Content 206 GET (Range: bytes=0-9)
-        let res_range = super::serve_media(&vault, "/media/sample.mp4", Some("bytes=0-9"));
-        let text_range = String::from_utf8_lossy(&res_range);
-        assert!(text_range.starts_with("HTTP/1.1 206 Partial Content\r\n"));
-        assert!(text_range.contains("Content-Range: bytes 0-9/36\r\n"));
-        assert!(text_range.contains("Content-Length: 10\r\n"));
-        assert!(res_range.ends_with(b"0123456789"));
+        // 2. HEAD request: returns headers only with 0 body bytes
+        let res_head = super::serve_media(&vault, "HEAD", "/media/sample.mp4", None);
+        let text_head = String::from_utf8_lossy(&res_head);
+        assert!(text_head.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(text_head.contains("Content-Length: 36\r\n"));
+        assert!(!res_head.ends_with(payload));
 
-        // 3. Open-ended Range (Range: bytes=26-)
-        let res_open = super::serve_media(&vault, "/media/sample.mp4", Some("bytes=26-"));
+        // 3. Partial Content 206 GET (Range: bytes=0-0)
+        let res_0_0 = super::serve_media(&vault, "GET", "/media/sample.mp4", Some("bytes=0-0"));
+        let text_0_0 = String::from_utf8_lossy(&res_0_0);
+        assert!(text_0_0.starts_with("HTTP/1.1 206 Partial Content\r\n"));
+        assert!(text_0_0.contains("Content-Range: bytes 0-0/36\r\n"));
+        assert!(text_0_0.contains("Content-Length: 1\r\n"));
+        assert!(res_0_0.ends_with(b"0"));
+
+        // 4. Suffix Range (Range: bytes=-6) -> last 6 bytes
+        let res_suffix = super::serve_media(&vault, "GET", "/media/sample.mp4", Some("bytes=-6"));
+        let text_suffix = String::from_utf8_lossy(&res_suffix);
+        assert!(text_suffix.starts_with("HTTP/1.1 206 Partial Content\r\n"));
+        assert!(text_suffix.contains("Content-Range: bytes 30-35/36\r\n"));
+        assert!(text_suffix.contains("Content-Length: 6\r\n"));
+        assert!(res_suffix.ends_with(b"UVWXYZ"));
+
+        // 5. Open-ended Range (Range: bytes=26-)
+        let res_open = super::serve_media(&vault, "GET", "/media/sample.mp4", Some("bytes=26-"));
         let text_open = String::from_utf8_lossy(&res_open);
         assert!(text_open.starts_with("HTTP/1.1 206 Partial Content\r\n"));
         assert!(text_open.contains("Content-Range: bytes 26-35/36\r\n"));
         assert!(res_open.ends_with(b"QRSTUVWXYZ"));
 
-        // 4. Unsatisfiable Range 416
-        let res_416 = super::serve_media(&vault, "/media/sample.mp4", Some("bytes=50-100"));
+        // 6. Multi-range rejected (400)
+        let res_multi = super::serve_media(&vault, "GET", "/media/sample.mp4", Some("bytes=0-5,10-15"));
+        let text_multi = String::from_utf8_lossy(&res_multi);
+        assert!(text_multi.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+
+        // 7. Unsatisfiable Range 416
+        let res_416 = super::serve_media(&vault, "GET", "/media/sample.mp4", Some("bytes=50-100"));
         let text_416 = String::from_utf8_lossy(&res_416);
         assert!(text_416.starts_with("HTTP/1.1 416 Range Not Satisfiable\r\n"));
         assert!(text_416.contains("Content-Range: bytes */36\r\n"));
 
-        // 5. Reject path traversal
-        let res_traversal = super::serve_media(&vault, "/media/../secret.txt", None);
-        let text_traversal = String::from_utf8_lossy(&res_traversal);
-        assert!(text_traversal.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        // 8. Defense-in-depth: URL-encoded traversal (%2e%2e%2f)
+        let res_enc = super::serve_media(&vault, "GET", "/media/%2e%2e%2fsecret.txt", None);
+        let text_enc = String::from_utf8_lossy(&res_enc);
+        assert!(text_enc.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+
+        // 9. Defense-in-depth: Null byte in path
+        let res_null = super::serve_media(&vault, "GET", "/media/sample%00.mp4", None);
+        let text_null = String::from_utf8_lossy(&res_null);
+        assert!(text_null.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+
+        // 10. Defense-in-depth: Planted symlink escaping Media directory (403)
+        let outside_secret = vault.join("outside_secret.mp4");
+        std::fs::write(&outside_secret, b"sensitive data").unwrap();
+        let symlink_path = media_dir.join("escaped.mp4");
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(&outside_secret, &symlink_path);
+            let res_sym = super::serve_media(&vault, "GET", "/media/escaped.mp4", None);
+            let text_sym = String::from_utf8_lossy(&res_sym);
+            assert!(text_sym.starts_with("HTTP/1.1 403 Forbidden\r\n"), "got: {text_sym}");
+        }
 
         let _ = std::fs::remove_dir_all(vault);
     }
@@ -3215,7 +3415,6 @@ mod tests {
         assert!(text.contains("\"replaced\":true"), "{text}");
 
         let updated_content = std::fs::read_to_string(&crlf_file).unwrap();
-        // Crucial: replacement preserved CRLF dominant endings!
         assert_eq!(updated_content, "fn first() {\r\n    println!(\"beta\");\r\n}\r\n");
 
         // 2. LF file matched by CRLF model input
@@ -3235,15 +3434,29 @@ mod tests {
         let updated_content = std::fs::read_to_string(&lf_file).unwrap();
         assert_eq!(updated_content, "let x = 10;\nlet y = 20;\n");
 
-        // 3. Diagnostic error when substring not found
+        // 3. Intentional preservation of mixed endings
+        let req_preserve = json!({
+            "path": "lf_sample.rs",
+            "old_str": "let x = 10;\n",
+            "new_str": "let x = 100;\r\n",
+            "preserve_line_endings": true
+        }).to_string();
+        let res = super::project_replace(Some(&root), &req_preserve);
+        let text = String::from_utf8_lossy(&res);
+        assert!(text.contains("\"replaced\":true"), "{text}");
+        let preserved_content = std::fs::read_to_string(&lf_file).unwrap();
+        assert_eq!(preserved_content, "let x = 100;\r\nlet y = 20;\n");
+
+        // 4. Diagnostic error with character offset when substring not found
         let not_found_req = json!({
             "path": "lf_sample.rs",
-            "old_str": "let missing = 99;\n",
+            "old_str": "let x = 100;\r\nlet y = 999;\n",
             "new_str": "let fixed = 100;\n"
         }).to_string();
         let res = super::project_replace(Some(&root), &not_found_req);
         let text = String::from_utf8_lossy(&res);
         assert!(text.contains("old_str not found in target file"), "{text}");
+        assert!(text.contains("First mismatch at character offset"), "{text}");
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3273,15 +3486,27 @@ mod tests {
         assert!(text.contains("\"ok\":true"), "{text}");
 
         let rotated_meta = turns_file.metadata().unwrap();
-        // File size must now be pruned to <= 1MB + new line
         assert!(rotated_meta.len() <= 1024 * 1024 + 5000, "len is {}", rotated_meta.len());
 
         let rotated_content = std::fs::read_to_string(&turns_file).unwrap();
         let lines: Vec<&str> = rotated_content.lines().collect();
         assert!(lines.len() <= 2001, "lines count: {}", lines.len());
-        // Verify newest turn is preserved at the end
         assert!(rotated_content.contains("fresh reply"));
         assert!(rotated_content.trim_end().ends_with("\"role\":\"assistant\"}"));
+
+        // Test concurrent appends with multiple threads
+        let mut handles = Vec::new();
+        for t in 0..10 {
+            let v = vault.clone();
+            handles.push(std::thread::spawn(move || {
+                let payload = serde_json::json!({"id": 10000 + t, "role": "user", "content": format!("concurrent {t}")}).to_string();
+                let r = super::record_trace(&v, &payload);
+                assert!(String::from_utf8_lossy(&r).contains("\"ok\":true"));
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
 
         let _ = std::fs::remove_dir_all(vault);
     }
