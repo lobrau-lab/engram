@@ -3,7 +3,7 @@ import { recordAndUpdate, retrieveEvidence, evaluateRules } from './core/memory-
 import { filterRemoteHistory, packContext } from './core/context-packer.js';
 import { completeChat, listModels, setModelLoaded, streamChat } from './providers/openai-compatible.js';
 import { searchEngramVault } from './providers/engram-vault.js';
-import { applicationTools, executeApplicationAction, executeProjectAction } from './core/app-actions.js';
+import { applicationTools, executeApplicationAction, executeProjectAction, executeStationAction } from './core/app-actions.js';
 import { classifyEndpoint, canSendVaultContext, requestCategories, confirmDisclosure, supportsFunctionTools } from './core/privacy-policy.js';
 import { toolCallRejection } from './core/permission-gate.js';
 import { runMemoryBench } from './core/evaluation-bench.js';
@@ -75,6 +75,32 @@ function renderThreads() {
   document.querySelectorAll('[data-conversation]').forEach(button => button.addEventListener('click', () => { setActiveConversation(button.dataset.conversation); renderAll(); }));
 }
 
+function renderTurnContent(rawContent) {
+  if (!rawContent) return '';
+  let safe = esc(rawContent);
+  safe = safe.replace(/!\[(.*?)\]\((\/media\/[a-zA-Z0-9._-]+)\)/g, (_m, alt, url) => {
+    const ext = url.split('.').pop().toLowerCase();
+    if (['mp4', 'webm', 'mov'].includes(ext)) {
+      return `<video src="${url}" controls style="max-width:100%;border-radius:8px;margin:8px 0;display:block;background:#000;"></video>`;
+    }
+    if (['wav', 'mp3', 'ogg'].includes(ext)) {
+      return `<audio src="${url}" controls style="width:100%;margin:8px 0;display:block;"></audio>`;
+    }
+    return `<img src="${url}" alt="${alt}" style="max-width:100%;border-radius:8px;margin:8px 0;display:block;" />`;
+  });
+  safe = safe.replace(/\[(\/media\/[a-zA-Z0-9._-]+)\]/g, (_m, url) => {
+    const ext = url.split('.').pop().toLowerCase();
+    if (['mp4', 'webm', 'mov'].includes(ext)) {
+      return `<video src="${url}" controls style="max-width:100%;border-radius:8px;margin:8px 0;display:block;background:#000;"></video>`;
+    }
+    if (['wav', 'mp3', 'ogg'].includes(ext)) {
+      return `<audio src="${url}" controls style="width:100%;margin:8px 0;display:block;"></audio>`;
+    }
+    return `<img src="${url}" alt="" style="max-width:100%;border-radius:8px;margin:8px 0;display:block;" />`;
+  });
+  return safe.replace(/\n/g, '<br>');
+}
+
 function renderMessages() {
   const convo = current(); const msgs = $('#messages');
   $('#welcome').classList.toggle('hidden', convo.turns.length > 0);
@@ -85,7 +111,7 @@ function renderMessages() {
     const sourceCount = turnSources.length + noteSources.length;
     const sourceDetails = [...turnSources.map(id => `turn ${id.slice(0, 8)}`), ...noteSources.map(id => `<a href="/note?path=${encodeURIComponent(id)}">${esc(id)}</a>`)];
     const thinkingBlock = turn.thinking ? `<details class="message-thinking"><summary>Thought process</summary><div class="thinking-content">${esc(turn.thinking).replace(/\n/g, '<br>')}</div></details>` : '';
-    return `<article class="message-row ${turn.role === 'assistant' ? 'assistant-row' : 'user-row'}"><div class="message-avatar ${turn.role}">${turn.role === 'assistant' ? '<img src="./assets/engram-mark.png" alt="" />' : 'T'}</div><div class="message-main"><div class="message-meta"><strong>${turn.role === 'assistant' ? 'Threadline' : 'You'}</strong><time>${new Date(turn.timestamp).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</time>${turn.role === 'assistant' && sourceCount ? `<span class="source-badge">⌘ ${sourceCount} sources</span>` : ''}</div>${thinkingBlock}<div class="message-text">${esc(turn.content).replace(/\n/g, '<br>')}</div>${turn.role === 'assistant' && sourceCount ? `<details class="message-sources"><summary>Sources used</summary><span>${sourceDetails.join(' · ')}</span></details>` : ''}</div></article>`;
+    return `<article class="message-row ${turn.role === 'assistant' ? 'assistant-row' : 'user-row'}"><div class="message-avatar ${turn.role}">${turn.role === 'assistant' ? '<img src="./assets/engram-mark.png" alt="" />' : 'T'}</div><div class="message-main"><div class="message-meta"><strong>${turn.role === 'assistant' ? 'Threadline' : 'You'}</strong><time>${new Date(turn.timestamp).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</time>${turn.role === 'assistant' && sourceCount ? `<span class="source-badge">⌘ ${sourceCount} sources</span>` : ''}</div>${thinkingBlock}<div class="message-text">${renderTurnContent(turn.content)}</div>${turn.role === 'assistant' && sourceCount ? `<details class="message-sources"><summary>Sources used</summary><span>${sourceDetails.join(' · ')}</span></details>` : ''}</div></article>`;
   }).join('');
   $('#open-embedded-settings')?.addEventListener('click', () => switchView('settings'));
   $('#dismiss-embedded-setup')?.addEventListener('click', () => { embeddedSetupDismissed = true; renderMessages(); });
@@ -930,6 +956,7 @@ async function submitMessage(message) {
           runApplication: runApplicationForTool,
           computerUse: computerUseForTool,
           trustedTakeover: isTakeoverArmed(),
+          getStationConfig: () => getWorkspace().settings.station,
           confirm: message => confirmToolAction(message)
         };
         const rejection = toolCallRejection(call.function.name, offeredToolNames, endpoint.kind);
@@ -942,11 +969,14 @@ async function submitMessage(message) {
           continue;
         }
         const isProjectTool = call.function.name.startsWith('project_') || call.function.name === 'run_project_check';
+        const isStationTool = call.function.name.startsWith('station_');
         const result = isProjectTool && endpoint.kind !== 'local'
           ? { ok: false, code: 'local_inference_required', error: 'Project tools are disabled for remote inference. Connect a loopback on-device model to keep Engram source offline.' }
           : isProjectTool
             ? await executeProjectAction(call.function.name, call.function.arguments, actionCallbacks)
-             : await executeApplicationAction(call.function.name, call.function.arguments, actionCallbacks);
+            : isStationTool
+              ? await executeStationAction(call.function.name, call.function.arguments, actionCallbacks)
+              : await executeApplicationAction(call.function.name, call.function.arguments, actionCallbacks);
         toolMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(result) });
       }
       requestMessages = [...requestMessages, { role: 'assistant', content: null, tool_calls: toolCalls }, ...toolMessages];
@@ -955,6 +985,22 @@ async function submitMessage(message) {
     placeholder.remove();
     const vaultSourceNoteIds = [...new Set(pack.audit.selected.flatMap(item => item.sourceNoteIds || []))];
     appendTurn({ role: 'assistant', content: answer || 'The model returned an empty response.', thinking, sourceTurnIds: settings.showEvidence ? pack.audit.selected.filter(item => item.kind.startsWith('source')).flatMap(item => item.sourceTurnIds) : [], sourceNoteIds: settings.showEvidence ? vaultSourceNoteIds : [], vaultSourceNoteIds, vaultProvenanceKnown: true, estimatedTokens: pack.audit.estimatedInputTokens });
+    fetch('/api/v1/traces', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        timestamp: new Date().toISOString(),
+        conversationId: convo.id,
+        model: settings.model,
+        modelProfile: settings.modelProfile || 'auto',
+        message,
+        estimatedTokens: pack.audit.estimatedInputTokens,
+        thinking,
+        content: answer,
+        toolCalls: toolCalls.map(c => c.function?.name || c.id),
+        vaultSources: vaultSourceNoteIds
+      })
+    }).catch(() => {});
   } catch (error) {
     placeholder?.remove();
     if (error.name === 'AbortError') appendTurn({ role: 'assistant', content: 'Generation stopped.' });

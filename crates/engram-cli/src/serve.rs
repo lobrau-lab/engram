@@ -11,6 +11,7 @@ use engram_core::{
     atomic_write, build_context_prompt, Config, HashingEmbedder, LlmClient, OpenAiCompat,
     RenderStationConfig, Vault,
 };
+use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
@@ -165,6 +166,7 @@ struct Request {
     host: String,
     origin: Option<String>,
     sec_fetch_site: Option<String>,
+    range: Option<String>,
 }
 
 fn handle(
@@ -310,12 +312,18 @@ fn dispatch(
         ("PUT", "/api/v1/workspace") => workspace_put(vault, body),
         ("POST", "/api/v1/station/dispatch") => station_dispatch(body),
         ("POST", "/api/v1/station/poll") => station_poll(body),
+        ("POST", "/api/v1/station/fetch") => station_fetch(vault, body),
+        ("GET", path) if path.starts_with("/media/") => {
+            serve_media(vault, path, request.range.as_deref())
+        }
         ("GET", "/api/v1/project/status") => project_status(project_root),
         ("GET", "/api/v1/project/files") => project_files(project_root, query),
         ("GET", "/api/v1/project/read") => project_read(project_root, query),
         ("POST", "/api/v1/project/write") => project_write(project_root, body),
+        ("POST", "/api/v1/project/replace") => project_replace(project_root, body),
         ("POST", "/api/v1/project/directory") => project_create_directory(project_root, body),
         ("POST", "/api/v1/project/check") => project_run_check(project_root, body),
+        ("POST", "/api/v1/traces") => record_trace(vault, body),
         ("GET", "/api/v1/inference/embedded") => embedded_status(),
         ("GET", "/api/v1/apps") => list_apps(vault),
         ("POST", "/api/v1/apps/inspect") => inspect_app(vault, body),
@@ -1113,6 +1121,180 @@ fn station_poll(body: &str) -> Vec<u8> {
     }
 }
 
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct StationFetchRequest {
+    #[serde(default)]
+    job_id: Option<String>,
+    filename: String,
+    station: RenderStationConfig,
+}
+
+fn is_safe_media_filename(filename: &str) -> bool {
+    if filename.is_empty() || filename.len() > 255 || filename.starts_with('.') {
+        return false;
+    }
+    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+        return false;
+    }
+    let Some((_, ext)) = filename.rsplit_once('.') else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "mp4" | "webm" | "mov" | "wav" | "mp3" | "ogg"
+    )
+}
+
+fn station_fetch(vault: &Path, body: &str) -> Vec<u8> {
+    let mut request = match serde_json::from_str::<StationFetchRequest>(body) {
+        Ok(req) => req,
+        Err(err) => return station_error(400, format!("invalid station fetch request: {err}")),
+    };
+    request.filename = request.filename.trim().to_string();
+    if !is_safe_media_filename(&request.filename) {
+        return station_error(400, "filename must be a safe media file name with supported extension");
+    }
+    if !valid_station_workspace(&request.station.remote_workspace) {
+        return station_error(400, "remote workspace must be an absolute or home-relative safe path");
+    }
+    normalize_station_config(&mut request.station);
+    let media_dir = vault.join("Media");
+    if let Err(err) = std::fs::create_dir_all(&media_dir) {
+        return station_error(500, format!("failed to create media directory: {err}"));
+    }
+    let temp_filename = format!(
+        ".fetch-{}-{}.tmp",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+        request.filename
+    );
+    let temp_dest = media_dir.join(&temp_filename);
+    let client = RemoteStationClient::new(request.station);
+    if let Err(err) = client.fetch_artifact_file(&request.filename, &temp_dest) {
+        let _ = std::fs::remove_file(&temp_dest);
+        return station_error(502, err);
+    }
+    let target_dest = media_dir.join(&request.filename);
+    if let Err(err) = std::fs::rename(&temp_dest, &target_dest) {
+        let _ = std::fs::remove_file(&temp_dest);
+        return station_error(500, format!("failed to finalize media file: {err}"));
+    }
+    let bytes = match std::fs::read(&target_dest) {
+        Ok(b) => b,
+        Err(err) => return station_error(500, format!("failed to read downloaded file: {err}")),
+    };
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    response(
+        200,
+        "application/json; charset=utf-8",
+        &serde_json::json!({
+            "ok": true,
+            "path": format!("Media/{}", request.filename),
+            "url": format!("/media/{}", request.filename),
+            "bytes": bytes.len(),
+            "sha256": sha256
+        })
+        .to_string(),
+    )
+}
+
+fn media_content_type(filename: &str) -> &'static str {
+    let ext = filename.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    match ext.to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "wav" => "audio/wav",
+        "mp3" => "audio/mpeg",
+        "ogg" => "audio/ogg",
+        _ => "application/octet-stream",
+    }
+}
+
+fn serve_media(vault: &Path, path: &str, range_header: Option<&str>) -> Vec<u8> {
+    let filename = path.strip_prefix("/media/").unwrap_or_default();
+    if filename.is_empty()
+        || filename.starts_with('.')
+        || filename.contains('/')
+        || filename.contains('\\')
+        || filename.contains("..")
+    {
+        return response(400, "text/plain; charset=utf-8", "invalid media filename");
+    }
+    let file_path = vault.join("Media").join(filename);
+    if !file_path.is_file() {
+        return response(404, "text/plain; charset=utf-8", "media file not found");
+    }
+    let metadata = match std::fs::metadata(&file_path) {
+        Ok(m) => m,
+        Err(_) => return response(500, "text/plain; charset=utf-8", "failed to read file metadata"),
+    };
+    let total_len = metadata.len();
+    let content_type = media_content_type(filename);
+
+    if let Some(range) = range_header {
+        if let Some(spec) = range.strip_prefix("bytes=") {
+            let (start_str, end_str) = spec.split_once('-').unwrap_or((spec, ""));
+            let start = start_str.trim().parse::<u64>().unwrap_or(0);
+            let end = if end_str.trim().is_empty() {
+                total_len.saturating_sub(1)
+            } else {
+                end_str
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap_or(total_len.saturating_sub(1))
+                    .min(total_len.saturating_sub(1))
+            };
+            if start > end || start >= total_len {
+                let header = format!(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total_len}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                return header.into_bytes();
+            }
+            let chunk_len = (end - start + 1) as usize;
+            let mut file = match std::fs::File::open(&file_path) {
+                Ok(f) => f,
+                Err(_) => return response(500, "text/plain; charset=utf-8", "failed to open media file"),
+            };
+            use std::io::Seek;
+            if file.seek(std::io::SeekFrom::Start(start)).is_err() {
+                return response(500, "text/plain; charset=utf-8", "seek failed");
+            }
+            let mut buf = vec![0u8; chunk_len];
+            if file.read_exact(&mut buf).is_err() {
+                return response(500, "text/plain; charset=utf-8", "read chunk failed");
+            }
+            let header = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Type: {content_type}\r\nContent-Range: bytes {start}-{end}/{total_len}\r\nContent-Length: {chunk_len}\r\nAccept-Ranges: bytes\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n"
+            );
+            let mut res = Vec::with_capacity(header.len() + chunk_len);
+            res.extend_from_slice(header.as_bytes());
+            res.extend_from_slice(&buf);
+            return res;
+        }
+    }
+
+    let bytes = match std::fs::read(&file_path) {
+        Ok(b) => b,
+        Err(_) => return response(500, "text/plain; charset=utf-8", "failed to read media file"),
+    };
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
+        bytes.len()
+    );
+    let mut res = Vec::with_capacity(header.len() + bytes.len());
+    res.extend_from_slice(header.as_bytes());
+    res.extend_from_slice(&bytes);
+    res
+}
+
 fn project_status(root: Option<&Path>) -> Vec<u8> {
     match root {
         Some(root) => response(200, "application/json; charset=utf-8", &serde_json::json!({"enabled": true, "root": root.display().to_string(), "access": ["list", "read", "write"]}).to_string()),
@@ -1244,6 +1426,158 @@ fn project_write(root: Option<&Path>, body: &str) -> Vec<u8> {
         "application/json; charset=utf-8",
         &serde_json::json!({"written": true, "path": relative, "bytes": content.len()}).to_string(),
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineEnding {
+    Lf,
+    Crlf,
+}
+
+fn detect_line_ending(text: &str) -> LineEnding {
+    let crlf = text.matches("\r\n").count();
+    let lf = text.matches('\n').count().saturating_sub(crlf);
+    if crlf > lf {
+        LineEnding::Crlf
+    } else {
+        LineEnding::Lf
+    }
+}
+
+fn normalize_line_endings(text: &str, target: LineEnding) -> String {
+    let stripped = text.replace("\r\n", "\n");
+    match target {
+        LineEnding::Lf => stripped,
+        LineEnding::Crlf => stripped.replace('\n', "\r\n"),
+    }
+}
+
+fn project_replace(root: Option<&Path>, body: &str) -> Vec<u8> {
+    let Some(root) = root else {
+        return project_disabled();
+    };
+    let payload: serde_json::Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return project_error(400, "expected a JSON object"),
+    };
+    let Some(relative) = payload.get("path").and_then(serde_json::Value::as_str) else {
+        return project_error(400, "path is required");
+    };
+    let Some(old_str) = payload.get("old_str").and_then(serde_json::Value::as_str) else {
+        return project_error(400, "old_str is required");
+    };
+    let Some(new_str) = payload.get("new_str").and_then(serde_json::Value::as_str) else {
+        return project_error(400, "new_str is required");
+    };
+    if old_str.is_empty() {
+        return project_error(400, "old_str cannot be empty");
+    }
+    if is_sensitive_project_path(Path::new(relative)) {
+        return project_error(403, "modifications to sensitive or hidden paths are blocked");
+    }
+    let path = match resolve_project_path(root, relative, false) {
+        Ok(path) => path,
+        Err(error) => return project_error(400, &error.to_string()),
+    };
+    if !path.is_file() {
+        return project_error(400, "target must be an existing regular file");
+    }
+    let original = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) => return project_error(500, &format!("failed to read file: {error}")),
+    };
+    let style = detect_line_ending(&original);
+    let norm_old = normalize_line_endings(old_str, style);
+    let norm_new = normalize_line_endings(new_str, style);
+    let count = original.matches(&norm_old).count();
+    let updated = if count == 1 {
+        original.replacen(&norm_old, &norm_new, 1)
+    } else if count > 1 {
+        return project_error(
+            400,
+            &format!("old_str matched {count} times; provide more surrounding context to match uniquely"),
+        );
+    } else {
+        let model_style = detect_line_ending(old_str);
+        let file_style_desc = match style {
+            LineEnding::Crlf => "CRLF (\\r\\n)",
+            LineEnding::Lf => "LF (\\n)",
+        };
+        let model_style_desc = match model_style {
+            LineEnding::Crlf => "CRLF (\\r\\n)",
+            LineEnding::Lf => "LF (\\n)",
+        };
+        let hint = if original.contains(norm_old.trim()) {
+            " Target substring exists with different leading/trailing whitespace or indentation."
+        } else {
+            " Target substring not found. Re-read the file with project_read_file and verify exact context."
+        };
+        return project_error(
+            400,
+            &format!("old_str not found in target file. Target file uses {file_style_desc} line endings while request provided {model_style_desc}.{hint}"),
+        );
+    };
+    if let Err(error) = atomic_write::replace(&path, updated.as_bytes()) {
+        return project_error(500, &error.to_string());
+    }
+    response(
+        200,
+        "application/json; charset=utf-8",
+        &serde_json::json!({"replaced": true, "path": relative, "bytes": updated.len()}).to_string(),
+    )
+}
+
+const TRACE_TRIGGER_BYTES: u64 = 2 * 1024 * 1024;
+const TRACE_KEEP_BYTES: usize = 1024 * 1024;
+const TRACE_MAX_ENTRIES: usize = 2000;
+
+fn record_trace(vault: &Path, body: &str) -> Vec<u8> {
+    let trace_val: serde_json::Value = match serde_json::from_str(body) {
+        Ok(val) => val,
+        Err(err) => return response(400, "application/json; charset=utf-8", &serde_json::json!({"ok": false, "error": err.to_string()}).to_string()),
+    };
+    let dir = vault.join(".engram").join("traces");
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        return response(500, "application/json; charset=utf-8", &serde_json::json!({"ok": false, "error": err.to_string()}).to_string());
+    }
+    let file_path = dir.join("turns.jsonl");
+    let mut line = trace_val.to_string();
+    line.push('\n');
+
+    let current_len = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
+    if current_len + line.len() as u64 > TRACE_TRIGGER_BYTES {
+        if let Ok(content) = std::fs::read_to_string(&file_path) {
+            let mut lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+            if lines.len() > TRACE_MAX_ENTRIES {
+                lines = lines[lines.len() - TRACE_MAX_ENTRIES..].to_vec();
+            }
+            let mut kept = Vec::new();
+            let mut accumulated = 0usize;
+            for entry in lines.into_iter().rev() {
+                let entry_size = entry.len() + 1;
+                if accumulated + entry_size > TRACE_KEEP_BYTES && !kept.is_empty() {
+                    break;
+                }
+                accumulated += entry_size;
+                kept.push(entry);
+            }
+            kept.reverse();
+            let mut rotated = kept.join("\n");
+            if !rotated.is_empty() {
+                rotated.push('\n');
+            }
+            let _ = atomic_write::replace(&file_path, rotated.as_bytes());
+        }
+    }
+
+    let mut file = match std::fs::OpenOptions::new().create(true).append(true).open(&file_path) {
+        Ok(f) => f,
+        Err(err) => return response(500, "application/json; charset=utf-8", &serde_json::json!({"ok": false, "error": err.to_string()}).to_string()),
+    };
+    if let Err(err) = file.write_all(line.as_bytes()) {
+        return response(500, "application/json; charset=utf-8", &serde_json::json!({"ok": false, "error": err.to_string()}).to_string());
+    }
+    response(200, "application/json; charset=utf-8", &serde_json::json!({"ok": true}).to_string())
 }
 
 fn resolve_project_path(root: &Path, raw: &str, allow_missing: bool) -> Result<PathBuf> {
@@ -1467,6 +1801,7 @@ fn read_request(stream: &mut TcpStream) -> Result<Request> {
     let mut host = None;
     let mut origin = None;
     let mut sec_fetch_site = None;
+    let mut range = None;
     for line in lines.filter(|line| !line.is_empty()) {
         let (name, value) = line.split_once(':').context("malformed HTTP header")?;
         if name.eq_ignore_ascii_case("transfer-encoding") {
@@ -1504,6 +1839,9 @@ fn read_request(stream: &mut TcpStream) -> Result<Request> {
             }
             sec_fetch_site = Some(value.trim().to_ascii_lowercase());
         }
+        if name.eq_ignore_ascii_case("range") {
+            range = Some(value.trim().to_string());
+        }
     }
     let length = content_length.unwrap_or(0);
     if length > MAX_BODY_BYTES {
@@ -1521,6 +1859,7 @@ fn read_request(stream: &mut TcpStream) -> Result<Request> {
         host: host.context("missing Host header")?,
         origin,
         sec_fetch_site,
+        range,
     })
 }
 
@@ -2475,6 +2814,7 @@ mod tests {
             host: "127.0.0.1:8765".into(),
             origin: None,
             sec_fetch_site: None,
+            range: None,
         };
 
         assert!(validate_request(&request, address).is_err());
@@ -2756,8 +3096,194 @@ mod tests {
         let (status, accepted) = parse_response(&super::station_dispatch(&dispatch_payload(station("127.0.0.1", "/valid/path/here"), "safe")));
         assert_eq!(status, 200, "{accepted}");
 
+        // Test station_fetch validation
+        let fetch_req = json!({
+            "job_id": "job-123",
+            "filename": "render-job-123.png",
+            "station": station("127.0.0.1", "/tmp/station_test")
+        }).to_string();
+        let scp = fake_bin.join("scp");
+        std::fs::write(&scp, "#!/bin/sh\nlast=\"\"\nfor arg in \"$@\"; do last=\"$arg\"; done\ncat > \"$last\" <<'EOF'\nfake png content\nEOF\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&scp).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&scp, permissions).unwrap();
+        }
+
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let (status, fetch_res) = parse_response(&super::station_fetch(&vault, &fetch_req));
+        assert_eq!(status, 200, "{fetch_res}");
+        assert_eq!(fetch_res["ok"], true);
+        assert_eq!(fetch_res["url"], "/media/render-job-123.png");
+        assert!(fetch_res["sha256"].as_str().is_some());
+
+        // Test station_fetch rejects directory traversal or illegal extensions
+        let bad_cases = [
+            ("traversal", "../secret.png"),
+            ("slash", "sub/render.png"),
+            ("leading dot", ".hidden.png"),
+            ("unsafe extension", "malicious.exe"),
+        ];
+        for (name, bad_fn) in bad_cases {
+            let bad_req = json!({
+                "filename": bad_fn,
+                "station": station("127.0.0.1", "/tmp/station_test")
+            }).to_string();
+            let (status, bad_res) = parse_response(&super::station_fetch(&vault, &bad_req));
+            assert_eq!(status, 400, "{name}: {bad_res}");
+        }
+
         std::env::set_var("PATH", orig_path);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn serve_media_with_range_requests_and_mimes() {
+        let vault = std::env::temp_dir().join(format!(
+            "engram-media-test-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let media_dir = vault.join("Media");
+        std::fs::create_dir_all(&media_dir).unwrap();
+        let video_file = media_dir.join("sample.mp4");
+        let payload = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        std::fs::write(&video_file, payload).unwrap();
+
+        // 1. Full 200 GET
+        let res_full = super::serve_media(&vault, "/media/sample.mp4", None);
+        let text_full = String::from_utf8_lossy(&res_full);
+        assert!(text_full.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(text_full.contains("Content-Type: video/mp4\r\n"));
+        assert!(text_full.contains("Accept-Ranges: bytes\r\n"));
+        assert!(res_full.ends_with(payload));
+
+        // 2. Partial Content 206 GET (Range: bytes=0-9)
+        let res_range = super::serve_media(&vault, "/media/sample.mp4", Some("bytes=0-9"));
+        let text_range = String::from_utf8_lossy(&res_range);
+        assert!(text_range.starts_with("HTTP/1.1 206 Partial Content\r\n"));
+        assert!(text_range.contains("Content-Range: bytes 0-9/36\r\n"));
+        assert!(text_range.contains("Content-Length: 10\r\n"));
+        assert!(res_range.ends_with(b"0123456789"));
+
+        // 3. Open-ended Range (Range: bytes=26-)
+        let res_open = super::serve_media(&vault, "/media/sample.mp4", Some("bytes=26-"));
+        let text_open = String::from_utf8_lossy(&res_open);
+        assert!(text_open.starts_with("HTTP/1.1 206 Partial Content\r\n"));
+        assert!(text_open.contains("Content-Range: bytes 26-35/36\r\n"));
+        assert!(res_open.ends_with(b"QRSTUVWXYZ"));
+
+        // 4. Unsatisfiable Range 416
+        let res_416 = super::serve_media(&vault, "/media/sample.mp4", Some("bytes=50-100"));
+        let text_416 = String::from_utf8_lossy(&res_416);
+        assert!(text_416.starts_with("HTTP/1.1 416 Range Not Satisfiable\r\n"));
+        assert!(text_416.contains("Content-Range: bytes */36\r\n"));
+
+        // 5. Reject path traversal
+        let res_traversal = super::serve_media(&vault, "/media/../secret.txt", None);
+        let text_traversal = String::from_utf8_lossy(&res_traversal);
+        assert!(text_traversal.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+
+        let _ = std::fs::remove_dir_all(vault);
+    }
+
+    #[test]
+    fn project_replace_line_ending_normalization() {
+        use serde_json::json;
+
+        let root = std::env::temp_dir().join(format!(
+            "engram-replace-test-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+
+        // 1. CRLF file matched by LF model input
+        let crlf_file = root.join("crlf_sample.rs");
+        std::fs::write(&crlf_file, "fn first() {\r\n    println!(\"alpha\");\r\n}\r\n").unwrap();
+
+        let req_lf = json!({
+            "path": "crlf_sample.rs",
+            "old_str": "fn first() {\n    println!(\"alpha\");\n}",
+            "new_str": "fn first() {\n    println!(\"beta\");\n}"
+        }).to_string();
+
+        let res = super::project_replace(Some(&root), &req_lf);
+        let text = String::from_utf8_lossy(&res);
+        assert!(text.contains("\"replaced\":true"), "{text}");
+
+        let updated_content = std::fs::read_to_string(&crlf_file).unwrap();
+        // Crucial: replacement preserved CRLF dominant endings!
+        assert_eq!(updated_content, "fn first() {\r\n    println!(\"beta\");\r\n}\r\n");
+
+        // 2. LF file matched by CRLF model input
+        let lf_file = root.join("lf_sample.rs");
+        std::fs::write(&lf_file, "let x = 1;\nlet y = 2;\n").unwrap();
+
+        let req_crlf = json!({
+            "path": "lf_sample.rs",
+            "old_str": "let x = 1;\r\nlet y = 2;\r\n",
+            "new_str": "let x = 10;\r\nlet y = 20;\r\n"
+        }).to_string();
+
+        let res = super::project_replace(Some(&root), &req_crlf);
+        let text = String::from_utf8_lossy(&res);
+        assert!(text.contains("\"replaced\":true"), "{text}");
+
+        let updated_content = std::fs::read_to_string(&lf_file).unwrap();
+        assert_eq!(updated_content, "let x = 10;\nlet y = 20;\n");
+
+        // 3. Diagnostic error when substring not found
+        let not_found_req = json!({
+            "path": "lf_sample.rs",
+            "old_str": "let missing = 99;\n",
+            "new_str": "let fixed = 100;\n"
+        }).to_string();
+        let res = super::project_replace(Some(&root), &not_found_req);
+        let text = String::from_utf8_lossy(&res);
+        assert!(text.contains("old_str not found in target file"), "{text}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn trace_rotation_caps_file_size_and_entries() {
+        let vault = std::env::temp_dir().join(format!(
+            "engram-trace-test-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let traces_dir = vault.join(".engram").join("traces");
+        std::fs::create_dir_all(&traces_dir).unwrap();
+        let turns_file = traces_dir.join("turns.jsonl");
+
+        // Create initial file slightly exceeding TRACE_TRIGGER_BYTES (2MB) with many lines
+        let mut big_content = String::new();
+        for i in 0..2500 {
+            big_content.push_str(&format!("{{\"id\":{i},\"filler\":\"{}\"}}\n", "A".repeat(850)));
+        }
+        std::fs::write(&turns_file, &big_content).unwrap();
+        assert!(turns_file.metadata().unwrap().len() > 2 * 1024 * 1024);
+
+        // Record a new trace turn - this must trigger rotation
+        let new_turn = serde_json::json!({"id": 9999, "role": "assistant", "content": "fresh reply"}).to_string();
+        let res = super::record_trace(&vault, &new_turn);
+        let text = String::from_utf8_lossy(&res);
+        assert!(text.contains("\"ok\":true"), "{text}");
+
+        let rotated_meta = turns_file.metadata().unwrap();
+        // File size must now be pruned to <= 1MB + new line
+        assert!(rotated_meta.len() <= 1024 * 1024 + 5000, "len is {}", rotated_meta.len());
+
+        let rotated_content = std::fs::read_to_string(&turns_file).unwrap();
+        let lines: Vec<&str> = rotated_content.lines().collect();
+        assert!(lines.len() <= 2001, "lines count: {}", lines.len());
+        // Verify newest turn is preserved at the end
+        assert!(rotated_content.contains("fresh reply"));
+        assert!(rotated_content.trim_end().ends_with("\"role\":\"assistant\"}"));
+
+        let _ = std::fs::remove_dir_all(vault);
     }
 }
 

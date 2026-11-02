@@ -15,7 +15,9 @@ const EFFECT_POLICIES = new Map([
   ['local_file_write', 'confirm'],
   ['local_file_delete', 'confirm'],
   ['shell_execution', 'confirm'],
-  ['application_control', 'confirm']
+  ['application_control', 'confirm'],
+  ['remote_station_execution', 'confirm'],
+  ['remote_station_fetch', 'confirm']
 ]);
 
 const RISK_LEVELS = new Set(['low', 'medium', 'high', 'critical']);
@@ -91,8 +93,46 @@ export function formatToolDisclosure(tool, args = {}) {
   let serialized;
   try { serialized = JSON.stringify(args); }
   catch { serialized = '[parameters could not be serialized]'; }
-  if (tool.name === 'project_write_file') {
-    return [tool.confirmation || 'Allow this project file write?', '', `Capability: ${tool.capability}`, `Risk: ${tool.risk}`, `Data accessed or sent: ${data}`, destination, `Path: ${args.path || '(missing)'}`, `Proposed content (${String(args.content || '').length} characters):`, String(args.content || '')].join('\n');
+  if (tool.name === 'project_write_file' || tool.name === 'project_replace_file_content') {
+    return [
+      tool.confirmation || (tool.name === 'project_replace_file_content' ? 'Allow this project file modification?' : 'Allow this project file write?'),
+      '',
+      `Capability: ${tool.capability}`,
+      `Risk: ${tool.risk}`,
+      `Data accessed or sent: ${data}`,
+      destination,
+      `Path: ${args.path || '(missing)'}`,
+      tool.name === 'project_replace_file_content'
+        ? `Target substring:\n${String(args.old_str || '')}\n\nReplacement:\n${String(args.new_str || '')}`
+        : `Proposed content (${String(args.content || '').length} characters):\n${String(args.content || '')}`
+    ].join('\n');
+  }
+  if (tool.name === 'station_dispatch_render') {
+    return [
+      tool.confirmation || 'Dispatch media rendering to remote station?',
+      '',
+      `Capability: ${tool.capability}`,
+      `Risk: ${tool.risk}`,
+      `Data accessed or sent: ${data}`,
+      destination,
+      `Media type: ${args.type || 'unknown'}`,
+      `Prompt:\n${String(args.prompt || '')}`,
+      args.duration_seconds ? `Duration: ${args.duration_seconds}s` : null,
+      args.resolution ? `Resolution: ${args.resolution}` : null,
+      args.model ? `Model: ${args.model}` : null
+    ].filter(Boolean).join('\n');
+  }
+  if (tool.name === 'station_fetch_artifact') {
+    return [
+      tool.confirmation || 'Fetch media artifact from remote station?',
+      '',
+      `Capability: ${tool.capability}`,
+      `Risk: ${tool.risk}`,
+      `Data accessed or sent: ${data}`,
+      destination,
+      `Filename: ${args.filename || '(missing)'}`,
+      args.job_id ? `Job ID: ${args.job_id}` : null
+    ].filter(Boolean).join('\n');
   }
   const parameters = serialized.length > 1200 ? `${serialized.slice(0, 1200)}… [truncated]` : serialized;
   return [

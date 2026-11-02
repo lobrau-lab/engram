@@ -28,6 +28,52 @@ pub enum RenderStatus {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StationErrorKind {
+    Unreachable,
+    ConnectionRefused,
+    AuthenticationFailed,
+    HostKeyMismatch,
+    CommandFailed,
+}
+
+/// Classify SSH and SCP stderr output into distinct operational categories.
+pub fn classify_ssh_error(stderr: &str) -> (StationErrorKind, String) {
+    let lower = stderr.to_lowercase();
+    if lower.contains("timed out")
+        || lower.contains("no route to host")
+        || lower.contains("network is unreachable")
+    {
+        (
+            StationErrorKind::Unreachable,
+            "Render station unreachable or asleep (timed out after 5s). Ensure the desktop rig is powered on and connected to your network.".to_string(),
+        )
+    } else if lower.contains("connection refused") {
+        (
+            StationErrorKind::ConnectionRefused,
+            "Render station connection refused. Ensure SSH server is active and listening on the configured port.".to_string(),
+        )
+    } else if lower.contains("permission denied") || lower.contains("authentication failed") {
+        (
+            StationErrorKind::AuthenticationFailed,
+            "Render station authentication failed. Verify SSH username and private key permissions.".to_string(),
+        )
+    } else if lower.contains("host key verification failed")
+        || lower.contains("remote host identification has changed")
+    {
+        (
+            StationErrorKind::HostKeyMismatch,
+            "Render station SSH host key verification failed. The desktop host identity has changed or requires verification.".to_string(),
+        )
+    } else {
+        (
+            StationErrorKind::CommandFailed,
+            format!("Render station command failed: {}", stderr.trim()),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderJob {
     pub id: String,
@@ -104,6 +150,24 @@ impl RemoteStationClient {
         format!("'{}'", arg.replace('\'', "'\\''"))
     }
 
+    /// Centralized base SSH/SCP options enforcing fast timeouts and reliable probes.
+    pub fn base_ssh_opts() -> Vec<String> {
+        vec![
+            "-o".to_string(),
+            "BatchMode=yes".to_string(),
+            "-o".to_string(),
+            "StrictHostKeyChecking=accept-new".to_string(),
+            "-o".to_string(),
+            "ConnectTimeout=5".to_string(),
+            "-o".to_string(),
+            "ConnectionAttempts=1".to_string(),
+            "-o".to_string(),
+            "ServerAliveInterval=5".to_string(),
+            "-o".to_string(),
+            "ServerAliveCountMax=2".to_string(),
+        ]
+    }
+
     /// Build the core command that runs on the desktop.
     pub fn build_inner_command(&self, job: &RenderJob) -> String {
         let job_type_str = match job.job_type {
@@ -151,12 +215,7 @@ impl RemoteStationClient {
 
     /// Construct `ssh` command arguments.
     pub fn build_ssh_args(&self, remote_cmd: &str) -> Vec<String> {
-        let mut args = vec![
-            "-o".to_string(),
-            "BatchMode=yes".to_string(),
-            "-o".to_string(),
-            "StrictHostKeyChecking=accept-new".to_string(),
-        ];
+        let mut args = Self::base_ssh_opts();
         if self.config.port != 22 && self.config.port != 0 {
             args.push("-p".to_string());
             args.push(self.config.port.to_string());
@@ -172,12 +231,7 @@ impl RemoteStationClient {
 
     /// Construct `scp` command arguments for pulling artifacts.
     pub fn build_scp_args(&self, remote_relative_or_abs: &str, local_dest: &Path) -> Vec<String> {
-        let mut args = vec![
-            "-o".to_string(),
-            "BatchMode=yes".to_string(),
-            "-o".to_string(),
-            "StrictHostKeyChecking=accept-new".to_string(),
-        ];
+        let mut args = Self::base_ssh_opts();
         if self.config.port != 22 && self.config.port != 0 {
             args.push("-P".to_string());
             args.push(self.config.port.to_string());
@@ -207,9 +261,10 @@ impl RemoteStationClient {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            let (_kind, message) = classify_ssh_error(&stderr);
             job.status = RenderStatus::Failed;
-            job.error = Some(stderr.trim().to_string());
-            anyhow::bail!("remote station dispatch failed: {stderr}");
+            job.error = Some(message.clone());
+            anyhow::bail!("{message}");
         }
 
         let pid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -237,6 +292,14 @@ impl RemoteStationClient {
 
         let ssh_args = self.build_ssh_args(&pid_probe);
         let output = Command::new("ssh").args(&ssh_args).output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let (_kind, message) = classify_ssh_error(&stderr);
+            job.status = RenderStatus::Failed;
+            job.error = Some(message.clone());
+            anyhow::bail!("{message}");
+        }
+
         let res = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
         if res == "RUNNING" {
@@ -256,14 +319,18 @@ impl RemoteStationClient {
         Ok(job.status)
     }
 
-    /// Fetch finished artifact from remote desktop to local destination directory.
-    pub fn fetch_artifact(&self, job: &RenderJob, local_dest_dir: &Path) -> Result<PathBuf> {
+    /// Fetch a single named artifact file from the remote station to a local destination file path.
+    pub fn fetch_artifact_file(&self, filename: &str, local_dest: &Path) -> Result<PathBuf> {
+        if !self.is_configured() {
+            anyhow::bail!("Remote station host is not configured in settings");
+        }
         let ws = self.config.remote_workspace.trim_end_matches('/');
-        let remote_artifact_path = format!("{}/out/{}", ws, job.output_filename);
-        std::fs::create_dir_all(local_dest_dir)?;
-        let local_dest = local_dest_dir.join(&job.output_filename);
+        let remote_artifact_path = format!("{}/out/{}", ws, filename);
+        if let Some(parent) = local_dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
 
-        let scp_args = self.build_scp_args(&remote_artifact_path, local_dest_dir);
+        let scp_args = self.build_scp_args(&remote_artifact_path, local_dest);
         let output = Command::new("scp")
             .args(&scp_args)
             .output()
@@ -271,10 +338,18 @@ impl RemoteStationClient {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("failed to fetch remote artifact: {stderr}");
+            let (_kind, message) = classify_ssh_error(&stderr);
+            anyhow::bail!("{message}");
         }
 
-        Ok(local_dest)
+        Ok(local_dest.to_path_buf())
+    }
+
+    /// Fetch finished artifact for a job to local destination directory.
+    pub fn fetch_artifact(&self, job: &RenderJob, local_dest_dir: &Path) -> Result<PathBuf> {
+        std::fs::create_dir_all(local_dest_dir)?;
+        let local_dest = local_dest_dir.join(&job.output_filename);
+        self.fetch_artifact_file(&job.output_filename, &local_dest)
     }
 }
 
@@ -342,6 +417,29 @@ mod tests {
         assert!(args.contains(&"2222".to_string()));
         assert!(args.contains(&"-i".to_string()));
         assert!(args.contains(&"/Users/tk/.ssh/id_ed25519".to_string()));
+        assert!(args.contains(&"ConnectTimeout=5".to_string()));
+        assert!(args.contains(&"ConnectionAttempts=1".to_string()));
+        assert!(args.contains(&"ServerAliveInterval=5".to_string()));
+        assert!(args.contains(&"ServerAliveCountMax=2".to_string()));
         assert_eq!(args.last().unwrap(), "uptime");
+    }
+
+    #[test]
+    fn classifies_ssh_errors_accurately() {
+        let (kind, msg) = classify_ssh_error("ssh: connect to host 192.168.1.100 port 22: Operation timed out");
+        assert_eq!(kind, StationErrorKind::Unreachable);
+        assert!(msg.contains("timed out after 5s"));
+
+        let (kind, msg) = classify_ssh_error("ssh: connect to host 192.168.1.100 port 22: Connection refused");
+        assert_eq!(kind, StationErrorKind::ConnectionRefused);
+        assert!(msg.to_lowercase().contains("connection refused"));
+
+        let (kind, msg) = classify_ssh_error("Permission denied (publickey,password).");
+        assert_eq!(kind, StationErrorKind::AuthenticationFailed);
+        assert!(msg.contains("authentication failed"));
+
+        let (kind, msg) = classify_ssh_error("Host key verification failed.");
+        assert_eq!(kind, StationErrorKind::HostKeyMismatch);
+        assert!(msg.contains("host key verification failed"));
     }
 }

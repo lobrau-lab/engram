@@ -45,6 +45,24 @@ const registeredTools = [
     parameters: { type: 'object', properties: { path: { type: 'string', minLength: 1, maxLength: 500 }, content: { type: 'string', maxLength: 524288 } }, required: ['path', 'content'], additionalProperties: false }
   },
   {
+    name: 'project_replace_file_content',
+    description: 'Replace an exact block of text in an existing project file with new text. Always prefer this over writing the entire file for targeted edits.',
+    effect: 'local_file_write', scope: 'threadline:project:write', capability: 'Replace text inside a project source file',
+    risk: 'high', destination: 'local', dataClasses: ['Target and replacement content for the project file'], approval: 'confirm',
+    confirmation: 'Allow Threadline to modify this project file with the proposed replacement?',
+    scopeResolver: 'granted-project-root',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', minLength: 1, maxLength: 500 },
+        old_str: { type: 'string', minLength: 1, maxLength: 524288 },
+        new_str: { type: 'string', maxLength: 524288 }
+      },
+      required: ['path', 'old_str', 'new_str'],
+      additionalProperties: false
+    }
+  },
+  {
     name: 'inspect_local_application',
     description: 'Inspect an absolute path to a local executable or macOS .app bundle. Records its version, usage, and flags as a capability digest under the vault; runs the program only with --help and --version.',
     effect: 'application_control', scope: 'threadline:apps:inspect', capability: 'Inspect and digest a local application',
@@ -184,6 +202,53 @@ const registeredTools = [
     approval: 'confirm',
     confirmation: 'Clear all locally stored conversations, memory, and settings? This cannot be undone.',
     parameters: { type: 'object', properties: {}, additionalProperties: false }
+  },
+  {
+    name: 'station_dispatch_render',
+    description: 'Dispatch a media rendering job (image, video, audio) to the remote desktop render station. Use when the user asks to generate, render, or create media on their desktop station.',
+    effect: 'remote_station_execution',
+    scope: 'threadline:station:render',
+    capability: 'Dispatch media rendering to desktop station',
+    risk: 'medium',
+    destination: 'remote',
+    destinationLabel: 'Remote render station (SSH/desktop)',
+    dataClasses: ['Prompt and generation parameters'],
+    approval: 'confirm',
+    confirmation: 'Dispatch this media rendering job to your remote desktop station?',
+    parameters: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', minLength: 1, maxLength: 16384 },
+        type: { type: 'string', enum: ['image', 'video', 'audio'] },
+        duration_seconds: { type: 'integer', minimum: 1, maximum: 600 },
+        resolution: { type: 'string', enum: ['512x512', '768x768', '1024x1024', '720p', '1080p', '4k'] },
+        model: { type: 'string', maxLength: 100 }
+      },
+      required: ['prompt', 'type'],
+      additionalProperties: false
+    }
+  },
+  {
+    name: 'station_fetch_artifact',
+    description: 'Fetch a completed media artifact from the remote desktop render station into the local vault Media folder for display in chat.',
+    effect: 'remote_station_fetch',
+    scope: 'threadline:station:fetch',
+    capability: 'Fetch media artifact from desktop station',
+    risk: 'low',
+    destination: 'remote',
+    destinationLabel: 'Remote render station (SSH/desktop)',
+    dataClasses: ['Artifact file path'],
+    approval: 'confirm',
+    confirmation: 'Fetch this rendered media artifact to your local workspace?',
+    parameters: {
+      type: 'object',
+      properties: {
+        filename: { type: 'string', minLength: 1, maxLength: 255 },
+        job_id: { type: 'string', maxLength: 100 }
+      },
+      required: ['filename'],
+      additionalProperties: false
+    }
   }
 ].map(tool => Object.freeze({
   ...tool,

@@ -130,6 +130,8 @@ export async function executeProjectAction(name, rawArguments, callbacks = {}) {
       response = await fetch(`/api/v1/project/read?${query}`);
     } else if (name === 'project_write_file') {
       response = await fetch('/api/v1/project/write', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(args) });
+    } else if (name === 'project_replace_file_content') {
+      response = await fetch('/api/v1/project/replace', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(args) });
     } else if (name === 'project_create_directory') {
       response = await fetch('/api/v1/project/directory', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(args) });
     } else if (name === 'run_project_check') {
@@ -144,5 +146,104 @@ export async function executeProjectAction(name, rawArguments, callbacks = {}) {
   } catch (error) {
     receipt(invocationId, tool, 'failed', { message: String(error.message || error).slice(0, 300) });
     return { ok: false, code: 'project_action_failed', error: String(error.message || error).slice(0, 500), invocationId };
+  }
+}
+
+/** Run media render station actions on the remote desktop machine. */
+export async function executeStationAction(name, rawArguments, callbacks = {}) {
+  const invocationId = callbacks.actionId || crypto.randomUUID();
+  if (completedInvocations.has(invocationId)) return completedInvocations.get(invocationId);
+  let args;
+  try { args = typeof rawArguments === 'string' ? JSON.parse(rawArguments || '{}') : (rawArguments ?? {}); }
+  catch { return { ok: false, code: 'invalid_arguments', error: 'Arguments are not valid JSON.' }; }
+  const tool = getRegisteredTool(name);
+  if (!tool || !name.startsWith('station_')) return { ok: false, code: 'unknown_tool', error: `Station action not allowed: ${name}` };
+  const validationError = validateToolArguments(tool, args);
+  if (validationError) return { ok: false, code: 'invalid_arguments', error: validationError };
+
+  const stationConfig = callbacks.stationConfig || (typeof callbacks.getStationConfig === 'function' ? callbacks.getStationConfig() : null);
+  if (!stationConfig || !stationConfig.host || !stationConfig.host.trim()) {
+    receipt(invocationId, tool, 'denied', { code: 'station_not_configured' });
+    return { ok: false, code: 'station_not_configured', error: 'Render station is not configured in settings. Set host and credentials in Render Station settings.' };
+  }
+
+  if (typeof callbacks.confirm !== 'function') return { ok: false, code: 'approval_unavailable', error: 'This station action requires an approval interface.' };
+  let confirmed = false;
+  try { confirmed = await callbacks.confirm(formatToolDisclosure(tool, args)) === true; }
+  catch { return { ok: false, code: 'approval_unavailable', error: 'The approval interface failed; the action was blocked.' }; }
+  if (!confirmed) {
+    receipt(invocationId, tool, 'cancelled', { code: 'approval_denied' });
+    return { ok: false, code: 'approval_denied', cancelled: true, error: 'The user declined this action.', invocationId };
+  }
+  const authorization = await authorizeToolInvocation(tool, args, { confirm: () => true });
+  if (!authorization.allowed) {
+    receipt(invocationId, tool, 'denied', { code: authorization.code });
+    return { ok: false, code: authorization.code, cancelled: Boolean(authorization.cancelled), error: authorization.message, invocationId };
+  }
+
+  try {
+    let response;
+    if (name === 'station_dispatch_render') {
+      const params = {};
+      if (args.duration_seconds != null) params.duration_seconds = args.duration_seconds;
+      if (args.resolution != null) params.resolution = args.resolution;
+      if (args.model != null) params.model = args.model;
+      const payload = {
+        type: args.type,
+        prompt: args.prompt,
+        params,
+        station: stationConfig
+      };
+      response = await fetch('/api/v1/station/dispatch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error || `Station dispatch failed (${response.status}).`);
+      const job = result.job;
+      const completed = {
+        ok: true,
+        success: true,
+        job_id: job.id,
+        status: job.status,
+        expected_artifacts: [job.output_filename],
+        message: `Render job ${job.id} dispatched to remote station (${job.status}). Output will be ${job.output_filename}. Use station_fetch_artifact with filename '${job.output_filename}' when complete.`
+      };
+      completedInvocations.set(invocationId, completed);
+      receipt(invocationId, tool, 'executed');
+      return completed;
+    } else if (name === 'station_fetch_artifact') {
+      const payload = {
+        job_id: args.job_id || null,
+        filename: args.filename,
+        station: stationConfig
+      };
+      response = await fetch('/api/v1/station/fetch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error || `Station fetch failed (${response.status}).`);
+      const completed = {
+        ok: true,
+        success: true,
+        url: result.url,
+        path: result.path,
+        bytes: result.bytes,
+        sha256: result.sha256,
+        embed: `[${result.url}]`,
+        message: `Artifact fetched to local vault at ${result.path} (${result.bytes} bytes). Embed with [${result.url}] or ![](${result.url}).`
+      };
+      completedInvocations.set(invocationId, completed);
+      receipt(invocationId, tool, 'executed');
+      return completed;
+    } else {
+      return { ok: false, code: 'unimplemented_tool', error: `Unimplemented station action: ${name}` };
+    }
+  } catch (error) {
+    receipt(invocationId, tool, 'failed', { message: String(error.message || error).slice(0, 300) });
+    return { ok: false, code: 'station_action_failed', error: String(error.message || error).slice(0, 500), invocationId };
   }
 }
