@@ -75,6 +75,7 @@ const listeners = new Set();
 
 export function getWorkspace() { return state; }
 export function subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); }
+export function getAuthToken() { return typeof document === 'undefined' ? '' : document.querySelector('meta[name="threadline-token"]')?.content || ''; }
 
 function emit() { listeners.forEach(fn => fn(state)); }
 
@@ -95,7 +96,7 @@ async function pushWorkspace() {
   try {
     const response = await fetch('/api/v1/workspace', {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${getAuthToken()}` },
       body: JSON.stringify({ baseRevision: revision, workspace: state })
     });
     if (response.status === 409) {
@@ -248,7 +249,7 @@ if (typeof window !== 'undefined') {
     try {
       const body = JSON.stringify({ baseRevision: revision, workspace: state });
       if (body.length > 60_000) return;
-      fetch('/api/v1/workspace', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body, keepalive: true }).catch(() => {});
+      fetch('/api/v1/workspace', { method: 'PUT', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${getAuthToken()}` }, body, keepalive: true }).catch(() => {});
     } catch {}
   });
 }

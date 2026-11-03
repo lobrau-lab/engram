@@ -75,6 +75,9 @@ enum Cmd {
         /// Optional project root granted to Threadline's local file tools.
         #[arg(long)]
         project_root: Option<PathBuf>,
+        /// Serve Threadline assets from the local web directory.
+        #[arg(long)]
+        dev: bool,
     },
     /// Start the local workspace and open it in the system browser.
     Open {
@@ -88,6 +91,9 @@ enum Cmd {
         /// Optional project root granted to Threadline's local file tools.
         #[arg(long)]
         project_root: Option<PathBuf>,
+        /// Serve Threadline assets from the local web directory.
+        #[arg(long)]
+        dev: bool,
     },
     /// Create an encrypted Markdown backup. Reads ENGRAM_BACKUP_PASSWORD.
     Backup { dest: PathBuf },
@@ -118,15 +124,17 @@ fn main() -> Result<()> {
             host,
             port,
             project_root,
+            dev,
         } => {
             let active_vault = vault_path.unwrap_or(vault);
-            serve::run(&active_vault, project_root.as_deref(), &host, port)
+            serve::run(&active_vault, project_root.as_deref(), &host, port, dev)
         }
         Cmd::Open {
             vault_path,
             host,
             port,
             project_root,
+            dev,
         } => {
             let active_vault = vault_path.unwrap_or(vault);
             let active_config = cli
@@ -134,7 +142,7 @@ fn main() -> Result<()> {
                 .clone()
                 .unwrap_or_else(|| active_vault.join(".engram").join("config.toml"));
             ensure_open_vault(&active_vault, &active_config)?;
-            serve::open(&active_vault, project_root.as_deref(), &host, port)
+            serve::open(&active_vault, project_root.as_deref(), &host, port, dev)
         }
         Cmd::Backup { dest } => cmd_backup(&vault, &dest),
         Cmd::Restore { src } => cmd_restore(&vault, &src),

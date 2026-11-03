@@ -1,11 +1,13 @@
 import { applicationTools, getRegisteredTool, listRegisteredTools, validateToolArguments, validateToolManifest } from './tool-registry.js';
 import { authorizeToolInvocation, formatToolDisclosure } from './permission-gate.js';
 import { executeGuardedInvocation } from './agent-execution.js';
+import { getAuthToken } from './store.js';
 
 export { applicationTools, listRegisteredTools };
 
 const completedInvocations = new Map();
 const auditReceipts = [];
+const authHeaders = () => ({ 'Content-Type': 'application/json', Authorization: `Bearer ${getAuthToken()}` });
 
 function receipt(invocationId, tool, outcome, extra = {}) {
   const event = { invocationId, tool: tool?.name || 'unknown', version: tool?.version || null, outcome, capability: tool?.capabilityId || null, destination: tool?.destination || null, timestamp: new Date().toISOString(), ...extra };
@@ -129,13 +131,13 @@ export async function executeProjectAction(name, rawArguments, callbacks = {}) {
       query.set('path', args.path);
       response = await fetch(`/api/v1/project/read?${query}`);
     } else if (name === 'project_write_file') {
-      response = await fetch('/api/v1/project/write', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(args) });
+      response = await fetch('/api/v1/project/write', { method: 'POST', headers: authHeaders(), body: JSON.stringify(args) });
     } else if (name === 'project_replace_file_content') {
-      response = await fetch('/api/v1/project/replace', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(args) });
+      response = await fetch('/api/v1/project/replace', { method: 'POST', headers: authHeaders(), body: JSON.stringify(args) });
     } else if (name === 'project_create_directory') {
-      response = await fetch('/api/v1/project/directory', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(args) });
+      response = await fetch('/api/v1/project/directory', { method: 'POST', headers: authHeaders(), body: JSON.stringify(args) });
     } else if (name === 'run_project_check') {
-      response = await fetch('/api/v1/project/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(args) });
+      response = await fetch('/api/v1/project/check', { method: 'POST', headers: authHeaders(), body: JSON.stringify(args) });
     } else return { ok: false, code: 'unimplemented_tool', error: 'This project action has no executor.' };
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || `Local project action failed (${response.status}).`);
@@ -196,7 +198,7 @@ export async function executeStationAction(name, rawArguments, callbacks = {}) {
       };
       response = await fetch('/api/v1/station/dispatch', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Threadline-Local-Control': '1' },
+         headers: authHeaders(),
         body: JSON.stringify(payload)
       });
       const result = await response.json();
@@ -221,7 +223,7 @@ export async function executeStationAction(name, rawArguments, callbacks = {}) {
       };
       response = await fetch('/api/v1/station/fetch', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Threadline-Local-Control': '1' },
+         headers: authHeaders(),
         body: JSON.stringify(payload)
       });
       const result = await response.json();

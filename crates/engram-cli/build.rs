@@ -66,6 +66,10 @@ fn main() {
     }
 
     println!("cargo:rustc-env=ENGRAM_CONTROL_BIN={}", helper.display());
+    generate_manifest(
+        &PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("web"),
+        &out_dir,
+    );
 }
 
 fn write_fallback(path: &Path, message: &str) {
@@ -89,4 +93,63 @@ fn write_fallback(path: &Path, message: &str) {
 
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn generate_manifest(web: &Path, out_dir: &Path) {
+    println!("cargo:rerun-if-changed={}", web.display());
+
+    let mut files = Vec::new();
+    collect(&web, &web, &mut files);
+    files.sort();
+
+    let mut manifest = String::from(
+        "struct ThreadlineAsset {\n    path: &'static str,\n    content_type: &'static str,\n    bytes: &'static [u8],\n}\n\nstatic THREADLINE_ASSETS: &[ThreadlineAsset] = &[\n",
+    );
+    for (route, path, content_type) in files {
+        manifest.push_str(&format!(
+            "    ThreadlineAsset {{ path: {route:?}, content_type: {content_type:?}, bytes: include_bytes!({:?}) }},\n",
+            path.to_string_lossy()
+        ));
+    }
+    manifest.push_str("];\n");
+
+    let out = out_dir.join("threadline_assets.rs");
+    fs::write(out, manifest).unwrap();
+}
+
+fn collect(root: &Path, directory: &Path, files: &mut Vec<(String, PathBuf, &'static str)>) {
+    let mut entries = fs::read_dir(directory)
+        .unwrap_or_else(|error| panic!("reading {}: {error}", directory.display()))
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    entries.sort();
+
+    for path in entries {
+        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+        if name == ".DS_Store" || name == "README.md" || name == "tests" {
+            continue;
+        }
+        if path.is_dir() {
+            collect(root, &path, files);
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+
+        let relative = path.strip_prefix(root).unwrap();
+        let content_type = match path.extension().and_then(|extension| extension.to_str()) {
+            Some("html") => "text/html; charset=utf-8",
+            Some("css") => "text/css; charset=utf-8",
+            Some("js") => "text/javascript; charset=utf-8",
+            Some("png") => "image/png",
+            Some("svg") => "image/svg+xml",
+            extension => panic!("unsupported Threadline asset type: {} ({extension:?})", path.display()),
+        };
+        files.push((
+            format!("/threadline/{}", relative.to_string_lossy().replace('\\', "/")),
+            path,
+            content_type,
+        ));
+    }
 }

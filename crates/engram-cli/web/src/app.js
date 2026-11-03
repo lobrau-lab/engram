@@ -1,4 +1,4 @@
-import { getWorkspace, activeConversation, appendTurn, createConversation, setActiveConversation, updateActive, updateMemory, updateSettings, subscribe, clearWorkspace, removeAssertion, getSessionApiKey, setSessionApiKey, hydrateWorkspace, flushWorkspace, exportWorkspace, replaceWorkspace, reloadWorkspaceFromServer, getWorkspaceStatus } from './core/store.js';
+import { getWorkspace, activeConversation, appendTurn, createConversation, setActiveConversation, updateActive, updateMemory, updateSettings, subscribe, clearWorkspace, removeAssertion, getSessionApiKey, setSessionApiKey, hydrateWorkspace, flushWorkspace, exportWorkspace, replaceWorkspace, reloadWorkspaceFromServer, getWorkspaceStatus, getAuthToken } from './core/store.js';
 import { recordAndUpdate, retrieveEvidence, evaluateRules } from './core/memory-manager.js';
 import { filterRemoteHistory, packContext } from './core/context-packer.js';
 import { completeChat, listModels, setModelLoaded, streamChat } from './providers/openai-compatible.js';
@@ -12,6 +12,7 @@ import { resolveModelProfile } from './core/model-profiles.js';
 import { renderTurnContent } from './core/media-renderer.js';
 
 const $ = selector => document.querySelector(selector);
+const authHeaders = (contentType = 'application/json') => ({ 'Content-Type': contentType, Authorization: `Bearer ${getAuthToken()}` });
 const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
 let currentView = 'chat'; let inspectorTab = 'assembly'; let sending = false; let aborter = null; let embeddedModel = null; let embeddedProbeComplete = false; let embeddedSetupDismissed = false; let stationJobs = []; let stationBusy = false; let appDigests = []; let appResult = ''; let appsLoaded = false; let appWorkflows = []; let workflowsLoaded = false; let workflowRecording = null; let workshopProposals = []; let workshopResult = ''; let workshopLoaded = false; let takeoverStatus = null; let takeoverSession = null; let takeoverResult = ''; let takeoverTree = ''; let takeoverShot = ''; let takeoverBusy = false; let takeoverTimer = null; let takeoverRequest = 0; let takeoverMinutes = 15;
 
@@ -169,7 +170,7 @@ async function dispatchStationJob(event) {
   stationJobs = [optimistic, ...stationJobs];
   renderWorkspaceView();
   try {
-    const response = await fetch('/api/v1/station/dispatch', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Threadline-Local-Control': '1' }, body: JSON.stringify(dispatchPayload(job, station)) });
+     const response = await fetch('/api/v1/station/dispatch', { method: 'POST', headers: authHeaders(), body: JSON.stringify(dispatchPayload(job, station)) });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error || `Station dispatch failed (${response.status}).`);
     stationJobs = updateStationJob(stationJobs, job.id, { ...data.job, status: data.job?.status || 'running' });
@@ -199,7 +200,7 @@ async function pollStationJobs() {
   const station = stationConfig();
   await Promise.all(active.map(async job => {
     try {
-      const response = await fetch('/api/v1/station/poll', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Threadline-Local-Control': '1' }, body: JSON.stringify({ job, station }) });
+       const response = await fetch('/api/v1/station/poll', { method: 'POST', headers: authHeaders(), body: JSON.stringify({ job, station }) });
       const data = await response.json().catch(() => ({}));
       if (response.ok && data.job) stationJobs = updateStationJob(stationJobs, job.id, data.job);
     } catch {}
@@ -325,7 +326,7 @@ async function configureEmbeddedDefault() {
 }
 
 async function inspectApplicationForTool(path) {
-  const response = await fetch('/api/v1/apps/inspect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path }) });
+  const response = await fetch('/api/v1/apps/inspect', { method: 'POST', headers: authHeaders(), body: JSON.stringify({ path }) });
   const data = await response.json();
   if (!response.ok) throw new Error(data.error?.message || 'Inspection failed.');
   appsLoaded = false;
@@ -341,7 +342,7 @@ async function listApplicationsForTool() {
 }
 
 async function runApplicationForTool(id, action) {
-  const response = await fetch('/api/v1/apps/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, action }) });
+  const response = await fetch('/api/v1/apps/run', { method: 'POST', headers: authHeaders(), body: JSON.stringify({ id, action }) });
   const data = await response.json();
   if (!response.ok) throw new Error(data.error?.message || 'The application could not run.');
   return data;
@@ -382,7 +383,7 @@ async function draftWorkshopProposal(goal, filesInput) {
   workshopResult = `Drafting a proposal for “${goal}”…\nThis runs the built-in model over the selected source files. Nothing is applied.`;
   renderWorkspaceView();
   try {
-    const response = await fetch('/api/v1/workshop/propose', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ goal, files }) });
+     const response = await fetch('/api/v1/workshop/propose', { method: 'POST', headers: authHeaders(), body: JSON.stringify({ goal, files }) });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error?.message || 'The workshop could not draft a proposal.');
     workshopResult = data.proposal;
@@ -440,7 +441,7 @@ function startWorkflowRecording() {
 async function saveWorkflowRecording() {
   if (!workflowRecording?.steps.length) { toast('Run at least one approved action before saving.'); return; }
   try {
-    const response = await fetch('/api/v1/workflows', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: crypto.randomUUID(), name: workflowRecording.name, steps: workflowRecording.steps, created_at: Math.floor(Date.now() / 1000) }) });
+    const response = await fetch('/api/v1/workflows', { method: 'POST', headers: authHeaders(), body: JSON.stringify({ id: crypto.randomUUID(), name: workflowRecording.name, steps: workflowRecording.steps, created_at: Math.floor(Date.now() / 1000) }) });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error || 'Could not save workflow.');
     workflowRecording = null;
@@ -477,7 +478,7 @@ async function inspectApplication(path) {
   appResult = `Inspecting ${path}…\nThis runs --help and --version with a timeout.`;
   renderWorkspaceView();
   try {
-    const response = await fetch('/api/v1/apps/inspect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path }) });
+  const response = await fetch('/api/v1/apps/inspect', { method: 'POST', headers: authHeaders(), body: JSON.stringify({ path }) });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error?.message || 'Inspection failed.');
     appResult = `Digested ${data.name} (${data.kind}).\nPath: ${data.path}\nVersion: ${data.version || 'not reported'}\nActions: ${data.actions.join(', ')}\nFlags found: ${data.flags.length}\n\n${data.help_excerpt || ''}`;
@@ -497,7 +498,7 @@ async function runApplication(id, action) {
   appResult = `Running ${app.name} · ${action}…`;
   renderWorkspaceView();
   try {
-    const response = await fetch('/api/v1/apps/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, action }) });
+    const response = await fetch('/api/v1/apps/run', { method: 'POST', headers: authHeaders(), body: JSON.stringify({ id, action }) });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error?.message || 'The application could not run.');
     appResult = `$ ${app.path} · ${action}\n\n${data.stdout || '(no standard output)'}${data.stderr ? `\n\n[stderr]\n${data.stderr}` : ''}\n\nExit: ${data.status ?? 'unknown'}`;
@@ -509,7 +510,7 @@ async function runApplication(id, action) {
   }
 }
 
-function takeoverHeaders() { return { 'Content-Type': 'application/json', 'X-Threadline-Local-Control': '1' }; }
+function takeoverHeaders() { return authHeaders(); }
 function takeoverRemainingSeconds() { return takeoverSession ? Math.max(0, takeoverSession.expiresAt - Math.floor(Date.now() / 1000)) : 0; }
 function isTakeoverArmed() { return Boolean(takeoverSession && takeoverRemainingSeconds() > 0); }
 function formatTakeoverTime(seconds) { const safe = Math.max(0, Number(seconds) || 0); return `${Math.floor(safe / 60)}:${String(safe % 60).padStart(2, '0')}`; }
@@ -645,7 +646,7 @@ async function computerUseForTool(args) {
 
 async function exportTakeoverAudit() {
   try {
-    const response = await fetch('/api/v1/takeover/audit/export', { headers: { 'X-Threadline-Local-Control': '1' } });
+    const response = await fetch('/api/v1/takeover/audit/export', { headers: { Authorization: `Bearer ${getAuthToken()}` } });
     if (!response.ok) throw new Error('Could not read the takeover audit.');
     const blob = await response.blob();
     const link = document.createElement('a');
@@ -790,7 +791,7 @@ async function manageOmlx(action) {
   buttons.forEach(button => { button.disabled = true; });
   if (label) label.textContent = `Running oMLX ${action}…`;
   try {
-    const response = await fetch(`/api/v1/inference/omlx/${action}`, { method: 'POST', headers: { 'X-Threadline-Local-Control': '1' } });
+    const response = await fetch(`/api/v1/inference/omlx/${action}`, { method: 'POST', headers: { Authorization: `Bearer ${getAuthToken()}` } });
     const result = await response.json();
     if (!response.ok || !result.ok) throw new Error(result.error || `oMLX ${action} failed.`);
     if (label) label.textContent = result.message;

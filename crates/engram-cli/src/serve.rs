@@ -19,6 +19,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
+use rand::RngCore;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+include!(concat!(env!("OUT_DIR"), "/threadline_assets.rs"));
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -70,18 +75,18 @@ impl Drop for ConnectionPermit {
     }
 }
 
-pub fn run(vault: &Path, project_root: Option<&Path>, host: &str, port: u16) -> Result<()> {
+pub fn run(vault: &Path, project_root: Option<&Path>, host: &str, port: u16, dev: bool) -> Result<()> {
     validate_bind_host(host)?;
     let listener = TcpListener::bind((host, port))
         .with_context(|| format!("binding local workspace at {host}:{port}"))?;
-    run_listener(vault, project_root, listener, false)
+    run_listener(vault, project_root, listener, false, dev)
 }
 
-pub fn open(vault: &Path, project_root: Option<&Path>, host: &str, port: u16) -> Result<()> {
+pub fn open(vault: &Path, project_root: Option<&Path>, host: &str, port: u16, dev: bool) -> Result<()> {
     validate_bind_host(host)?;
     let listener = TcpListener::bind((host, port))
         .with_context(|| format!("binding local workspace at {host}:{port}"))?;
-    run_listener(vault, project_root, listener, true)
+    run_listener(vault, project_root, listener, true, dev)
 }
 
 fn validate_bind_host(host: &str) -> Result<()> {
@@ -96,6 +101,7 @@ fn run_listener(
     project_root: Option<&Path>,
     listener: TcpListener,
     launch_browser: bool,
+    dev: bool,
 ) -> Result<()> {
     let project_root = project_root
         .map(|path| {
@@ -107,6 +113,7 @@ fn run_listener(
         })
         .transpose()?;
     let address = listener.local_addr()?;
+    let runtime = RuntimeGuard::create(vault, address.port())?;
     let url = format!("http://{address}");
     let takeover = Arc::new(Takeover::new(vault.to_path_buf()));
     let connections = Arc::new(ConnectionLimiter::new());
@@ -141,10 +148,11 @@ fn run_listener(
                 let vault = vault.to_path_buf();
                 let project_root = project_root.clone();
                 let takeover = Arc::clone(&takeover);
+                let token = runtime.token.clone();
                 if let Err(error) = std::thread::Builder::new().spawn(move || {
                     let _permit = permit;
                     if let Err(error) =
-                        handle(&vault, project_root.as_deref(), &takeover, stream, address)
+                        handle(&vault, project_root.as_deref(), &takeover, stream, address, dev, &token)
                     {
                         eprintln!("request failed: {error:#}");
                     }
@@ -158,15 +166,123 @@ fn run_listener(
     Ok(())
 }
 
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct RuntimeDescriptor {
+    protocol_version: u32,
+    vault_id: String,
+    pid: u32,
+    port: u16,
+    token: String,
+    started_at: String,
+}
+
+#[derive(Debug)]
+struct RuntimeGuard {
+    path: PathBuf,
+    token: String,
+}
+
+impl RuntimeGuard {
+    fn create(vault: &Path, port: u16) -> Result<Self> {
+        let directory = vault.join(".engram");
+        let path = directory.join("runtime.json");
+        if path.exists() {
+            let existing = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|contents| serde_json::from_str::<RuntimeDescriptor>(&contents).ok());
+            if let Some(descriptor) = existing.filter(|descriptor| process_is_alive(descriptor.pid)) {
+                anyhow::bail!(
+                    "another Engram instance (PID {}) is already running for vault {}",
+                    descriptor.pid,
+                    vault.display()
+                );
+            }
+            eprintln!("removing stale Engram runtime descriptor: {}", path.display());
+            std::fs::remove_file(&path)
+                .with_context(|| format!("removing stale runtime descriptor {}", path.display()))?;
+        }
+
+        let mut token_bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut token_bytes);
+        let descriptor = RuntimeDescriptor {
+            protocol_version: 1,
+            vault_id: vault
+                .canonicalize()
+                .unwrap_or_else(|_| vault.to_path_buf())
+                .to_string_lossy()
+                .into_owned(),
+            pid: std::process::id(),
+            port,
+            token: token_bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
+            started_at: iso8601_utc(SystemTime::now()),
+        };
+        let payload = serde_json::to_vec_pretty(&descriptor)?;
+        engram_core::atomic_write::replace(&path, &payload)?;
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(Self { path, token: descriptor.token })
+    }
+}
+
+impl Drop for RuntimeGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+fn iso8601_utc(time: SystemTime) -> String {
+    let seconds = time
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let days = seconds.div_euclid(86_400);
+    let day_seconds = seconds.rem_euclid(86_400);
+    let hour = day_seconds / 3_600;
+    let minute = day_seconds / 60 % 60;
+    let second = day_seconds % 60;
+
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_part = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_part + 2) / 5 + 1;
+    let month = month_part + if month_part < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
 struct Request {
     method: String,
     target: String,
     body: String,
-    local_control: bool,
     host: String,
     origin: Option<String>,
     sec_fetch_site: Option<String>,
     range: Option<String>,
+    authorization: Option<String>,
 }
 
 fn handle(
@@ -175,12 +291,14 @@ fn handle(
     takeover: &Takeover,
     mut stream: TcpStream,
     address: SocketAddr,
+    dev: bool,
+    token: &str,
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let response = match read_request(&mut stream) {
         Ok(request) => match validate_request(&request, address) {
-            Ok(()) => match dispatch(vault, project_root, takeover, &request) {
+            Ok(()) => match dispatch(vault, project_root, takeover, &request, dev, token) {
                 Ok(response) => response,
                 Err(error) => {
                     eprintln!("request failed: {error:#}");
@@ -264,6 +382,8 @@ fn dispatch(
     project_root: Option<&Path>,
     takeover: &Takeover,
     request: &Request,
+    dev: bool,
+    token: &str,
 ) -> Result<Vec<u8>> {
     let (path, query) = request
         .target
@@ -271,7 +391,13 @@ fn dispatch(
         .split_once('?')
         .unwrap_or((request.target.as_str(), ""));
     let body = &request.body;
-    let local_control = request.local_control;
+    if requires_auth(request.method.as_str(), path) && !valid_bearer(request, token) {
+        return Ok(response(
+            401,
+            "application/json; charset=utf-8",
+            r#"{"error":"valid session bearer token required"}"#,
+        ));
+    }
     let response = match (request.method.as_str(), path) {
         ("GET", "/") => redirect("/threadline/"),
         ("GET", "/vault") => render_index(vault, query)?,
@@ -291,28 +417,14 @@ fn dispatch(
         ("POST", path) if path.starts_with("/api/v1/dump/") && path.ends_with("/undo") => {
             undo_dump(vault, path, body)?
         }
-        ("GET", "/threadline/") | ("GET", "/threadline/index.html") => response(
-            200,
-            "text/html; charset=utf-8",
-            include_str!("../web/index.html"),
-        ),
-        ("GET", asset_path) if asset_path.starts_with("/threadline/assets/") => {
-            match threadline_image(asset_path) {
-                Some(contents) => response_bytes(200, "image/png", contents),
-                None => response(404, "text/plain; charset=utf-8", "Not found"),
-            }
-        }
         ("GET", asset_path) if asset_path.starts_with("/threadline/") => {
-            match threadline_asset(asset_path) {
-                Some((content_type, contents)) => response(200, content_type, contents),
-                None => response(404, "text/plain; charset=utf-8", "Not found"),
-            }
+            threadline_response(asset_path, dev, token)
         }
         ("GET", "/api/v1/workspace") => workspace_get(vault),
         ("PUT", "/api/v1/workspace") => workspace_put(vault, body),
-        ("POST", "/api/v1/station/dispatch") if local_control => station_dispatch(vault, body),
-        ("POST", "/api/v1/station/poll") if local_control => station_poll(body),
-        ("POST", "/api/v1/station/fetch") if local_control => station_fetch(vault, body),
+        ("POST", "/api/v1/station/dispatch") => station_dispatch(vault, body),
+        ("POST", "/api/v1/station/poll") => station_poll(body),
+        ("POST", "/api/v1/station/fetch") => station_fetch(vault, body),
         ("POST", path) if path.starts_with("/api/v1/station/") => {
             project_error(403, "local control header required")
         }
@@ -336,17 +448,12 @@ fn dispatch(
         ("GET", "/api/v1/workshop") => list_workshop(vault),
         ("POST", "/api/v1/workshop/propose") => workshop_propose(project_root, vault, body),
         ("GET", "/api/v1/takeover/status") => takeover_status(takeover),
-        ("POST", "/api/v1/takeover/arm") if local_control => takeover_arm(takeover, body),
-        ("POST", "/api/v1/takeover/disarm") if local_control => takeover_disarm(takeover),
-        ("POST", "/api/v1/takeover/action") if local_control => takeover_action(takeover, body),
-        ("POST", "/api/v1/takeover/permission") if local_control => takeover_permission(takeover),
-        ("GET", "/api/v1/takeover/audit/export") if local_control => {
-            takeover_audit_export(takeover)
-        }
-        ("GET", "/api/v1/takeover/audit/export") => {
-            project_error(403, "local control header required")
-        }
-        ("POST", "/api/v1/takeover/purge") if local_control => takeover_purge(takeover),
+        ("POST", "/api/v1/takeover/arm") => takeover_arm(takeover, body),
+        ("POST", "/api/v1/takeover/disarm") => takeover_disarm(takeover),
+        ("POST", "/api/v1/takeover/action") => takeover_action(takeover, body),
+        ("POST", "/api/v1/takeover/permission") => takeover_permission(takeover),
+        ("GET", "/api/v1/takeover/audit/export") => takeover_audit_export(takeover),
+        ("POST", "/api/v1/takeover/purge") => takeover_purge(takeover),
         ("GET", path) if path.starts_with("/api/v1/takeover/screenshot/") => {
             takeover_screenshot(takeover, path)
         }
@@ -356,9 +463,9 @@ fn dispatch(
         ("GET", "/v1/models") => embedded_models(),
         ("POST", "/v1/chat/completions") => chat_completions(body),
         ("GET", "/api/v1/inference/omlx") => omlx_status(),
-        ("POST", "/api/v1/inference/omlx/start") if local_control => omlx_action("start"),
-        ("POST", "/api/v1/inference/omlx/stop") if local_control => omlx_action("stop"),
-        ("POST", "/api/v1/inference/omlx/restart") if local_control => omlx_action("restart"),
+        ("POST", "/api/v1/inference/omlx/start") => omlx_action("start"),
+        ("POST", "/api/v1/inference/omlx/stop") => omlx_action("stop"),
+        ("POST", "/api/v1/inference/omlx/restart") => omlx_action("restart"),
         ("POST", path) if path.starts_with("/api/v1/inference/omlx/") => {
             project_error(403, "local control header required")
         }
@@ -396,6 +503,37 @@ fn dispatch(
         _ => response(404, "text/plain; charset=utf-8", "Not found"),
     };
     Ok(response)
+}
+
+fn requires_auth(method: &str, path: &str) -> bool {
+    if matches!((method, path),
+        ("PUT", "/api/v1/workspace")
+        | ("POST", "/api/v1/apps/inspect")
+        | ("POST", "/api/v1/apps/run")
+        | ("POST", "/api/v1/workflows")
+        | ("POST", "/api/v1/workshop/propose")
+        | ("POST", "/api/v1/project/write")
+        | ("POST", "/api/v1/project/replace")
+        | ("POST", "/api/v1/project/directory")
+        | ("POST", "/api/v1/project/check")
+        | ("GET", "/api/v1/takeover/audit/export")) {
+        true
+    } else {
+        method == "POST"
+            && (path.starts_with("/api/v1/station/")
+                || path.starts_with("/api/v1/takeover/")
+                || path.starts_with("/api/v1/inference/omlx/"))
+    }
+}
+
+fn valid_bearer(request: &Request, expected: &str) -> bool {
+    let Some(value) = request.authorization.as_deref() else {
+        return false;
+    };
+    let Some((scheme, token)) = value.split_once(' ') else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case("Bearer") && token == expected
 }
 
 #[derive(serde::Deserialize)]
@@ -1913,7 +2051,7 @@ fn read_request(stream: &mut TcpStream) -> Result<Request> {
         "unsupported HTTP version"
     );
     let mut content_length = None;
-    let mut local_control = false;
+    let mut authorization = None;
     let mut host = None;
     let mut origin = None;
     let mut sec_fetch_site = None;
@@ -1923,8 +2061,9 @@ fn read_request(stream: &mut TcpStream) -> Result<Request> {
         if name.eq_ignore_ascii_case("transfer-encoding") {
             anyhow::bail!("transfer encoding is unsupported")
         }
-        if name.eq_ignore_ascii_case("x-threadline-local-control") && value.trim() == "1" {
-            local_control = true;
+        if name.eq_ignore_ascii_case("authorization") {
+            anyhow::ensure!(authorization.is_none(), "duplicate authorization");
+            authorization = Some(value.trim().to_string());
         }
         if name.eq_ignore_ascii_case("content-length") {
             if content_length.is_some() {
@@ -1971,11 +2110,11 @@ fn read_request(stream: &mut TcpStream) -> Result<Request> {
         method,
         target,
         body: String::from_utf8(body).context("request body is not UTF-8")?,
-        local_control,
         host: host.context("missing Host header")?,
         origin,
         sec_fetch_site,
         range,
+        authorization,
     })
 }
 
@@ -2672,6 +2811,7 @@ fn response(status: u16, content_type: &str, body: &str) -> Vec<u8> {
 fn response_bytes(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
     let reason = match status {
         200 => "OK",
+        401 => "Unauthorized",
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
@@ -2692,101 +2832,76 @@ fn response_bytes(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
     response
 }
 
-/// Static Threadline modules are embedded in the binary so `engram open`
-/// remains a single-binary local workspace.
-fn threadline_asset(path: &str) -> Option<(&'static str, &'static str)> {
-    let asset = match path {
-        "/threadline/styles.css" => ("text/css; charset=utf-8", include_str!("../web/styles.css")),
-        "/threadline/src/app.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("../web/src/app.js"),
-        ),
-        "/threadline/src/core/store.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("../web/src/core/store.js"),
-        ),
-        "/threadline/src/core/station-state.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("../web/src/core/station-state.js"),
-        ),
-        "/threadline/src/core/memory-manager.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("../web/src/core/memory-manager.js"),
-        ),
-        "/threadline/src/core/context-packer.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("../web/src/core/context-packer.js"),
-        ),
-        "/threadline/src/core/evaluation-bench.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("../web/src/core/evaluation-bench.js"),
-        ),
-        "/threadline/src/core/app-actions.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("../web/src/core/app-actions.js"),
-        ),
-        "/threadline/src/core/agent-execution.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("../web/src/core/agent-execution.js"),
-        ),
-        "/threadline/src/core/tool-registry.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("../web/src/core/tool-registry.js"),
-        ),
-        "/threadline/src/core/permission-gate.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("../web/src/core/permission-gate.js"),
-        ),
-        "/threadline/src/core/privacy-policy.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("../web/src/core/privacy-policy.js"),
-        ),
-        "/threadline/src/core/media-renderer.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("../web/src/core/media-renderer.js"),
-        ),
-        "/threadline/src/providers/openai-compatible.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("../web/src/providers/openai-compatible.js"),
-        ),
-        "/threadline/src/providers/engram-vault.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("../web/src/providers/engram-vault.js"),
-        ),
-        _ => return None,
-    };
-    Some(asset)
+fn threadline_asset(path: &str) -> Option<(&'static str, &'static [u8])> {
+    THREADLINE_ASSETS
+        .iter()
+        .find(|asset| asset.path == path)
+        .map(|asset| (asset.content_type, asset.bytes))
 }
 
-fn threadline_image(path: &str) -> Option<&'static [u8]> {
-    match path {
-        "/threadline/assets/engram-logo.png" => {
-            Some(include_bytes!("../web/assets/engram-logo.png"))
+fn threadline_response(path: &str, dev: bool, token: &str) -> Vec<u8> {
+    if dev {
+        let relative = if path == "/threadline/" {
+            "index.html"
+        } else {
+            path.strip_prefix("/threadline/").unwrap_or_default()
+        };
+        let relative = Path::new(relative);
+        if relative.components().any(|component| !matches!(component, Component::Normal(_))) {
+            return response(404, "text/plain; charset=utf-8", "Not found");
         }
-        "/threadline/assets/engram-mark.png" => {
-            Some(include_bytes!("../web/assets/engram-mark.png"))
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("web");
+        let candidate = root.join(relative);
+        if !candidate.is_file() {
+            return response(404, "text/plain; charset=utf-8", "Not found");
         }
-        "/threadline/assets/engram-mark-green.png" => {
-            Some(include_bytes!("../web/assets/engram-mark-green.png"))
+        let Ok(candidate) = candidate.canonicalize() else {
+            return response(404, "text/plain; charset=utf-8", "Not found");
+        };
+        let Ok(root) = root.canonicalize() else {
+            return response(404, "text/plain; charset=utf-8", "Not found");
+        };
+        if !candidate.starts_with(root) {
+            return response(404, "text/plain; charset=utf-8", "Not found");
         }
-        "/threadline/assets/engram-icon-purple.png" => {
-            Some(include_bytes!("../web/assets/engram-icon-purple.png"))
-        }
-        "/threadline/assets/engram-icon-pink.png" => {
-            Some(include_bytes!("../web/assets/engram-icon-pink.png"))
-        }
-        "/threadline/assets/engram-icon-blue.png" => {
-            Some(include_bytes!("../web/assets/engram-icon-blue.png"))
-        }
-        "/threadline/assets/engram-icon-fire.png" => {
-            Some(include_bytes!("../web/assets/engram-icon-fire.png"))
-        }
-        "/threadline/assets/engram-icon-forest.png" => {
-            Some(include_bytes!("../web/assets/engram-icon-forest.png"))
-        }
-        "/threadline/assets/engram-icon-ice.png" => {
-            Some(include_bytes!("../web/assets/engram-icon-ice.png"))
-        }
+        let Some(content_type) = threadline_content_type(&candidate) else {
+            return response(404, "text/plain; charset=utf-8", "Not found");
+        };
+        return match std::fs::read(candidate) {
+            Ok(bytes) if path == "/threadline/" || path == "/threadline/index.html" => {
+                threadline_html_response(&bytes, token)
+            }
+            Ok(bytes) => response_bytes(200, content_type, &bytes),
+            Err(_) => response(404, "text/plain; charset=utf-8", "Not found"),
+        };
+    }
+
+    let path = if path == "/threadline/" {
+        "/threadline/index.html"
+    } else {
+        path
+    };
+    match threadline_asset(path) {
+        Some((_, bytes)) if path == "/threadline/index.html" => threadline_html_response(bytes, token),
+        Some((content_type, bytes)) => response_bytes(200, content_type, bytes),
+        None => response(404, "text/plain; charset=utf-8", "Not found"),
+    }
+}
+
+fn threadline_html_response(bytes: &[u8], token: &str) -> Vec<u8> {
+    let html = String::from_utf8_lossy(bytes);
+    let meta = format!(r#"<meta name="threadline-token" content="{token}">"#);
+    let html = html.replacen("<head>", &format!("<head>{meta}"), 1);
+    response(200, "text/html; charset=utf-8", &html)
+}
+
+fn threadline_content_type(path: &Path) -> Option<&'static str> {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("html") => Some("text/html; charset=utf-8"),
+        Some("css") => Some("text/css; charset=utf-8"),
+        Some("js") => Some("text/javascript; charset=utf-8"),
+        Some("png") => Some("image/png"),
+        Some("svg") => Some("image/svg+xml"),
         _ => None,
     }
 }
@@ -2877,13 +2992,17 @@ fn markdown_html(markdown: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        chat_completions, create_note, delete_note, encode, has_hidden_component, host_is_local,
+        chat_completions, create_note, delete_note, dispatch, encode, has_hidden_component, host_is_local,
         is_markdown, origin_is_local, rename_note, restore_note, save_note, search_vault_api,
-        threadline_asset, trash_entries, validate_bind_host, validate_request, ConnectionLimiter,
-        Request,
+        threadline_response, trash_entries, validate_bind_host, validate_request, ConnectionLimiter,
+        Request, RuntimeDescriptor, RuntimeGuard, Takeover,
     };
     use std::net::SocketAddr;
     use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use walkdir::WalkDir;
 
     #[test]
     fn accepts_loopback_bind_hosts() {
@@ -2930,11 +3049,11 @@ mod tests {
             method: "POST".into(),
             target: "/api/v1/takeover/arm".into(),
             body: "{}".into(),
-            local_control: true,
             host: "127.0.0.1:8765".into(),
             origin: None,
             sec_fetch_site: None,
             range: None,
+            authorization: None,
         };
 
         assert!(validate_request(&request, address).is_err());
@@ -2961,6 +3080,98 @@ mod tests {
         assert!(limiter.try_acquire().is_none());
         drop(permits.pop());
         assert!(limiter.try_acquire().is_some());
+    }
+
+    #[test]
+    fn runtime_descriptor_has_expected_fields_and_is_removed_on_drop() {
+        let vault = std::env::temp_dir().join(format!(
+            "engram-runtime-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let guard = RuntimeGuard::create(&vault, 43210).unwrap();
+        let path = vault.join(".engram/runtime.json");
+        let descriptor: RuntimeDescriptor =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(descriptor.protocol_version, 1);
+        assert_eq!(descriptor.pid, std::process::id());
+        assert_eq!(descriptor.port, 43210);
+        assert_eq!(descriptor.token.len(), 64);
+        assert!(descriptor.started_at.ends_with('Z'));
+        #[cfg(unix)]
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        drop(guard);
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(vault);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_runtime_descriptor_is_removed() {
+        let vault = std::env::temp_dir().join(format!(
+            "engram-runtime-stale-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let _ = child.wait_with_output().unwrap();
+        std::fs::create_dir_all(vault.join(".engram")).unwrap();
+        let stale = RuntimeDescriptor {
+            protocol_version: 1,
+            vault_id: vault.display().to_string(),
+            pid,
+            port: 43210,
+            token: "0".repeat(64),
+            started_at: "1970-01-01T00:00:00Z".into(),
+        };
+        std::fs::write(
+            vault.join(".engram/runtime.json"),
+            serde_json::to_vec(&stale).unwrap(),
+        )
+        .unwrap();
+        let guard = RuntimeGuard::create(&vault, 43211).unwrap();
+        assert_eq!(
+            serde_json::from_str::<RuntimeDescriptor>(
+                &std::fs::read_to_string(vault.join(".engram/runtime.json")).unwrap()
+            )
+            .unwrap()
+            .port,
+            43211
+        );
+        drop(guard);
+        let _ = std::fs::remove_dir_all(vault);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_runtime_descriptor_rejects_startup() {
+        let vault = std::env::temp_dir().join(format!(
+            "engram-runtime-active-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(vault.join(".engram")).unwrap();
+        let active = RuntimeDescriptor {
+            protocol_version: 1,
+            vault_id: vault.display().to_string(),
+            pid: std::process::id(),
+            port: 43210,
+            token: "0".repeat(64),
+            started_at: "1970-01-01T00:00:00Z".into(),
+        };
+        std::fs::write(
+            vault.join(".engram/runtime.json"),
+            serde_json::to_vec(&active).unwrap(),
+        )
+        .unwrap();
+        let error = RuntimeGuard::create(&vault, 43211).unwrap_err();
+        assert!(error.to_string().contains(&format!("PID {}", std::process::id())));
+        assert!(vault.join(".engram/runtime.json").exists());
+        let _ = std::fs::remove_dir_all(vault);
     }
 
     #[test]
@@ -3078,26 +3289,71 @@ mod tests {
 
     #[test]
     fn serves_every_threadline_module_imported_by_app() {
-        for path in [
-            "/threadline/src/core/evaluation-bench.js",
-            "/threadline/src/core/store.js",
-            "/threadline/src/core/station-state.js",
-            "/threadline/src/core/memory-manager.js",
-            "/threadline/src/core/context-packer.js",
-            "/threadline/src/core/app-actions.js",
-            "/threadline/src/core/agent-execution.js",
-            "/threadline/src/core/permission-gate.js",
-            "/threadline/src/core/tool-registry.js",
-            "/threadline/src/core/privacy-policy.js",
-            "/threadline/src/providers/openai-compatible.js",
-            "/threadline/src/providers/engram-vault.js",
-            "/threadline/src/core/media-renderer.js",
-        ] {
-            assert!(
-                threadline_asset(path).is_some(),
-                "missing module route: {path}"
-            );
+        let web_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("web");
+        for entry in WalkDir::new(&web_root).into_iter().filter_map(Result::ok) {
+            let path = entry.path();
+            let extension = path.extension().and_then(|extension| extension.to_str());
+            if !matches!(extension, Some("js") | Some("css")) {
+                continue;
+            }
+            let relative = path.strip_prefix(&web_root).unwrap();
+            let route = format!("/threadline/{}", relative.to_string_lossy());
+            let response_bytes = threadline_response(&route, false, "test-token");
+            let response = String::from_utf8_lossy(&response_bytes);
+            assert!(response.starts_with("HTTP/1.1 200 OK"), "missing asset route: {route}");
+            let expected = match extension {
+                Some("js") => "text/javascript; charset=utf-8",
+                Some("css") => "text/css; charset=utf-8",
+                _ => unreachable!(),
+            };
+            assert!(response.contains(&format!("Content-Type: {expected}")), "wrong type: {route}");
         }
+    }
+
+    #[test]
+    fn protected_mutation_requires_and_accepts_the_runtime_bearer_token() {
+        let vault = std::env::temp_dir().join(format!(
+            "engram-auth-test-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let takeover = Takeover::new(vault.clone());
+        let token = "a".repeat(64);
+        let mut request = Request {
+            method: "POST".into(),
+            target: "/api/v1/takeover/arm".into(),
+            body: r#"{"minutes":1}"#.into(),
+            host: "127.0.0.1:8765".into(),
+            origin: Some("http://127.0.0.1:8765".into()),
+            sec_fetch_site: Some("same-origin".into()),
+            range: None,
+            authorization: None,
+        };
+        let unauthorized = dispatch(&vault, None, &takeover, &request, false, &token).unwrap();
+        assert!(String::from_utf8_lossy(&unauthorized).starts_with("HTTP/1.1 401 Unauthorized"));
+
+        request.authorization = Some("Bearer wrong".into());
+        let invalid = dispatch(&vault, None, &takeover, &request, false, &token).unwrap();
+        assert!(String::from_utf8_lossy(&invalid).starts_with("HTTP/1.1 401 Unauthorized"));
+
+        request.authorization = Some(format!("Bearer {token}"));
+        let authorized = dispatch(&vault, None, &takeover, &request, false, &token).unwrap();
+        assert!(String::from_utf8_lossy(&authorized).starts_with("HTTP/1.1 200 OK"));
+        let _ = std::fs::remove_dir_all(vault);
+    }
+
+    #[test]
+    fn threadline_index_injects_the_runtime_token() {
+        let response_bytes = threadline_response(
+            "/threadline/",
+            false,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        );
+        let response = String::from_utf8_lossy(&response_bytes);
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains(
+            r#"<meta name="threadline-token" content="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef">"#
+        ));
     }
 
     #[test]
@@ -3281,22 +3537,30 @@ mod tests {
             assert_eq!(status, 400, "{name}: {bad_res}");
         }
 
-        // Test server-side permission gate: dispatch without local_control returns 403
+        // Test server-side permission gate: dispatch without a bearer token returns 401
         let takeover = std::sync::Arc::new(crate::takeover::Takeover::new(vault.clone()));
         let unprivileged_request = super::Request {
             method: "POST".into(),
             target: "/api/v1/station/dispatch".into(),
             body: dispatch_payload(station("127.0.0.1", "/tmp/station_test"), "safe"),
-            local_control: false,
             host: "127.0.0.1:8765".into(),
             origin: Some("http://127.0.0.1:8765".into()),
             sec_fetch_site: Some("same-origin".into()),
             range: None,
+            authorization: None,
         };
-        let gate_res = super::dispatch(&vault, None, &takeover, &unprivileged_request).unwrap();
+        let gate_res = super::dispatch(
+            &vault,
+            None,
+            &takeover,
+            &unprivileged_request,
+            false,
+            "test-token",
+        )
+        .unwrap();
         let (gate_status, gate_json) = parse_response(&gate_res);
-        assert_eq!(gate_status, 403, "{gate_json}");
-        assert!(gate_json["error"].as_str().unwrap().contains("local control header required"));
+        assert_eq!(gate_status, 401, "{gate_json}");
+        assert_eq!(gate_json["error"], "valid session bearer token required");
 
         std::env::set_var("PATH", orig_path);
         let _ = std::fs::remove_dir_all(root);
@@ -3511,4 +3775,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(vault);
     }
 }
-
