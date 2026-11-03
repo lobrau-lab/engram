@@ -238,10 +238,11 @@ fn host_is_local(host: &str, address: SocketAddr) -> bool {
 }
 
 fn origin_is_local(origin: &str, host: &str) -> bool {
-    origin
-        .trim()
-        .to_ascii_lowercase()
-        .eq_ignore_ascii_case(&format!("http://{}", host.trim().to_ascii_lowercase()))
+    let origin = origin.trim();
+    if origin == "null" || origin == "file://" {
+        return false;
+    }
+    origin.eq_ignore_ascii_case(&format!("http://{}", host.trim()))
 }
 
 fn dispatch(
@@ -2001,6 +2002,7 @@ mod tests {
         assert!(origin_is_local("http://127.0.0.1:8765", "127.0.0.1:8765"));
         assert!(!origin_is_local("http://evil.example", "localhost:8765"));
         assert!(!origin_is_local("null", "localhost:8765"));
+        assert!(!origin_is_local("file://", "localhost:8765"));
     }
 
     #[test]
