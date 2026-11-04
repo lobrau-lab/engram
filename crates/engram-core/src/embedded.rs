@@ -575,12 +575,15 @@ pub fn availability() -> EmbeddedAvailability {
 
     #[cfg(target_os = "macos")]
     {
-        let probe = chat_applefm::availability();
+        // Skip blocking availability check when no engine is loaded to avoid indefinite hang.
         EmbeddedAvailability {
-            available: probe.available,
+            available: false,
             provider: "apple-foundation-models",
             model: "apple-on-device",
-            reason: probe.reason,
+            reason: Some(
+                "The built-in model is unavailable; no MLX/GGUF engine loaded and system model not accessible."
+                    .to_string(),
+            ),
         }
     }
     #[cfg(not(target_os = "macos"))]

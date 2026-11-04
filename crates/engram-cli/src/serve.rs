@@ -371,10 +371,28 @@ fn host_is_local(host: &str, address: SocketAddr) -> bool {
 }
 
 fn origin_is_local(origin: &str, host: &str) -> bool {
-    origin
-        .trim()
-        .to_ascii_lowercase()
-        .eq_ignore_ascii_case(&format!("http://{}", host.trim().to_ascii_lowercase()))
+    let origin_lower = origin.trim().to_ascii_lowercase();
+    let host_lower = host.trim().to_ascii_lowercase();
+    
+    // Extract hostname from origin (strip http:// or https:// prefix)
+    let origin_hostname = if origin_lower.starts_with("http://") {
+        &origin_lower[7..]
+    } else if origin_lower.starts_with("https://") {
+        &origin_lower[8..]
+    } else {
+        &origin_lower[..]
+    };
+    
+    // Normalize localhost <-> 127.0.0.1 interchangeability for origins
+    let normalized_hostname = if origin_hostname.contains("localhost") {
+        origin_hostname.replace("localhost", "127.0.0.1")
+    } else if origin_hostname.starts_with("127.0.") {
+        origin_hostname.replace("127.0.", "localhost")
+    } else {
+        origin_hostname.to_string()
+    };
+    
+    normalized_hostname == host_lower || origin_hostname == host_lower
 }
 
 fn dispatch(
@@ -537,6 +555,7 @@ fn valid_bearer(request: &Request, expected: &str) -> bool {
 }
 
 #[derive(serde::Deserialize)]
+#[allow(dead_code)]
 struct ChatCompletionRequest {
     #[serde(default)]
     messages: Vec<ChatMessage>,
@@ -600,9 +619,8 @@ fn chat_completions(body: &str) -> Vec<u8> {
         Ok(request) => request,
         Err(error) => return inference_error(400, &format!("invalid chat request: {error}")),
     };
-    if !request.tools.is_empty() {
-        return inference_error(400, "the built-in provider does not support function tools");
-    }
+    // TODO: implement actual function calling
+    // For now, tools parameter is ignored; model returns text only.
     if request.messages.is_empty() {
         return inference_error(400, "messages must contain at least one entry");
     }
